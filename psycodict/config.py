@@ -219,3 +219,5 @@ class Configuration(object):
         res["port"] = int(res["port"])
         return res
 
+if __name__ == "__main__":
+    Configuration(writeargstofile=True)
