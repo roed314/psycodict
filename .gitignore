@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Emacs autosaves
+*~
+
+# Secrets file: should not be committed to repo!
+secrets.ini
