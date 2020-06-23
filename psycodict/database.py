@@ -139,7 +139,7 @@ class PostgresDatabase(PostgresBase):
         obj.conn = self.conn
         self._objects.append(obj)
 
-    def __init__(self, config=None, secretsfile=None, **kwargs):
+    def __init__(self, config=None, **kwargs):
         if config is None:
             from .config import Configuration
             config = Configuration()

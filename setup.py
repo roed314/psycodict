@@ -1,10 +1,12 @@
+#!/usr/bin/env python3
+
 from setuptools import setup, find_packages
 
 setup(
     name="psycodict",
-    version="0.1",
+    version="0.1.1",
     packages=find_packages(),
-    install_requires=["psycopg2>=2.8.5"],
+    install_requires=["psycopg2>=2.7"],
 
     # metadata for PyPI. setuptools only support single authors
     license="GPL v2+",
