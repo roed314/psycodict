@@ -199,6 +199,7 @@ def _meta_table_name(meta_name):
         table_name = "name"
     return table_name
 
+
 class PostgresBase(object):
     """
     A base class for various objects that interact with Postgres.
@@ -906,6 +907,10 @@ class PostgresBase(object):
         - ``tmp_table`` -- string, the name of the new table to create
         """
         if self._table_exists(tmp_table):
+            # remove suffix for display message
+            for suffix in ['_counts', '_stats']:
+                if table.endswith(suffix):
+                    table = table[:-len(suffix)]
             raise ValueError(
                 "Temporary table %s already exists. "
                 "Run db.%s.cleanup_from_reload() if you want to delete it and proceed."
@@ -944,7 +949,7 @@ class PostgresBase(object):
         INPUT:
 
         - ``filename`` -- a string, the filename to load the table from
-        - ``name`` -- the name fo the table
+        - ``name`` -- the name of the table
         - ``sep`` -- the separator character, defaulting to tab
         - ``addid`` -- if true, also adds an id column to the created table
 

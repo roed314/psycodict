@@ -11,7 +11,7 @@ from psycopg2.sql import SQL, Identifier, Literal
 from .base import number_types
 from .table import PostgresTable
 from .encoding import Json
-from .utils import IdentifierWrapper, filter_sql_injection, postgres_infix_ops
+from .utils import IdentifierWrapper, DelayCommit, filter_sql_injection, postgres_infix_ops
 
 
 class PostgresSearchTable(PostgresTable):
@@ -121,6 +121,9 @@ class PostgresSearchTable(PostgresTable):
         It is called from `_parse_special` and `_parse_dict`; see the documentation
         of those functions for inputs.
         """
+        if col_type == "smallint[]" and key in ["$contains", "$containedin"]:
+            # smallint[] requires a typecast to test containment
+            return "::int[]"
         if col_type.endswith("[]") and key in ["$eq", "$ne", "$contains", "$containedin"]:
             if isinstance(col, Identifier):
                 return "::" + col_type
@@ -146,6 +149,7 @@ class PostgresSearchTable(PostgresTable):
             - ``$contains`` -- for json columns, the given value should be a subset of the column.
             - ``$notcontains`` -- for json columns, the column must not contain any entry of the given value (which should be iterable)
             - ``$containedin`` -- for json columns, the column should be a subset of the given list
+            - ``$overlaps`` -- the column should overlap the given array
             - ``$exists`` -- if True, require not null; if False, require null.
             - ``$startswith`` -- for text columns, matches strings that start with the given string.
             - ``$like`` -- for text columns, matches strings according to the LIKE operand in SQL.
@@ -248,6 +252,12 @@ class PostgresSearchTable(PostgresTable):
             elif key == "$containedin":
                 # jsonb_path_ops modifiers for the GIN index doesn't support this query
                 cmd = SQL("{0} <@ %s")
+            elif key == "$overlaps":
+                if col_type == "jsonb":
+                    # jsonb doesn't support &&
+                    # We could convert it to a giant conjunction, but that leads to very bad performance
+                    raise ValueError("Jsonb columns do not support $overlaps")
+                cmd = SQL("{0} && %s")
             elif key == "$startswith":
                 cmd = SQL("{0} LIKE %s")
                 value = value.replace("_", r"\_").replace("%", r"\%") + "%"
@@ -483,7 +493,7 @@ class PostgresSearchTable(PostgresTable):
                 cur.close()
                 if (
                     cur.withhold # to assure that it is a buffered cursor
-                    and self._db._nocommit_stack == 0 # and there is nothing to commmit
+                    and self._db._nocommit_stack == 0 # and there is nothing to commit
                 ):
                     cur.connection.commit()
 
@@ -950,7 +960,7 @@ class PostgresSearchTable(PostgresTable):
                     # so we just get an unsorted list of labels
                     L = list(self.search(query, 0, sort=[]))
                 else:
-                    # An arbitary projection might be large, so we get ids
+                    # An arbitrary projection might be large, so we get ids
                     L = list(self.search(query, "id", sort=[]))
                 self.stats._record_count(query, len(L))
                 if len(L) == 0:
@@ -1052,6 +1062,42 @@ class PostgresSearchTable(PostgresTable):
             cur = self._execute(selecter, values, buffered=True)
             return self._search_iterator(cur, search_cols, extra_cols, projection)
 
+    def copy_to_example(self, searchfile, extrafile=None, id=None, sep=u"|", commit=True):
+        """
+        This function writes files in the format used for copy_from and reload.
+        It writes the header and a single random row.
+
+        INPUT:
+
+        - ``searchfile`` -- a string, the filename to write data into for the search table
+        - ``extrafile`` -- a string,the filename to write data into for the extra table.
+            If there is an extra table, this argument is required.
+        - ``id`` -- an id to use for the example row (random if unspecified)
+        - ``sep`` -- a character to use as a separator between columns
+        """
+        self._check_file_input(searchfile, extrafile, {})
+        if id is None:
+            id = self.random({}, "id")
+            if id is None:
+                return self.copy_to(searchfile, extrafile, commit=commit, sep=sep)
+        tabledata = [
+            # tablename, cols, addid, write_header, filename
+            (self.search_table, ["id"] + self.search_cols, searchfile),
+            (self.extra_table, ["id"] + self.extra_cols, extrafile),
+        ]
+        with DelayCommit(self, commit):
+            for table, cols, filename in tabledata:
+                if filename is None:
+                    continue
+                types = [self.col_type[col] for col in cols]
+                header = "%s\n%s\n\n" % (sep.join(cols), sep.join(types))
+                select = SQL("SELECT {0} FROM {1} WHERE id = {2}").format(
+                    SQL(", ").join(map(Identifier, cols)),
+                    Identifier(table),
+                    Literal(id))
+                self._copy_to_select(select, filename, header=header, silent=True, sep=sep)
+                print("Wrote example to %s" % filename)
+
     ##################################################################
     # Convenience methods for accessing statistics                   #
     ##################################################################
@@ -1114,3 +1160,17 @@ class PostgresSearchTable(PostgresTable):
             244006
         """
         return self.stats.count(query, groupby=groupby, record=record)
+
+    def count_distinct(self, col, query={}, record=True):
+        """
+        Count the number of distinct values taken on by a given column.
+
+        The result will be the same as taking the length of the distinct values, but a bit faster and caches the answer
+
+        INPUT:
+
+        - ``col`` -- the name of the column
+        - ``query`` -- a query dictionary constraining which rows are considered
+        - ``record`` -- (default True) whether to record the number of results in the stats table.
+        """
+        return self.stats.count_distinct(col, query, record=record)
