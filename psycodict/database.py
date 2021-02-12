@@ -24,15 +24,7 @@ from psycopg2.extensions import (
 from psycopg2.extras import register_json
 
 from .encoding import Json, numeric_converter
-from .base import (
-    PostgresBase,
-    _meta_tables_cols,
-    _meta_tables_types,
-    _meta_indexes_cols,
-    _meta_indexes_types,
-    _meta_constraints_cols,
-    _meta_constraints_types,
-)
+from .base import PostgresBase, _meta_tables_cols
 from .searchtable import PostgresSearchTable
 from .utils import DelayCommit
 
@@ -59,9 +51,9 @@ def setup_connection(conn):
         pass
     else:
         register_adapter(Integer, AsIs)
-        from .encoding import RealEncoder
+        from .encoding import RealEncoder, LmfdbRealLiteral
         register_adapter(RealNumber, RealEncoder)
-
+        register_adapter(LmfdbRealLiteral, RealEncoder)
 
 class PostgresDatabase(PostgresBase):
     """
@@ -82,7 +74,7 @@ class PostgresDatabase(PostgresBase):
     - ``conn`` -- the psycopg2 connection object
     - ``tablenames`` -- a list of tablenames in the database, as strings
 
-    Also, each tablename will be stored as an attribute, so that db.ec_curves works for example.
+    Also, each tablename will be stored as an attribute, so that db.ec_curvedata works for example.
 
     EXAMPLES::
 
@@ -139,7 +131,7 @@ class PostgresDatabase(PostgresBase):
         obj.conn = self.conn
         self._objects.append(obj)
 
-    def __init__(self, config=None, **kwargs):
+    def __init__(self, config=None, secretsfile=None, **kwargs):
         if config is None:
             from .config import Configuration
             config = Configuration()
@@ -210,8 +202,6 @@ class PostgresDatabase(PostgresBase):
             if table_name not in data_types:
                 data_types[table_name] = []
             data_types[table_name].append((column_name, regtype))
-
-        self._ensure_meta_exists()
 
         cur = self._execute(SQL(
             "SELECT name, label_col, sort, count_cutoff, id_ordered, out_of_order, "
@@ -410,55 +400,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             sizes[name]["total_bytes"] += total_bytes
         return sizes
 
-    def _ensure_meta_exists(self):
-        for table, createit in [
-                ("meta_tables", self._create_meta_tables),
-                ("meta_indexes", self._create_meta_indexes),
-                ("meta_constraints", self._create_meta_constraints),
-                ("meta_indexes_hist", self._create_meta_indexes_hist),
-                ("meta_constraints_hist", self._create_meta_constraints_hist),
-                ("meta_tables_hist", self._create_meta_tables_hist),
-        ]:
-            if not self._table_exists(table):
-                createit()
-
-    def _create_meta_tables(self):
-        with DelayCommit(self, silence=True):
-            # The following is safe from injection since we hard code the values in base.py
-            self._execute(SQL(
-                "CREATE TABLE meta_tables " +
-                "(%s)" % (", ".join("%s %s" % (col, _meta_tables_types[col]) for col in _meta_tables_cols))
-            ))
-            alterer = SQL("ALTER TABLE meta_tables ALTER COLUMN {0} SET DEFAULT %s")
-            for col, val in [("count_cutoff", 1000),
-                             ("stats_valid", True),
-                             ("total", 0),
-                             ("important", False),
-                             ("include_nones", True)]:
-                self._execute(alterer.format(Identifier(col)), [val])
-            #self.grant_select("meta_tables")
-        print("Meta tables created")
-
-    def _create_meta_indexes(self):
-        with DelayCommit(self, silence=True):
-            # The following is safe from injection since we hard code the values in base.py
-            self._execute(SQL(
-                "CREATE TABLE meta_indexes " +
-                "(%s)" % (", ".join("%s %s" % (col, _meta_indexes_types[col]) for col in _meta_indexes_cols))
-            ))
-            #self.grant_select("meta_indexes")
-        print("Meta indexes created")
-
-    def _create_meta_constraints(self):
-        with DelayCommit(self, silence=True):
-            # The following is safe from injection since we hard code the values in base.py
-            self._execute(SQL(
-                "CREATE TABLE meta_constraints " +
-                "(%s)" % (", ".join("%s %s" % (col, _meta_constraints_types[col]) for col in _meta_constraints_cols))
-            ))
-            #self.grant_select("meta_constraints")
-        print("Table meta_constraints created")
-
     def _create_meta_indexes_hist(self):
         with DelayCommit(self, silence=True):
             self._execute(SQL(
@@ -484,9 +425,19 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     row + (version,),
                 )
 
-            #self.grant_select("meta_indexes_hist")
+            self.grant_select("meta_indexes_hist")
 
         print("Table meta_indexes_hist created")
+
+    def _create_meta_constraints(self):
+        with DelayCommit(self, silence=True):
+            self._execute(SQL(
+                "CREATE TABLE meta_constraints "
+                "(constraint_name text, table_name text, "
+                "type text, columns jsonb, check_func jsonb)"
+            ))
+            self.grant_select("meta_constraints")
+        print("Table meta_constraints created")
 
     def _create_meta_constraints_hist(self):
         with DelayCommit(self, silence=True):
@@ -513,7 +464,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     row + (version,),
                 )
 
-            #self.grant_select("meta_constraints_hist")
+            self.grant_select("meta_constraints_hist")
 
         print("Table meta_constraints_hist created")
 
@@ -544,7 +495,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     row + (version,),
                 )
 
-            #self.grant_select("meta_tables_hist")
+            self.grant_select("meta_tables_hist")
 
         print("Table meta_tables_hist created")
 
@@ -662,8 +613,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         """
         if name in self.tablenames:
             raise ValueError("%s already exists" % name)
-        #if "_" not in name:
-        #    raise ValueError("Table name must contain an underscore; first part gives LMFDB section")
         now = time.time()
         if id_ordered is None:
             id_ordered = sort is not None
