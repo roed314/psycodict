@@ -218,12 +218,13 @@ class PostgresBase(object):
         self.slow_cutoff = logging_options["slowcutoff"]
         self.logger = l = logging.getLogger(loggername)
         l.propogate = False
+        # we only want 2 handlers
+        l.handlers = []
         l.setLevel(logging.INFO)
-        fhandler = logging.FileHandler(logging_options["slowlogfile"])
         formatter = logging.Formatter("%(asctime)s - %(message)s")
-        filt = QueryLogFilter()
+        fhandler = logging.FileHandler(logging_options["slowlogfile"])
         fhandler.setFormatter(formatter)
-        fhandler.addFilter(filt)
+        fhandler.addFilter(QueryLogFilter())
         l.addHandler(fhandler)
         shandler = logging.StreamHandler()
         shandler.setFormatter(formatter)

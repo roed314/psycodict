@@ -1765,7 +1765,7 @@ class PostgresTable(PostgresBase):
                     if table not in tables:
                         tables.append(table)
 
-            if countsfile:
+            if self.stats.counts in tables:
                 # create index on counts table
                 self._create_counts_indexes(suffix=suffix)
 
