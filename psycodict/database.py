@@ -47,11 +47,11 @@ def setup_connection(conn):
     register_json(conn, loads=Json.loads)
     try:
         from sage.all import Integer, RealNumber
+        from .encoding import RealEncoder, LmfdbRealLiteral
     except ImportError:
         pass
     else:
         register_adapter(Integer, AsIs)
-        from .encoding import RealEncoder, LmfdbRealLiteral
         register_adapter(RealNumber, RealEncoder)
         register_adapter(LmfdbRealLiteral, RealEncoder)
 
