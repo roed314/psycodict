@@ -211,9 +211,7 @@ class PostgresStatsTable(PostgresBase):
         self.stats = st + "_stats"
         self.counts = st + "_counts"
         if total is None:
-            total = self.quick_count({})
-            if total is None:
-                total = self._slow_count({}, extra=False)
+            total = self._slow_count({}, extra=False)
         self.total = total
 
     def _get_tablespace(self):
