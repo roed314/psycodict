@@ -9,6 +9,16 @@ SELECT queries using a dictionary.  In addition, the package provides a number o
  * Data management tools wrapping PostgreSQL's mechanisms for loading from and saving to files
  * Statistics tables for storing statistics and counts (this is particularly useful in the LMFDB's context since the data changes rarely)
 
+# Install
+
+```
+pip3 install -U git+https://github.com/roed314/psycodict.git@toml#egg=project[pgbinary]
+```
+or
+```
+pip3 install -U git+https://github.com/roed314/psycodict.git@toml#egg=project[pgsource]
+```
+
 # Getting started
 
 You will first need to install [postgres](https://www.postgresql.org/) and create a [user](https://www.postgresql.org/docs/current/sql-createuser.html) and a [database](https://www.postgresql.org/docs/current/sql-createdatabase.html).  For example, you might execute the following commands in psql:
