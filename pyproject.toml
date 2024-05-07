@@ -9,7 +9,7 @@ description = "dictionary-based python interface to PostgreSQL databases"
 authors = [{name = "David Roe", email = "roed.math@gmail.com"}, {name = "Edgar Costa", email = "edgarc@mit.edu"}]
 license = {text = "GPL v2+"}
 keywords = ["postgres", "database", "interface"]
-urls = {"Homepage": "https://github.com/roed314/psycodict"}
+urls = [{"Homepage": "https://github.com/roed314/psycodict"}]
 
 [project.urls]
 repository = "https://github.com/roed314/psycodict"
