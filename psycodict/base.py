@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-from __future__ import print_function, absolute_import
-from six import string_types
 import csv
 import logging
 import re
@@ -19,7 +17,7 @@ from psycopg2.sql import SQL, Identifier, Placeholder, Literal, Composable
 from psycopg2.extras import execute_values
 
 from .encoding import Json
-from .utils import reraise, DelayCommit, QueryLogFilter
+from .utils import reraise, DelayCommit, QueryLogFilter, psycopg2_version
 
 
 # This list is used when creating new tables
@@ -200,7 +198,7 @@ def _meta_table_name(meta_name):
     return table_name
 
 
-class PostgresBase(object):
+class PostgresBase():
     """
     A base class for various objects that interact with Postgres.
 
@@ -217,10 +215,10 @@ class PostgresBase(object):
         logging_options = db.config.options["logging"]
         self.slow_cutoff = logging_options["slowcutoff"]
         self.logger = l = logging.getLogger(loggername)
-        l.propogate = False
+        l.propagate = False
         # we only want 2 handlers
         l.handlers = []
-        l.setLevel(logging.INFO)
+        l.setLevel(logging_options.get('loglevel', logging.INFO))
         formatter = logging.Formatter("%(asctime)s - %(message)s")
         fhandler = logging.FileHandler(logging_options["slowlogfile"])
         fhandler.setFormatter(formatter)
@@ -249,7 +247,7 @@ class PostgresBase(object):
 
         - ``query`` -- an SQL Composable object, the SQL command to execute.
         - ``values`` -- values to substitute for %s in the query.  Quoting from the documentation
-            for psycopg2 (http://initd.org/psycopg/docs/usage.html#passing-parameters-to-sql-queries):
+            for psycopg2 (https://initd.org/psycopg/docs/usage.html#passing-parameters-to-sql-queries):
 
             Never, never, NEVER use Python string concatenation (+) or string parameters
             interpolation (%) to pass variables to a SQL query string. Not even at gunpoint.
@@ -374,8 +372,14 @@ class PostgresBase(object):
 
         - ``tablename`` -- a string, the name of the table
         """
-        cur = self._execute(SQL("SELECT 1 from pg_tables where tablename=%s"), [tablename], silent=True)
+        cur = self._execute(SQL("SELECT 1 FROM pg_tables where tablename=%s"), [tablename], silent=True)
         return cur.fetchone() is not None
+
+    def _all_tablenames(self):
+        """
+        Return all (postgres) table names in the database
+        """
+        return [rec[0] for rec in self._execute(SQL("SELECT tablename FROM pg_tables ORDER BY tablename"), silent=True)]
 
     def _get_locks(self):
         return self._execute(SQL(
@@ -420,7 +424,7 @@ class PostgresBase(object):
         A list of pairs (locktype, pid) where locktype is a string as above,
         and pid is the process id of the postgres transaction holding the lock.
         """
-        if isinstance(types, string_types):
+        if isinstance(types, str):
             if types in ["update", "delete", "insert"]:
                 types = [
                     "ShareLock",
@@ -455,7 +459,7 @@ class PostgresBase(object):
         return [
             (locktype, pid)
             for (name, locktype, pid, t) in self._get_locks()
-            if name == tablename and (types == "all" or locktype in types)
+            if name == tablename and (types == "all" or locktype in types) and pid != self.conn.info.backend_pid
         ]
 
     def _index_exists(self, indexname, tablename=None):
@@ -667,7 +671,7 @@ class PostgresBase(object):
         INPUT:
 
         - ``sort_list`` -- a list, either of strings (which are interpreted as
-        column names in the ascending direction) or of pairs (column name, 1 or -1).
+          column names in the ascending direction) or of pairs (column name, 1 or -1).
 
         OUTPUT:
 
@@ -675,12 +679,12 @@ class PostgresBase(object):
         """
         L = []
         for col in sort_list:
-            if isinstance(col, string_types):
+            if isinstance(col, str):
                 L.append(Identifier(col))
             elif col[1] == 1:
                 L.append(Identifier(col[0]))
             else:
-                L.append(SQL("{0} DESC").format(Identifier(col[0])))
+                L.append(SQL("{0} DESC NULLS LAST").format(Identifier(col[0])))
         return SQL(", ").join(L)
 
     def _column_types(self, table_name, data_types=None):
@@ -694,34 +698,34 @@ class PostgresBase(object):
 
         - ``table_name`` -- a string or list of strings
         - ``data_types`` -- (optional) a dictionary providing a list of column names and
-        types for each table name.  If not provided, will be looked up from the database.
+          types for each table name.  If not provided, will be looked up from the database.
 
-        EXAMPLE:
-        sage: db._column_types('non_existant')
-        ([], {}, False)
-        sage: db._column_types('test_table')
-        ([u'dim',
-          u'label',
-          u'discriminant',
-          u'bad_primes',
-          u'new_column1',
-          u'new_label',
-          u'bar'],
-         {u'bad_primes': 'jsonb',
-          u'bar': 'text',
-          u'dim': 'smallint',
-          u'discriminant': 'numeric',
-          u'id': 'bigint',
-          u'label': 'text',
-          u'new_column1': 'text',
-          u'new_label': 'text'},
-         True)
+        EXAMPLES::
 
+            sage: db._column_types('non_existant')
+            ([], {}, False)
+            sage: db._column_types('test_table')
+            ([u'dim',
+              u'label',
+              u'discriminant',
+              u'bad_primes',
+              u'new_column1',
+              u'new_label',
+              u'bar'],
+             {u'bad_primes': 'jsonb',
+              u'bar': 'text',
+              u'dim': 'smallint',
+              u'discriminant': 'numeric',
+              u'id': 'bigint',
+              u'label': 'text',
+              u'new_column1': 'text',
+              u'new_label': 'text'},
+             True)
         """
         has_id = False
         col_list = []
         col_type = {}
-        if isinstance(table_name, string_types):
+        if isinstance(table_name, str):
             table_name = [table_name]
         for tname in table_name:
             if data_types is None or tname not in data_types:
@@ -775,7 +779,7 @@ class PostgresBase(object):
                     print("Created file %s" % filename)
 
     def _check_header_lines(
-        self, F, table_name, columns_set, sep=u"|", prohibit_missing=True
+        self, F, table_name, columns_set, sep="|", prohibit_missing=True
     ):
         """
         Reads the header lines from a file (row of column names, row of column
@@ -855,7 +859,7 @@ class PostgresBase(object):
         - ``kwds`` -- passed on to psycopg2's copy_from
         """
         kwds = dict(kwds)  # to not modify the dict kwds, with the pop
-        sep = kwds.pop("sep", u"|")
+        sep = kwds.pop("sep", "|")
 
         with DelayCommit(self, silence=True):
             with open(filename) as F:
@@ -866,11 +870,12 @@ class PostgresBase(object):
                 else:
                     addid = False
 
-                # We have to add quotes manually since copy_from doesn't accept
-                # psycopg2.sql.Identifiers
-                # None of our column names have double quotes in them. :-D
-                assert all('"' not in col for col in columns)
-                columns = ['"' + col + '"' for col in columns]
+                if psycopg2_version < (2, 9, 0):
+                    # We have to add quotes manually since copy_from doesn't accept
+                    # psycopg2.sql.Identifiers
+                    # None of our column names have double quotes in them. :-D
+                    assert all('"' not in col for col in columns)
+                    columns = ['"' + col + '"' for col in columns]
                 if addid:
                     # create sequence
                     cur_count = self.max_id(table)
@@ -898,6 +903,21 @@ class PostgresBase(object):
 
                 return addid, cur.rowcount
 
+    def _get_tablespace(self):
+        # overridden in table and statstable
+        pass
+
+    def _tablespace_clause(self, tablespace=None):
+        """
+        A clause for use in CREATE statements
+        """
+        if tablespace is None:
+            tablespace = self._get_tablespace()
+        if tablespace is None:
+            return SQL("")
+        else:
+            return SQL(" TABLESPACE {0}").format(Identifier(tablespace))
+
     def _clone(self, table, tmp_table):
         """
         Utility function: creates a table with the same schema as the given one.
@@ -917,7 +937,7 @@ class PostgresBase(object):
                 "Run db.%s.cleanup_from_reload() if you want to delete it and proceed."
                 % (tmp_table, table)
             )
-        creator = SQL("CREATE TABLE {0} (LIKE {1})").format(Identifier(tmp_table), Identifier(table))
+        creator = SQL("CREATE TABLE {0} (LIKE {1}){2}").format(Identifier(tmp_table), Identifier(table), self._tablespace_clause())
         self._execute(creator)
 
     def _check_col_datatype(self, typ):
@@ -927,19 +947,21 @@ class PostgresBase(object):
 
     def _create_table(self, name, columns):
         """
-        Utility function: creates a table with the schema specified by `columns`
+        Utility function: creates a table with the schema specified by ``columns``.
+
+        If self is a table, the new table will be in the same tablespace.
 
         INPUT:
 
         - ``name`` -- the desired name
-        - ``columns`` -- list of pairs, where the first entry is the column name
-        and the second one is the corresponding type
+        - ``columns`` -- list of pairs, where the first entry is
+          the column name and the second one is the corresponding type
         """
         # FIXME make the code use this
         for col, typ in columns:
             self._check_col_datatype(typ)
         table_col = SQL(", ").join(SQL("{0} %s" % typ).format(Identifier(col)) for col, typ in columns)
-        creator = SQL("CREATE TABLE {0} ({1})").format(Identifier(name), table_col)
+        creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(name), table_col, self._tablespace_clause())
         self._execute(creator)
 
     def _create_table_from_header(self, filename, name, sep, addid=True):
@@ -1025,7 +1047,7 @@ class PostgresBase(object):
                 tablename_new = table + target
                 self._execute(rename_table.format(Identifier(tablename_old), Identifier(tablename_new)))
 
-                done = set({})  # done constraints/indexes
+                done = set()  # done constraints/indexes
                 # We threat pkey separately
                 pkey_old = table + source + "_pkey"
                 pkey_new = table + target + "_pkey"
@@ -1061,7 +1083,7 @@ class PostgresBase(object):
                     )
                     done.add(i_target)  # not really needed
 
-    def _read_header_lines(self, F, sep=u"|"):
+    def _read_header_lines(self, F, sep="|"):
         """
         Reads the header lines from a file
         (row of column names, row of column types, blank line).
@@ -1145,16 +1167,16 @@ class PostgresBase(object):
         meta_name_hist_sql = Identifier(meta_name + "_hist")
 
         with open(filename, "r") as F:
-            lines = [line for line in csv.reader(F, delimiter=str(sep))]
-            if len(lines) == 0:
-                return
-            for line in lines:
-                if line[table_name_idx] != search_table:
-                    raise RuntimeError(
-                        "in %s column %d (= %s) in the file "
-                        "doesn't match the search table name %s"
-                        % (filename, table_name_idx, line[table_name_idx], search_table)
-                    )
+            lines = list(csv.reader(F, delimiter=str(sep)))
+        if not lines:
+            return
+        for line in lines:
+            if line[table_name_idx] != search_table:
+                raise RuntimeError(
+                    f"column {table_name_idx} (= {line[table_name_idx]}) "
+                    f"in the file {filename} doesn't match "
+                    f"the search table name {search_table}"
+                )
 
         with DelayCommit(self, silence=True):
             # delete the current columns
