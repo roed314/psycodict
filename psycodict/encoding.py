@@ -17,9 +17,10 @@ try:
         # this fails in sage 9.3
 
         from sage.rings.complex_mpfr import ComplexNumber
+        from sage.rings.complex_mpfr import ComplexField
     except ImportError:
         from sage.rings.complex_number import ComplexNumber
-    from sage.rings.complex_field import ComplexField
+        from sage.rings.complex_field import ComplexField
     from sage.rings.complex_double import ComplexDoubleElement
     from sage.rings.real_mpfr import RealLiteral, RealField, RealNumber
     from sage.rings.integer import Integer
