@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-from __future__ import print_function, absolute_import
-from six import string_types
 import logging
 import time
 from collections import defaultdict
@@ -143,7 +141,7 @@ class PostgresStatsTable(PostgresBase):
     - ``cols`` -- these are the columns specified in the query.  A list, stored as a jsonb.
     - ``values`` -- these could be numbers, or dictionaries giving a more complicated constraint.
         A list, of the same length as ``cols``, stored as a jsonb.
-    - ``count`` -- the number of rows in the search table where the the columns take on the given values.
+    - ``count`` -- the number of rows in the search table where the columns take on the given values.
     - ``extra`` -- false if the count was added in an ``add_stats`` method,
         true if it was added separately (such as by a request on a search results page).
     - ``split`` -- used when column values are arrays.  If true, then the array is split
@@ -182,7 +180,7 @@ class PostgresStatsTable(PostgresBase):
     dictionary whose keys are columns, and whose values are a list of strings giving intervals.
     Counts are computed with values grouped into intervals.
 
-    EXAMPLE::
+    EXAMPLES::
 
         sage: db.mf_newforms.stats.add_bucketed_counts(['level', 'weight'], {'level': ['1','2-10','11-100','101-1000','1001-2000', '2001-4000','4001-6000','6001-8000','8001-10000'], 'weight': ['1','2','3','4','5-8','9-16','17-32','33-64','65-316']})
 
@@ -218,7 +216,11 @@ class PostgresStatsTable(PostgresBase):
                 total = self._slow_count({}, extra=False)
         self.total = total
 
-    def _has_stats(self, jcols, ccols, cvals, threshold, split_list=False, threshold_inequality=False):
+    def _get_tablespace(self):
+        # We use the same tablespace for stats and counts tables as for the main search table
+        return self.table._get_tablespace()
+
+    def _has_stats(self, jcols, ccols, cvals, threshold, split_list=False, threshold_inequality=False, suffix=""):
         """
         Checks whether statistics have been recorded for a given set of columns.
         It just checks whether the "total" stat has been computed.
@@ -250,7 +252,7 @@ class PostgresStatsTable(PostgresBase):
             else:
                 threshold = "threshold = %s"
         selecter = SQL("SELECT 1 FROM {0} WHERE cols = %s AND stat = %s AND {1} AND {2} AND {3}")
-        selecter = selecter.format(Identifier(self.stats), SQL(ccols), SQL(cvals), SQL(threshold))
+        selecter = selecter.format(Identifier(self.stats + suffix), SQL(ccols), SQL(cvals), SQL(threshold))
         cur = self._execute(selecter, values)
         return cur.rowcount > 0
 
@@ -270,6 +272,8 @@ class PostgresStatsTable(PostgresBase):
 
         Either an integer giving the number of results, or None if not cached.
         """
+        if not query:
+            return self.total
         cols, vals = self._split_dict(query)
         selecter = SQL(
             "SELECT count FROM {0} WHERE cols = %s AND values = %s AND split = %s"
@@ -277,6 +281,27 @@ class PostgresStatsTable(PostgresBase):
         cur = self._execute(selecter, [cols, vals, split_list])
         if cur.rowcount:
             return int(cur.fetchone()[0])
+
+    def null_counts(self, suffix=""):
+        """
+        Returns the columns with null values, together with the count of the number of null rows for each
+        """
+        selecter = SQL(
+            "SELECT cols, count FROM {0} WHERE values = %s AND split = %s"
+        ).format(Identifier(self.counts + suffix))
+        cur = self._execute(selecter, [Json([None]), False])
+        allcounts = {rec[0][0]: rec[1] for rec in cur}
+        for col in self.table.search_cols:
+            if col not in allcounts:
+                allcounts[col] = self._slow_count({col: None}, suffix=suffix, extra=False)
+        return {col: cnt for col, cnt in allcounts.items() if cnt > 0}
+
+    def refresh_null_counts(self, suffix=""):
+        """
+        Recomputes the counts of null values for all search columns
+        """
+        for col in self.table.search_cols:
+            self._slow_count({col: None}, suffix=suffix, extra=False)
 
     def _slow_count(self, query, split_list=False, record=True, suffix="", extra=True):
         """
@@ -311,22 +336,30 @@ class PostgresStatsTable(PostgresBase):
         """
         Add the count to the counts table.
 
-        INPUT::
+        INPUT:
 
         - ``query`` -- a dictionary
         - ``count`` -- the count of rows in the search table satisfying the query
         - ``split_list`` -- see the ``add_stats`` method
         - ``suffix`` -- if provided, the table with that suffix added will be
-            used to store the count
+          used to store the count
         - ``extra`` -- see the discussion at the top of this class.
         """
+        # We only want to record 0 counts for value [NULL], since other cases can break stats
+        nullrec = (list(query.values()) == [None])
         cols, vals = self._split_dict(query)
         data = [count, cols, vals, split_list]
         if self.quick_count(query, suffix=suffix) is None:
+            if count == 0 and not nullrec:
+                return # we don't want to store 0 counts since it can break stats
             updater = SQL("INSERT INTO {0} (count, cols, values, split, extra) VALUES (%s, %s, %s, %s, %s)")
             data.append(extra)
         else:
-            updater = SQL("UPDATE {0} SET count = %s WHERE cols = %s AND values = %s AND split = %s")
+            if count == 0 and not nullrec:
+                updater = SQL("DELETE FROM {0} WHERE cols = %s AND values = %s AND split = %s")
+                data = [cols, vals, split_list]
+            else:
+                updater = SQL("UPDATE {0} SET count = %s WHERE cols = %s AND values = %s AND split = %s")
         try:
             # This will fail if we don't have write permission,
             # for example, if we're running as the lmfdb user
@@ -364,8 +397,6 @@ class PostgresStatsTable(PostgresBase):
             244006
         """
         if groupby is None:
-            if not query:
-                return self.total
             nres = self.quick_count(query)
             if nres is None:
                 nres = self._slow_count(query, record=record)
@@ -386,14 +417,14 @@ class PostgresStatsTable(PostgresBase):
             cur = self._execute(selecter, values)
             return {tuple(rec[1:]): int(rec[0]) for rec in cur}
 
-    def quick_count_distinct(self, col, query={}, suffix=""):
+    def quick_count_distinct(self, cols, query={}, suffix=""):
         """
         Tries to quickly determine the number of distinct values of a column
         using the stats table.
 
         INPUT:
 
-        - ``col`` -- a string, the name of a column
+        - ``cols`` -- a list of column names
         - ``query`` -- a search query, as a dictionary
         - ``suffix`` -- if provided, the table with that suffix added will be
             used to perform the count
@@ -404,17 +435,17 @@ class PostgresStatsTable(PostgresBase):
         """
         ccols, cvals = self._split_dict(query)
         selecter = SQL("SELECT value FROM {0} WHERE stat = %s AND cols = %s AND constraint_cols = %s AND constraint_values = %s").format(Identifier(self.stats + suffix))
-        cur = self._execute(selecter, ["distinct", Json([col]), ccols, cvals])
+        cur = self._execute(selecter, ["distinct", Json(cols), ccols, cvals])
         if cur.rowcount:
             return int(cur.fetchone()[0])
 
-    def _slow_count_distinct(self, col, query={}, record=True, suffix=""):
+    def _slow_count_distinct(self, cols, query={}, record=True, suffix=""):
         """
         No shortcuts: actually count the number of distinct values in the search table.
 
         INPUT:
 
-        - ``col`` -- a string, the name of a column
+        - ``cols`` -- a list of column names
         - ``query`` -- a search query, as a dictionary
         - ``record`` -- boolean (default True).  Whether to store the result in the stats table.
         - ``suffix`` -- if provided, the table with that suffix added will be
@@ -422,33 +453,34 @@ class PostgresStatsTable(PostgresBase):
 
         OUTPUT:
 
-        The number of distinct values taken on by the specified column among rows satisfying the constraint.
+        The number of distinct values taken on by the specified columns among rows satisfying the constraint.
         """
-        selecter = SQL("SELECT COUNT(DISTINCT {0}) FROM {1}").format(Identifier(col), Identifier(self.search_table))
         qstr, values = self.table._parse_dict(query)
-        if qstr is not None:
-            selecter = SQL("{0} WHERE {1}").format(selecter, qstr)
+        selecter = SQL("SELECT COUNT(*) FROM (SELECT DISTINCT {0} FROM {1}{2}) AS temp").format(
+            SQL(", ").join(map(Identifier, cols)),
+            Identifier(self.search_table + suffix),
+            SQL("") if qstr is None else SQL(" WHERE {0}").format(qstr))
         cur = self._execute(selecter, values)
         nres = cur.fetchone()[0]
         if record and self.saving:
-            self._record_count_distinct(col, query, nres, suffix)
+            self._record_count_distinct(cols, query, nres, suffix)
         return nres
 
-    def _record_count_distinct(self, col, query, count, suffix=""):
+    def _record_count_distinct(self, cols, query, count, suffix=""):
         """
         Add the count to the stats table.
 
         INPUT:
 
-        - ``col`` -- a string, the name of a column
+        - ``cols`` -- a list of column names
         - ``query`` -- a search query, as a dictionary
         - ``count`` -- the number of distinct values taken on by the column
         - ``suffix`` -- if provided, the table with that suffix added will be
             used to perform the count
         """
         ccols, cvals = self._split_dict(query)
-        data = [count, Json([col]), "distinct", ccols, cvals]
-        if self.quick_count_distinct(col, query, suffix=suffix) is None:
+        data = [count, Json(cols), "distinct", ccols, cvals]
+        if self.quick_count_distinct(cols, query, suffix=suffix) is None:
             updater = SQL("INSERT INTO {0} (value, cols, stat, constraint_cols, constraint_values) VALUES (%s, %s, %s, %s, %s)")
         else:
             updater = SQL("UPDATE {0} SET value = %s WHERE cols = %s AND stats = %s AND constraint_cols = %s AND constraint_values = %s")
@@ -461,22 +493,24 @@ class PostgresStatsTable(PostgresBase):
 
     def count_distinct(self, col, query={}, record=True):
         """
-        Count the number of distinct values taken on by a given column.
+        Count the number of distinct values taken on by given column(s).
 
         The result will be the same as taking the length of the distinct values, but a bit faster and caches the answer
 
         INPUT:
 
-        - ``col`` -- the name of the column
+        - ``col`` -- the name of the column, or a list of such names
         - ``query`` -- a query dictionary constraining which rows are considered
         - ``record`` -- (default True) whether to record the number of results in the stats table.
         """
+        if isinstance(col, str):
+            col = [col]
         nres = self.quick_count_distinct(col, query)
         if nres is None:
             nres = self._slow_count_distinct(col, query, record=record)
         return int(nres)
 
-    def column_counts(self, cols, constraint=None, threshold=None, split_list=False):
+    def column_counts(self, cols, constraint=None, threshold=1, split_list=False):
         """
         Returns all of the counts for a given column or set of columns.
 
@@ -501,7 +535,7 @@ class PostgresStatsTable(PostgresBase):
 
         If the value taken on by a column is a dictionary D, then the key will be tuple(D.items()).  However, we omit entries where D contains only keys starting with ``$``, since these are used to encode queries.
         """
-        if isinstance(cols, string_types):
+        if isinstance(cols, str):
             cols = [cols]
             one_col = True
         else:
@@ -511,7 +545,7 @@ class PostgresStatsTable(PostgresBase):
             ccols, cvals, allcols = Json([]), Json([]), cols
         else:
             ccols, cvals = self._split_dict(constraint)
-            allcols = sorted(list(set(cols + list(constraint))))
+            allcols = sorted(set(cols + list(constraint)))
             # Ideally we would include the constraint in the query, but it's not easy to do that
             # So we check the results in Python
         jcols = Json(cols)
@@ -534,7 +568,7 @@ class PostgresStatsTable(PostgresBase):
         ).format(Identifier(self.counts), thresh)
         cur = self._execute(selecter, [jallcols, split_list])
         if one_col:
-            _make_tuple = lambda x: make_tuple(x)[0]
+            def _make_tuple(x): return make_tuple(x)[0]
         else:
             _make_tuple = make_tuple
         if constraint is None:
@@ -545,7 +579,7 @@ class PostgresStatsTable(PostgresBase):
                 for rec in cur
                 if not any(
                     isinstance(val, dict) and all(
-                        isinstance(k, string_types) and k.startswith("$") for k in val
+                        isinstance(k, str) and k.startswith("$") for k in val
                     )
                     for val in rec[0]
                 )
@@ -562,7 +596,7 @@ class PostgresStatsTable(PostgresBase):
                 return all(val[i] == c for i, c in constraint_list) and not any(
                     isinstance(val[i], dict)
                     and all(
-                        isinstance(k, string_types) and k.startswith("$")
+                        isinstance(k, str) and k.startswith("$")
                         for k in val[i]
                     )
                     for i in column_indexes
@@ -577,17 +611,17 @@ class PostgresStatsTable(PostgresBase):
                 if satisfies_constraint(rec[0])
             }
 
-    def _quick_extreme(self, col, ccols, cvals, kind="max"):
+    def _quick_statistic(self, col, ccols, cvals, kind="max"):
         """
         Return the min or max value achieved by the column, or None if not cached.
 
-        INPUT::
+        INPUT:
 
         - ``col`` -- the column
         - ``ccols`` -- constraint columns
         - ``cvals`` -- constraint values.  The max will be taken over rows where
-            the constraint columns take on these values.
-        - ``kind`` -- either "min" or "max"
+          the constraint columns take on these values.
+        - ``kind`` -- either "min" or "max" or "sum"
         """
         constraint = SQL("constraint_cols = %s AND constraint_values = %s")
         values = [kind, Json([col]), ccols, cvals]
@@ -598,15 +632,15 @@ class PostgresStatsTable(PostgresBase):
         if cur.rowcount:
             return cur.fetchone()[0]
 
-    def _slow_extreme(self, col, constraint, kind="max"):
+    def _slow_statistic(self, col, constraint, kind="max"):
         """
         Compute the minimum/maximum value achieved by the column.
 
-        INPUT::
+        INPUT:
 
         - ``col`` -- the column
-        - ``constraint`` -- a dictionary giving a constraint.  The min/max will be taken
-            over rows satisfying this constraint.
+        - ``constraint`` -- a dictionary giving a constraint.
+          The min/max will be taken over rows satisfying this constraint.
         """
         qstr, values = self.table._parse_dict(constraint)
         if qstr is None:
@@ -614,10 +648,13 @@ class PostgresStatsTable(PostgresBase):
             values = []
         else:
             where = SQL(" WHERE {0}").format(qstr)
+
         if kind == "min":
             base_selecter = SQL("SELECT {0} FROM {1}{2} ORDER BY {0}")
         elif kind == "max":
             base_selecter = SQL("SELECT {0} FROM {1}{2} ORDER BY {0} DESC ")
+        elif kind == "sum":
+            base_selecter = SQL("SELECT SUM({0}) FROM {1}{2} ")
         else:
             raise ValueError("Invalid kind")
         base_selecter = base_selecter.format(
@@ -634,9 +671,9 @@ class PostgresStatsTable(PostgresBase):
             m = cur.fetchone()[0]
         return m
 
-    def _record_extreme(self, col, ccols, cvals, m, kind="max"):
+    def _record_statistic(self, col, ccols, cvals, m, kind="max"):
         """
-        Store a computed maximum value in the stats table.
+        Store a computed statistic (referenced by `kind`) in the stats table.
 
         INPUT:
 
@@ -644,6 +681,7 @@ class PostgresStatsTable(PostgresBase):
         - ``ccols`` -- the constraint columns
         - ``cvals`` -- the constraint values
         - ``m`` -- the maximum value to be stored
+        - ``kind`` -- the kind of statistic. Usually `min` or `max` or `sum`
         """
         try:
             inserter = SQL(
@@ -683,11 +721,11 @@ class PostgresStatsTable(PostgresBase):
         if col not in self.table.search_cols:
             raise ValueError("%s not a column of %s" % (col, self.search_table))
         ccols, cvals = self._split_dict(constraint)
-        m = self._quick_extreme(col, ccols, cvals, kind="max")
+        m = self._quick_statistic(col, ccols, cvals, kind="max")
         if m is None:
-            m = self._slow_extreme(col, constraint, kind="max")
+            m = self._slow_statistic(col, constraint, kind="max")
             if record and self.saving:
-                self._record_extreme(col, ccols, cvals, m, kind="max")
+                self._record_statistic(col, ccols, cvals, m, kind="max")
         return m
 
     def min(self, col, constraint={}, record=True):
@@ -712,11 +750,23 @@ class PostgresStatsTable(PostgresBase):
         if col not in self.table.search_cols:
             raise ValueError("%s not a column of %s" % (col, self.search_table))
         ccols, cvals = self._split_dict(constraint)
-        m = self._quick_extreme(col, ccols, cvals, kind="min")
+        m = self._quick_statistic(col, ccols, cvals, kind="min")
         if m is None:
-            m = self._slow_extreme(col, constraint, kind="min")
+            m = self._slow_statistic(col, constraint, kind="min")
             if record and self.saving:
-                self._record_extreme(col, ccols, cvals, m, kind="min")
+                self._record_statistic(col, ccols, cvals, m, kind="min")
+        return m
+
+    def sum(self, col, constraint={}, record=True):
+        """
+        Look up sum; if it exists return it, otherwise compute it, store it, and return
+        """
+        ccols, cvals = self._split_dict(constraint)
+        m = self._quick_statistic(col, ccols, cvals, kind="sum")
+        if m is None:
+            m = self._slow_statistic(col, constraint, kind="sum")
+            if record:
+                self._record_statistic(col, ccols, cvals, m, kind="sum")
         return m
 
     def _bucket_iterator(self, buckets, constraint):
@@ -924,7 +974,7 @@ class PostgresStatsTable(PostgresBase):
         - ``suffix`` -- if given, the counts will be performed on the table with the suffix appended.
         - ``commit`` -- if false, the results will not be committed to the database.
         """
-        if isinstance(grouping, string_types):
+        if isinstance(grouping, str):
             grouping = [grouping]
         else:
             grouping = sorted(grouping)
@@ -936,7 +986,7 @@ class PostgresStatsTable(PostgresBase):
         where, values, constraint, ccols, cvals, _ = self._process_constraint([col], constraint)
         jcol = Json([col])
         jcgcols = Json(sorted(ccols.adapted + grouping))
-        if self._has_numstats(jcol, jcgcols, cvals, threshold):
+        if self._has_numstats(jcol, jcgcols, cvals, threshold, suffix=suffix):
             self.logger.info("Numstats already exist")
             return
         now = time.time()
@@ -990,7 +1040,7 @@ class PostgresStatsTable(PostgresBase):
             )
         self.logger.info("Added numstats in %.3f secs" % (time.time() - now))
 
-    def _has_numstats(self, jcol, cgcols, cvals, threshold):
+    def _has_numstats(self, jcol, cgcols, cvals, threshold, suffix=""):
         """
         Checks whether statistics have been recorded for a given set of columns.
         It just checks whether the "ntotal" stat has been added.
@@ -1011,7 +1061,7 @@ class PostgresStatsTable(PostgresBase):
             values.append(threshold)
             threshold = "threshold = %s"
         selecter = SQL("SELECT 1 FROM {0} WHERE cols = %s AND stat = %s AND constraint_cols = %s AND constraint_values = %s AND {1}")
-        selecter = selecter.format(Identifier(self.stats), SQL(threshold))
+        selecter = selecter.format(Identifier(self.stats + suffix), SQL(threshold))
         cur = self._execute(selecter, values)
         return cur.rowcount > 0
 
@@ -1035,10 +1085,10 @@ class PostgresStatsTable(PostgresBase):
 
         OUTPUT:
 
-        A dictionary with keys the possible values taken on the the columns in grouping.
+        A dictionary with keys the possible values taken on the columns in grouping.
         Each value is a dictionary with keys 'min', 'max', 'avg'
         """
-        if isinstance(grouping, string_types):
+        if isinstance(grouping, str):
             onegroup = True
             grouping = [grouping]
         else:
@@ -1066,7 +1116,7 @@ class PostgresStatsTable(PostgresBase):
         selecter = selecter.format(Identifier(self.stats), threshold)
         nstats = defaultdict(dict)
         if onegroup:
-            _make_tuple = lambda x: make_tuple(x)[0]
+            def _make_tuple(x): return make_tuple(x)[0]
         else:
             _make_tuple = make_tuple
         for rec in self._execute(selecter, values):
@@ -1121,7 +1171,7 @@ class PostgresStatsTable(PostgresBase):
             else:
                 ccols, cvals = self._split_dict(constraint)
             # We need to include the constraints in the count table if we're not grouping by that column
-            allcols = sorted(list(set(cols + list(constraint))))
+            allcols = sorted(set(cols + list(constraint)))
             if any(key.startswith("$") for key in constraint):
                 raise ValueError("Top level special keys not allowed")
             qstr, values = self.table._parse_dict(constraint)
@@ -1223,12 +1273,15 @@ class PostgresStatsTable(PostgresBase):
 
         Returns a boolean: whether any counts were stored.
         """
+        if self._db._read_only:
+            self.logger.info("Read only mode, not recording stats")
+            return
         from sage.all import cartesian_product_iterator
         if split_list and threshold is not None:
             raise ValueError("split_list and threshold not simultaneously supported")
         cols = sorted(cols)
         where, values, constraint, ccols, cvals, allcols = self._process_constraint(cols, constraint)
-        if self._has_stats(Json(cols), ccols, cvals, threshold, split_list):
+        if self._has_stats(Json(cols), ccols, cvals, threshold, split_list, suffix=suffix):
             self.logger.info("Statistics already exist")
             return
         now = time.time()
@@ -1323,7 +1376,7 @@ class PostgresStatsTable(PostgresBase):
                 logging.warning(
                     "{:d} rows were just inserted to".format(len(to_add))
                     + " into {}, ".format(self.counts + suffix)
-                    + "all with with cols = {}. ".format(jallcols)
+                    + "all with cols = {}. ".format(jallcols)
                     + "This might decrease the counts table performance "
                     + "significantly! Consider clearing all the stats "
                     + "db.{}.stats._clear_stats_counts()".format(self.search_table)
@@ -1376,7 +1429,7 @@ ORDER BY v.ord LIMIT %s"""
                 common_cols.append(col)
         return common_cols
 
-    def _clear_stats_counts(self, extra=True):
+    def _clear_stats_counts(self, extra=True, suffix=""):
         """
         Deletes all stats and counts.  This cannot be undone.
 
@@ -1385,10 +1438,10 @@ ORDER BY v.ord LIMIT %s"""
         - ``extra`` -- if false, only delete the rows of the counts table not marked as extra.
         """
         deleter = SQL("DELETE FROM {0}")
-        self._execute(deleter.format(Identifier(self.stats)))
+        self._execute(deleter.format(Identifier(self.stats + suffix)))
         if not extra:
             deleter = SQL("DELETE FROM {0} WHERE extra IS NOT TRUE")  # false and null
-        self._execute(deleter.format(Identifier(self.counts)))
+        self._execute(deleter.format(Identifier(self.counts + suffix)))
 
     def add_stats_auto(self, cols=None, constraints=[None], max_depth=None, threshold=1000):
         """
@@ -1451,9 +1504,13 @@ ORDER BY v.ord LIMIT %s"""
                                 curlevel.append((colvec + col, j))
                     level += 1
 
-    def _status(self):
+    def _status(self, reset_None_to_1=False):
         """
         Returns information that can be used to recreate the statistics table.
+
+        INPUT:
+
+        - ``reset_None_to_1`` -- change threshold None to 1 in the stored statistics
 
         OUTPUT:
 
@@ -1474,12 +1531,19 @@ ORDER BY v.ord LIMIT %s"""
                 ccols = []
                 cvals = []
             else:
-                grouping = cgcols[len(cvals) :]
+                grouping = cgcols[len(cvals):]
                 ccols = cgcols[: len(cvals)]
             nstat_cmds.append((cols[0], grouping, ccols, cvals, threshold))
+        if reset_None_to_1:
+            for L in [stat_cmds, split_cmds, nstat_cmds]:
+                for i in range(len(L)):
+                    newval = list(L[i])
+                    if newval[-1] is None:
+                        newval[-1] = 1
+                        L[i] = tuple(newval)
         return stat_cmds, split_cmds, nstat_cmds
 
-    def refresh_stats(self, total=True, suffix=""):
+    def refresh_stats(self, total=True, reset_None_to_1=False, suffix=""):
         """
         Regenerate stats and counts, using rows with ``stat = "total"`` in the stats
         table to determine which stats to recompute, and the rows with ``extra = True``
@@ -1489,6 +1553,7 @@ ORDER BY v.ord LIMIT %s"""
 
         - ``total`` -- if False, doesn't update the total count (since we can often
             update the total cheaply)
+        - ``reset_None_to_1`` -- change threshold None to 1 in stored statistics
         - ``suffix`` -- appended to the table name when computing and storing stats.
             Used when reloading a table.
         """
@@ -1496,7 +1561,7 @@ ORDER BY v.ord LIMIT %s"""
         t0 = time.time()
         with DelayCommit(self, silence=True):
             # Determine the stats and counts currently recorded
-            stat_cmds, split_cmds, nstat_cmds = self._status()
+            stat_cmds, split_cmds, nstat_cmds = self._status(reset_None_to_1)
             col_value_dict = self.extra_counts(include_counts=False, suffix=suffix)
 
             # Delete all stats and counts
@@ -1506,23 +1571,24 @@ ORDER BY v.ord LIMIT %s"""
 
             # Regenerate stats and counts
             for cols, ccols, cvals, threshold in stat_cmds:
-                self.add_stats(cols, (ccols, cvals), threshold)
+                self.add_stats(cols, (ccols, cvals), threshold, suffix=suffix)
             for cols, ccols, cvals, threshold in split_cmds:
-                self.add_stats(cols, (ccols, cvals), threshold, split_list=True)
+                self.add_stats(cols, (ccols, cvals), threshold, split_list=True, suffix=suffix)
             for col, grouping, ccols, cvals, threshold in nstat_cmds:
-                self.add_numstats(col, grouping, (ccols, cvals), threshold)
+                self.add_numstats(col, grouping, (ccols, cvals), threshold, suffix=suffix)
             self._add_extra_counts(col_value_dict, suffix=suffix)
 
             if total:
                 # Refresh total in meta_tables
                 self.total = self._slow_count({}, suffix=suffix, extra=False)
+            self.refresh_null_counts(suffix=suffix)
             self.logger.info("Refreshed statistics in %.3f secs" % (time.time() - t0))
 
-    def status(self):
+    def status(self, reset_None_to_1=False):
         """
         Prints a status report on the statistics for this table.
         """
-        stat_cmds, split_cmds, nstat_cmds = self._status()
+        stat_cmds, split_cmds, nstat_cmds = self._status(reset_None_to_1)
         col_value_dict = self.extra_counts(include_counts=False)
         have_stats = stat_cmds or split_cmds or nstat_cmds
         if have_stats:
@@ -1657,7 +1723,7 @@ ORDER BY v.ord LIMIT %s"""
         - ``header`` -- a list of lists giving the values to print along the top or side of the table
         - ``data`` -- a dictionary with data on counts
         """
-        selecter_constraints = [SQL("split = %s"), SQL("cols = %s")]
+        selecter_constraints = [SQL("split = %s"), SQL("cols = %s"), SQL("count > 0")]
         if constraint:
             allcols = sorted(set(cols + list(constraint)))
             selecter_values = [split_list, Json(allcols)]
@@ -1736,7 +1802,7 @@ ORDER BY v.ord LIMIT %s"""
             data[values] = D
         # Ensure that we have all the statistics necessary
         ok = True
-        if buckets == {}:
+        if not buckets:
             # Just check that the results are nonempty
             if not data:
                 self.add_stats(cols, constraint, split_list=split_list)
