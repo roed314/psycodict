@@ -12,11 +12,11 @@ SELECT queries using a dictionary.  In addition, the package provides a number o
 # Install
 
 ```
-pip3 install -U git+https://github.com/roed314/psycodict.git@toml#egg=project[pgbinary]
+pip3 install -U git+https://github.com/roed314/psycodict.git#egg=project[pgbinary]
 ```
 or
 ```
-pip3 install -U git+https://github.com/roed314/psycodict.git@toml#egg=project[pgsource]
+pip3 install -U git+https://github.com/roed314/psycodict.git#egg=project[pgsource]
 ```
 
 # Getting started
