@@ -211,7 +211,7 @@ class PostgresStatsTable(PostgresBase):
         self.stats = st + "_stats"
         self.counts = st + "_counts"
         if total is None:
-            total = self.quick_count({})
+            total = self.quick_count({}, startup=True)
             if total is None:
                 total = self._slow_count({}, extra=False)
         self.total = total
@@ -256,7 +256,7 @@ class PostgresStatsTable(PostgresBase):
         cur = self._execute(selecter, values)
         return cur.rowcount > 0
 
-    def quick_count(self, query, split_list=False, suffix=""):
+    def quick_count(self, query, split_list=False, suffix="", startup=False):
         """
         Tries to quickly determine the number of results for a given query
         using the count table.
@@ -272,7 +272,7 @@ class PostgresStatsTable(PostgresBase):
 
         Either an integer giving the number of results, or None if not cached.
         """
-        if not query:
+        if not query and not startup:
             return self.total
         cols, vals = self._split_dict(query)
         selecter = SQL(
