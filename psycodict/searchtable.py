@@ -898,7 +898,7 @@ class PostgresSearchTable(PostgresTable):
                     info["number"] = self.count(query)
                 return self._search_iterator(cur, search_cols, extra_cols, projection, query=query, silent=silent)
             if nres is None:
-                exact_count = cur.rowcount < prelimit
+                exact_count = cur.rowcount < prelimit and (offset == 0 or cur.rowcount > 0)
                 nres = offset + cur.rowcount
             else:
                 exact_count = True
@@ -909,7 +909,13 @@ class PostgresSearchTable(PostgresTable):
                 # We're passing in an info dictionary, so this is a front end query,
                 # and the user has requested a start location larger than the number
                 # of results.  We adjust the results to be the last page instead.
-                offset -= (1 + (offset - nres) / limit) * limit
+
+                # nres may not be accurate here, but we could get a recursion error
+                # if offset is very large compared to the actual number of results
+                # and we just reduce the offset by the limit each time.  So we count for real.
+                if not exact_count:
+                    nres = self.stats.count(query)
+                offset = nres - limit
                 if offset < 0:
                     offset = 0
                 return self.search(
