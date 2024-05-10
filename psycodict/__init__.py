@@ -26,6 +26,11 @@ You can search using the methods ``search``, ``lucky`` and ``lookup``::
 
 """
 
+try:
+    import psycopg2
+except ImportError:
+    print('Missing psycopg2 dependency; either do "pip -install psycopg2-binary" or "pip -install psycopg2" (requires a C compiler, some development packages)')
+    raise
 
 from .utils import DelayCommit
 
