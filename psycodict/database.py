@@ -597,8 +597,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         sort=None,
         id_ordered=None,
         extra_columns=None,
-        search_order=None,
-        extra_order=None,
         tablespace=None,
         force_description=False,
         commit=True,
@@ -609,9 +607,10 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         INPUT:
 
         - ``name`` -- the name of the table, which must include an underscore.  See existing names for consistency.
-        - ``search_columns`` -- a dictionary whose keys are valid postgres types and whose values
-            are lists of column names (or just a string if only one column has the specified type).
-            An id column of type bigint will be added as a primary key (do not include it).
+        - ``search_columns`` -- either a dictionary whose keys are valid postgres types and whose values
+            are lists of column names (or just a string if only one column has the specified type);
+            or a list of pairs (col, type).
+            An id column of type bigint will be added as a primary key if not present.
         - ``label_col`` -- the column holding the LMFDB label.  This will be used in the ``lookup`` method
             and in the display of results on the API.  Use None if there is no appropriate column.
         - ``table_description`` -- a text description of this table
@@ -625,14 +624,12 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             If present, will create a second table (the name with "_extras" appended), linked by
             an id column.  Data in this table cannot be searched on, but will also not appear
             in the search table, speeding up scans.
-        - ``search_order`` -- (optional) list of column names, specifying the default order of columns
-        - ``extra_order`` -- (optional) list of column names, specifying the default order of columns
         - ``tablespace`` -- (optional) a postgres tablespace to use for the new table
         - ``force_description`` -- whether to require descriptions
 
         COMMON TYPES:
 
-        The postgres types most commonly used in the lmfdb are:
+        The postgres types most commonly used are:
 
         - smallint -- a 2-byte signed integer.
         - integer -- a 4-byte signed integer.
@@ -650,6 +647,17 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         now = time.time()
         if id_ordered is None:
             id_ordered = sort is not None
+
+        # Standardize input format for search_columns and extra_columns
+        def pairs_to_dict(L):
+            D = defaultdict(list)
+            for (col, typ) in L:
+                D[typ].append(col)
+            return D
+        if not isinstance(search_columns, dict):
+            search_columns = pairs_to_dict(search_columns)
+        if not isinstance(extra_columns, dict):
+            extra_columns = pairs_to_dict(extra_columns)
         for typ, L in list(search_columns.items()):
             if isinstance(L, str):
                 search_columns[typ] = [L]
@@ -662,6 +670,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         # Check that label_col is valid
         if label_col is not None and label_col not in valid_set:
             raise ValueError("label_col must be a search column")
+
         # Check that sort is valid
         if sort is not None:
             for col in sort:
@@ -673,36 +682,27 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     col = col[0]
                 if col not in valid_set:
                     raise ValueError("Column %s does not exist" % (col))
-        # Check that search order is valid
-        if search_order is not None:
-            for col in search_order:
-                if col not in valid_set:
-                    raise ValueError("Column %s does not exist" % (col))
-            if len(search_order) != len(valid_set):
-                raise ValueError("Must include all columns")
 
-        def process_columns(coldict, colorder):
-            allcols = {}
-            hasid = False
-            dictorder = []
-            for typ, cols in coldict.items():
-                self._check_col_datatype(typ)
-                if isinstance(cols, str):
-                    cols = [cols]
-                for col in cols:
+        def process_columns(coldict):
+            if not any("id" in cols for cols in coldict.values()):
+                if "bigint" not in coldict:
+                    coldict["bigint"] = []
+                coldict["bigint"].append("id")
+            allcols = []
+            # For space reasons, we sort the columns by type, then alphabetically within each type
+            # Note that _get_typlen checks that the type is valid
+            dictorder = sorted(coldict, key=self._get_type_sortkey)
+            for typ in dictorder:
+                for col in sorted(coldict[typ]):
                     if col == "id":
                         hasid = True
                     # We have whitelisted the types, so it's okay to use string formatting
                     # to insert them into the SQL command.
                     # This is useful so that we can specify the collation in the type
-                    allcols[col] = SQL("{0} " + typ).format(Identifier(col))
-                    dictorder.append(col)
-            allcols = [allcols[col] for col in (dictorder if colorder is None else colorder)]
-            if not hasid:
-                allcols.insert(0, SQL("id bigint"))
+                    allcols.append(SQL("{0} " + typ).format(Identifier(col)))
             return allcols
 
-        processed_search_columns = process_columns(search_columns, search_order)
+        processed_search_columns = process_columns(search_columns)
         # Check that descriptions are provided if required
         if extra_columns is not None:
             valid_extra_list = sum(extra_columns.values(), [])
@@ -717,7 +717,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                         raise ValueError("Column %s does not exist" % (col))
                 if len(extra_order) != len(valid_extra_set):
                     raise ValueError("Must include all columns")
-            processed_extra_columns = process_columns(extra_columns, extra_order)
+            processed_extra_columns = process_columns(extra_columns)
         else:
             processed_extra_columns = []
         description_columns = []
