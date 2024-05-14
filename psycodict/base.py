@@ -20,86 +20,89 @@ from .encoding import Json
 from .utils import reraise, DelayCommit, QueryLogFilter, psycopg2_version
 
 
-# This list is used when creating new tables
-number_types = [
-    "int2",
-    "smallint",
-    "smallserial",
-    "serial2",
-    "int4",
-    "int",
-    "integer",
-    "serial",
-    "serial4",
-    "int8",
-    "bigint",
-    "bigserial",
-    "serial8",
-    "numeric",
-    "decimal",
-    "float4",
-    "real",
-    "float8",
-    "double precision",
+# This dictionary is used when creating new tables
+# The value associated to each type is the typlen from the pg_type table
+# Reverse sorting by this typlen improves space efficiency
+# due to postgres' alignment requirements
+number_types = {
+    "int2": 2,
+    "smallint": 2,
+    "smallserial": 2,
+    "serial2": 2,
+    "int4": 4,
+    "int": 4,
+    "integer": 4,
+    "serial": 4,
+    "serial4": 4,
+    "int8": 8,
+    "bigint": 8,
+    "bigserial": 8,
+    "serial8": 8,
+    "numeric": -1,
+    "decimal": -1,
+    "float4": 4,
+    "real": 4,
+    "float8": 8,
+    "double precision": 8,
+}
+types_whitelist = {
+    "boolean": 1,
+    "bool": 1,
+    "text": -1,
+    "char": 1,
+    "character": 1,
+    "character varying": -1,
+    "varchar": -1,
+    "json": -1,
+    "jsonb": -1,
+    "xml": -1,
+    "date": 4,
+    "interval": 16,
+    "time": 8,
+    "time without time zone": 8,
+    "time with time zone": 12,
+    "timetz": 12,
+    "timestamp": 8,
+    "timestamp without time zone": 8,
+    "timestamp with time zone": 8,
+    "timestamptz": 8,
+    "bytea": -1,
+    "bit": -1,
+    "bit varying": -1,
+    "varbit": -1,
+    "point": 16,
+    "line": 24,
+    "lseg": 32,
+    "path": -1,
+    "box": 32,
+    "polygon": -1,
+    "circle": 24,
+    "tsquery": -1,
+    "tsvector": -1,
+    "txid_snapshot": -1,
+    "uuid": 16,
+    "cidr": -1,
+    "inet": -1,
+    "macaddr": 6,
+    "money": 8,
+    "pg_lsn": 8,
 ]
-types_whitelist = number_types + [
-    "boolean",
-    "bool",
-    "text",
-    "char",
-    "character",
-    "character varying",
-    "varchar",
-    "json",
-    "jsonb",
-    "xml",
-    "date",
-    "interval",
-    "time",
-    "time without time zone",
-    "time with time zone",
-    "timetz",
-    "timestamp",
-    "timestamp without time zone",
-    "timestamp with time zone",
-    "timestamptz",
-    "bytea",
-    "bit",
-    "bit varying",
-    "varbit",
-    "point",
-    "line",
-    "lseg",
-    "path",
-    "box",
-    "polygon",
-    "circle",
-    "tsquery",
-    "tsvector",
-    "txid_snapshot",
-    "uuid",
-    "cidr",
-    "inet",
-    "macaddr",
-    "money",
-    "pg_lsn",
-]
+types_whitelist.update(number_types)
 # add arrays
-types_whitelist += [elt + "[]" for elt in types_whitelist]
-
-# make it a set
-types_whitelist = set(types_whitelist)
+for elt in types_whitelist:
+    types_whitelist[elt + "[]"] = -1
 
 
-param_types_whitelist = [
-    r"^(bit( varying)?|varbit)\s*\([1-9][0-9]*\)$",
-    r'(text|(char(acter)?|character varying|varchar(\s*\(1-9][0-9]*\))?))(\s+collate "(c|posix|[a-z][a-z]_[a-z][a-z](\.[a-z0-9-]+)?)")?',
-    r"^interval(\s+year|month|day|hour|minute|second|year to month|day to hour|day to minute|day to second|hour to minute|hour to second|minute to second)?(\s*\([0-6]\))?$",
-    r"^timestamp\s*\([0-6]\)(\s+with(out)? time zone)?$",
-    r"^time\s*\(([0-9]|10)\)(\s+with(out)? time zone)?$",
-    r"^(numeric|decimal)\s*\([1-9][0-9]*(,\s*(0|[1-9][0-9]*))?\)$",
+param_types_whitelist = {
+    r"^(bit( varying)?|varbit)\s*\([1-9][0-9]*\)$": -1,
+    r'(text|(char(acter)?|character varying|varchar(\s*\(1-9][0-9]*\))?))(\s+collate "(c|posix|[a-z][a-z]_[a-z][a-z](\.[a-z0-9-]+)?)")?': -1,
+    r"^interval(\s+year|month|day|hour|minute|second|year to month|day to hour|day to minute|day to second|hour to minute|hour to second|minute to second)?(\s*\([0-6]\))?$": 16,
+    r"^timestamp\s*\([0-6]\)(\s+with(out)? time zone)?$": 8,
+    r"^time\s*\(([0-9]|10)\)(\s+without time zone)?$": 8,
+    r"^time\s*\(([0-9]|10)\)\s+with time zone$": 12,
+    r"^(numeric|decimal)\s*\([1-9][0-9]*(,\s*(0|[1-9][0-9]*))?\)$": -1,
 ]
-param_types_whitelist = [re.compile(s) for s in param_types_whitelist]
+param_types_whitelist = {re.compile(s): cost for (s, cost) in param_types_whitelist.items()}
 
 ##################################################################
 # meta_* infrastructure                                          #
@@ -690,7 +693,7 @@ class PostgresBase():
     def _column_types(self, table_name, data_types=None):
         """
         Returns the
-            -column list,
+            - column list,
             - column types (as a dict), and
             - has_id for a given table_name or list of table names
 
@@ -748,7 +751,7 @@ class PostgresBase():
                     col_list.append(col)
                 else:
                     has_id = True
-        return col_list, col_type, has_id
+        return sorted(col_list), col_type, has_id
 
     def _copy_to_select(self, select, filename, header="", sep="|", silent=False):
         """
@@ -944,6 +947,18 @@ class PostgresBase():
         if typ.lower() not in types_whitelist:
             if not any(regexp.match(typ.lower()) for regexp in param_types_whitelist):
                 raise RuntimeError("%s is not a valid type" % (typ))
+
+    def _get_type_sortkey(self, typ):
+        """
+        Returns the negated storage cost, together with the type
+        Used to sort columns when creating a table for smaller storage footprint
+        """
+        if typ.lower() in types_whitelist:
+            return -types_whitelist[typ.lower()], typ
+        for regexp, cost in param_types_whitelist.items():
+            if regexp.match(typ.lower()):
+                return -cost, typ
+        raise RuntimeError("%s is not a valid type" % (typ))
 
     def _create_table(self, name, columns):
         """

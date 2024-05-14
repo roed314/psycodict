@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import re
+from bisect import bisect
 
 from psycopg2.sql import SQL, Identifier, Placeholder, Literal
 
@@ -2285,9 +2286,9 @@ class PostgresTable(PostgresBase):
             )
             self._execute(modifier)
             if extra and name != "id":
-                self.extra_cols.append(name)
+                self.extra_cols.insert(bisect(self.extra_cols, name), name)
             elif not extra and name != "id":
-                self.search_cols.append(name)
+                self.search_cols.insert(bisect(self.search_cols, name), name)
             if label:
                 self.set_label(name)
             self.column_description(name, description)
@@ -2500,7 +2501,7 @@ class PostgresTable(PostgresBase):
         if column not in self.extra_cols:
             raise ValueError("%s not an extra column" % (column))
         self._move_column(column, self.extra_table, self.search_table, commit)
-        self.search_cols.append(column)
+        self.search_cols.insert(bisect(self.search_cols, column), column)
         self.extra_cols.remove(column)
 
     def log_db_change(self, operation, **data):
