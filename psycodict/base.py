@@ -89,7 +89,7 @@ types_whitelist = {
 }
 types_whitelist.update(number_types)
 # add arrays
-for elt in types_whitelist:
+for elt in list(types_whitelist):
     types_whitelist[elt + "[]"] = -1
 
 
