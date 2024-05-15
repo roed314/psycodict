@@ -86,7 +86,7 @@ types_whitelist = {
     "macaddr": 6,
     "money": 8,
     "pg_lsn": 8,
-]
+}
 types_whitelist.update(number_types)
 # add arrays
 for elt in types_whitelist:
