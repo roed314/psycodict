@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psycodict"
+version = "0.1.1"
+description = "dictionary-based python interface to PostgreSQL databases"
+authors = [{name = "David Roe", email = "roed.math@gmail.com"}, {name = "Edgar Costa", email = "edgarc@mit.edu"}]
+license = {text = "GPL v2+"}
+keywords = ["postgres", "database", "interface"]
+
+[project.urls]
+homepage = "https://github.com/roed314/psycodict"
+repository = "https://github.com/roed314/psycodict"
+
+[project.optional-dependencies]
+pgsource = ["psycopg2>=2.7"]
+pgbinary = ["psycopg2-binary>=2.7"]
+
