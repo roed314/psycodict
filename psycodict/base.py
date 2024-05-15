@@ -101,7 +101,7 @@ param_types_whitelist = {
     r"^time\s*\(([0-9]|10)\)(\s+without time zone)?$": 8,
     r"^time\s*\(([0-9]|10)\)\s+with time zone$": 12,
     r"^(numeric|decimal)\s*\([1-9][0-9]*(,\s*(0|[1-9][0-9]*))?\)$": -1,
-]
+}
 param_types_whitelist = {re.compile(s): cost for (s, cost) in param_types_whitelist.items()}
 
 ##################################################################
