@@ -650,6 +650,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         # Standardize input format for search_columns and extra_columns
         def pairs_to_dict(L):
+            if L is None:
+                return L
             D = defaultdict(list)
             for (col, typ) in L:
                 D[typ].append(col)
