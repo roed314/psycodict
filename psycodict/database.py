@@ -818,8 +818,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             sort=sort,
             id_ordered=id_ordered,
             extra_columns=extra_columns,
-            search_order=search_order,
-            extra_order=extra_order,
         )
         print("Table %s created in %.3f secs" % (name, time.time() - now))
 
