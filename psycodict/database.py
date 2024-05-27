@@ -541,9 +541,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 if not cols:
                     D.pop(typ)
         if not extra_columns:
-            extra_columns = extra_order = None
-        else:
-            extra_order = table.extra_cols
+            extra_columns = None
         label_col = table._label_col
         table_description = table.description()
         col_description = table.column_description()
@@ -559,8 +557,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             sort,
             id_ordered,
             extra_columns,
-            search_order,
-            extra_order,
             tablespace=tablespace,
             commit=commit,
         )
@@ -713,12 +709,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             if len(valid_extra_list) != len(valid_extra_set):
                 C = Counter(valid_extra_list)
                 raise ValueError("Column %s repeated" % (C.most_common(1)[0][0]))
-            if extra_order is not None:
-                for col in extra_order:
-                    if col not in valid_extra_set:
-                        raise ValueError("Column %s does not exist" % (col))
-                if len(extra_order) != len(valid_extra_set):
-                    raise ValueError("Must include all columns")
             processed_extra_columns = process_columns(extra_columns)
         else:
             processed_extra_columns = []
