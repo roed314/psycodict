@@ -729,7 +729,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             if isinstance(col, str):
                 description_columns.append(col)
             else:
-                description_columns.extend(col)
+                description_columns.extend([c for c in col if c != "id"])
         if force_description:
             if table_description is None or col_description is None:
                 raise ValueError("You must provide table and column descriptions")
