@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "psycodict"
-version = "0.1.3"
+version = "0.1.4"
 description = "dictionary-based python interface to PostgreSQL databases"
 authors = [{name = "David Roe", email = "roed.math@gmail.com"}, {name = "Edgar Costa", email = "edgarc@mit.edu"}]
 license = {text = "GPL v2+"}
