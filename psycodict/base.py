@@ -814,8 +814,8 @@ class PostgresBase():
         if "id" in names_set:
             if names[0] != "id":
                 raise ValueError("id must be the first column")
-            if header_cols[0][1] != "bigint":
-                raise ValueError("id must be of type bigint")
+            if header_cols[0][1] not in ["int2", "smallint", "int4", "integer", "int8", "bigint"]:
+                raise ValueError("id must be of integeral type")
             names_set.discard("id")
             header_cols = header_cols[1:]
 
@@ -1007,7 +1007,7 @@ class PostgresBase():
             columns = self._read_header_lines(F, sep)
         col_list = [elt[0] for elt in columns]
         if addid:
-            if ("id", "bigint") not in columns:
+            if "id" not in [col for (col,typ) in columns]:
                 columns = [("id", "bigint")] + columns
 
         self._create_table(name, columns)

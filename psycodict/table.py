@@ -1099,7 +1099,7 @@ class PostgresTable(PostgresBase):
             self._execute(creator)
             # We need to add an id column and populate it correctly
             if label_col != "id":
-                coladd = SQL("ALTER TABLE {0} ADD COLUMN id bigint").format(Identifier(tmp_table))
+                coladd = SQL("ALTER TABLE {0} ADD COLUMN id " + self.col_type["id"]).format(Identifier(tmp_table))
                 self._execute(coladd)
             self._copy_from(datafile, tmp_table, columns, True, kwds)
             if label_col != "id":
@@ -1499,10 +1499,9 @@ class PostgresTable(PostgresBase):
                     "CREATE TEMP SEQUENCE {0} MINVALUE 0 START 0 CACHE 10000"
                 ).format(tmp_seq))
 
+                id_type = self.col_type["id"]
                 self._execute(SQL(
-                    "CREATE TEMP TABLE {0} "
-                    "(oldid bigint, newid bigint NOT NULL DEFAULT nextval('{1}')) "
-                    "ON COMMIT DROP"
+                    "CREATE TEMP TABLE {0} (oldid %s, newid %s NOT NULL DEFAULT nextval('{1}')) ON COMMIT DROP" % (id_type, id_type)
                 ).format(tmp_table, tmp_seq))
 
                 self._execute(SQL(
@@ -2370,7 +2369,7 @@ class PostgresTable(PostgresBase):
                 updater = SQL("UPDATE meta_tables SET (has_extras) = (%s) WHERE name = %s")
                 self._execute(updater, [True, self.search_table])
             self.extra_table = self.search_table + "_extras"
-            col_type = [("id", "bigint")]
+            col_type = [("id", self.col_type["id"])]
             cur = self._indexes_touching(columns)
             if cur.rowcount > 0:
                 raise ValueError(

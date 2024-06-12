@@ -596,6 +596,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         tablespace=None,
         force_description=False,
         commit=True,
+        id_type="bigint",
     ):
         """
         Add a new search table to the database.  See also `create_table_like`.
@@ -606,7 +607,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         - ``search_columns`` -- either a dictionary whose keys are valid postgres types and whose values
             are lists of column names (or just a string if only one column has the specified type);
             or a list of pairs (col, type).
-            An id column of type bigint will be added as a primary key if not present.
+            An id column of type ``id_type`` will be added as a primary key if not present.
         - ``label_col`` -- the column holding the LMFDB label.  This will be used in the ``lookup`` method
             and in the display of results on the API.  Use None if there is no appropriate column.
         - ``table_description`` -- a text description of this table
@@ -622,6 +623,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             in the search table, speeding up scans.
         - ``tablespace`` -- (optional) a postgres tablespace to use for the new table
         - ``force_description`` -- whether to require descriptions
+        - ``id_type`` -- what postgres type to use for the id column
 
         COMMON TYPES:
 
@@ -683,9 +685,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         def process_columns(coldict):
             if not any("id" in cols for cols in coldict.values()):
-                if "bigint" not in coldict:
-                    coldict["bigint"] = []
-                coldict["bigint"].append("id")
+                if id_type not in coldict:
+                    coldict[id_type] = []
+                coldict[id_type].append("id")
             allcols = []
             # For space reasons, we sort the columns by type, then alphabetically within each type
             # Note that _get_typlen checks that the type is valid
