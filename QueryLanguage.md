@@ -93,7 +93,7 @@ For an array column, requires that the input is at least the minimum value in th
 
 The value should be a pair of integers `[a, b]` with `0 <= a < b`, and rows are sought where column is congruent to `a` modulo `b`.  Translates to `MOD(b + MOD(column, b), b) = a` (the circumlocution is due to the fact that `MOD(-1, 5) = -1` in Postgres, which is stupid).
 
-### `#overlaps`
+### `$overlaps`
 
 For array columns, searches for rows where the column overlaps with a given list of values.  Translates to the `&&` operator.
 
