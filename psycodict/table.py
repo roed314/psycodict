@@ -1053,7 +1053,7 @@ class PostgresTable(PostgresBase):
         - ``label_col`` -- a column specifying which row(s) of the table should be updated corresponding to each row of the input file.  This will usually be the label for the table, in which case it can be omitted.
         - ``inplace`` -- whether to do the update in place.  If set, the operation cannot be undone with ``reload_revert``.
         - ``resort`` -- whether this table should be resorted after updating (default is to resort when the sort columns intersect the updated columns)
-        - ``reindex`` -- whether the indexes on this table should be dropped and recreated during update (default is to recreate only the indexes that touch the updated columns)
+        - ``reindex`` -- whether the indexes on this table should be dropped and recreated during update (default is to recreate only the indexes that touch the updated columns).  Note that if ``inplace`` is false (the default), then this option has no effect since indexes must always be built for a new table.
         - ``restat`` -- whether to recompute stats for the table
         - ``commit`` -- whether to actually commit the changes
         - ``log_change`` -- whether to log the update to the log table
