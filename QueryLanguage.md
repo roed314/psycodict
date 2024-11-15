@@ -85,7 +85,7 @@ Uses Postgres' `LIKE` operator to search for rows where the column starts with a
 
 For an array column, requires that the maximum value in the array is at least the input.
 
-### `#anylte`
+### `$anylte`
 
 For an array column, requires that the input is at least the minimum value in the array.  Translates to `value >= ANY(column)`.
 
