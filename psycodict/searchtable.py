@@ -214,6 +214,32 @@ class PostgresSearchTable(PostgresTable):
             else:
                 return SQL("NOT ({0})").format(negated), values
 
+        # --- NEW OR-CHAIN FIX FOR ARRAY $IN ---
+        if key == "$in" and not col_type == "jsonb" and col_type.endswith("[]"):
+            if not value:
+                return SQL("FALSE"), []
+
+            conditions = []
+            all_python_values_for_placeholders = []
+            for sub_array_item in value:
+                # Each condition is: "column_identifier = (placeholder::array_element_type)"
+                # e.g., "torsion_structure" = (%s::smallint[])
+                conditions.append(SQL("{0} = (%s::{1})").format(col, SQL(col_type)))
+                all_python_values_for_placeholders.append(sub_array_item)
+
+            if not conditions: # Should have been caught by "if not value"
+                return SQL("FALSE"), []
+
+            if len(conditions) == 1:
+                # If only one item in the $in list, it's just "col = (value_array::type)"
+                final_cmd = conditions[0]
+            else:
+                # Join multiple conditions with OR, and wrap in parentheses for precedence
+                # e.g., "( (col = (%s::type)) OR (col = (%s::type)) )"
+                final_cmd = SQL("({0})").format(SQL(" OR ").join(conditions))
+
+            return final_cmd, all_python_values_for_placeholders # Return early
+
         # First handle the cases that have unusual values
         if key == "$exists":
             if value:
@@ -249,11 +275,12 @@ class PostgresSearchTable(PostgresTable):
                 cmd = SQL("array_max({0}) >= %s")
             elif key == "$anylte":
                 cmd = SQL("%s >= ANY({0})")
-            elif key == "$in":
+            elif key == "$in": # This now handles scalar $in or jsonb $in
                 if col_type == "jsonb":
                     # jsonb_path_ops modifiers for the GIN index doesn't support this query
                     cmd = SQL("{0} <@ %s")
-                else:
+                    value = Json(value) if not isinstance(value, Json) else value
+                else: # Scalar types for $in
                     cmd = SQL("{0} = ANY(%s)")
             elif key == "$nin":
                 if col_type == "jsonb":
@@ -280,7 +307,7 @@ class PostgresSearchTable(PostgresTable):
             else:
                 raise ValueError("Error building query: {0}".format(key))
             if col_type == "jsonb":
-                value = Json(value)
+                value = Json(value) if not isinstance(value, Json) else value
             cmd = cmd.format(col)
             # For some array types (e.g. numeric), operators such as = and @> can't automatically typecast so we have to do it manually.
             typecast = self._create_typecast(key, value, col, col_type)
