@@ -227,6 +227,16 @@ class PostgresSearchTable(PostgresTable):
                 value = [Json(v) for v in value]
             else:
                 cmd = SQL(" AND ").join(SQL("NOT (%s = ANY({0}))").format(col) * len(value))
+        elif key in ["$in", "$nin"] and col_type.endswith("[]"): # ANY doesn't work here
+            if not (isinstance(value, (list, tuple)) and all(isinstance(x, (list, tuple)) for x in value)):
+                raise ValueError("Error building %s operation: %s" % (key, value))
+            if len(value) == 1:
+                op = "=" if key == "$in" else "!="
+                cmd = SQL("{0} "+op+" %s")
+            else:
+                op = "IN" if key == "$in" else "NOT IN"
+                cmd = SQL("{0} "+op+"(" + ",".join("%s" for _ in value) + ")")
+            cmd = cmd.format(col)
         elif key == "$mod":
             if not (isinstance(value, (list, tuple)) and len(value) == 2):
                 raise ValueError("Error building modulus operation: %s" % value)
@@ -249,13 +259,13 @@ class PostgresSearchTable(PostgresTable):
                 cmd = SQL("array_max({0}) >= %s")
             elif key == "$anylte":
                 cmd = SQL("%s >= ANY({0})")
-            elif key == "$in":
+            elif key == "$in": # col_type is not an array, which is handled above
                 if col_type == "jsonb":
                     # jsonb_path_ops modifiers for the GIN index doesn't support this query
                     cmd = SQL("{0} <@ %s")
                 else:
                     cmd = SQL("{0} = ANY(%s)")
-            elif key == "$nin":
+            elif key == "$nin": # col_type is not an array, which is handled above
                 if col_type == "jsonb":
                     # jsonb_path_ops modifiers for the GIN index doesn't support this query
                     cmd = SQL("NOT ({0} <@ %s)")
