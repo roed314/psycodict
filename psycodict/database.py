@@ -1044,6 +1044,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         restat=None,
         adjust_schema=False,
         commit=True,
+        sequential_swap=False,
         **kwds
     ):
         """
@@ -1055,6 +1056,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             - ``data_folder`` -- the folder that contains files to be reloaded
             - ``halt_on_errors`` -- whether to stop if a DatabaseError is
                 encountered while trying to reload one of the tables
+            - ``sequential_swap`` -- if True, then the whole transaction will not be wrapped in a DelayCommit, which can sometimes prevent deadlocks.
 
         INPUTS passed to `reload` function in `PostgresTable`:
 
@@ -1071,7 +1073,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         if not data_folder.is_dir():
             raise ValueError("The path {} is not a directory".format(data_folder))
         sep = kwds.get("sep", "|")
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, commit, silence=True, active=not sequential_swap):
             file_list = []
             tablenames = []
             non_existent_tables = []
