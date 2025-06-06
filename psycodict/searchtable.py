@@ -186,7 +186,7 @@ class PostgresSearchTable(PostgresTable):
             sage: statement.as_string(db.conn), vals
             ('"ramps" @> %s', [[2, 3, 5]])
         """
-        if col_type.endswith("[]"):
+        if col_type is not None and col_type.endswith("[]"):
             # SQL does not correctly parse the =ANY(...) construction with array types, so we convert to an equivalent OR construction
             if key == "$in":
                 key = "$or"
