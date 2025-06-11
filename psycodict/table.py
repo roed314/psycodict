@@ -1091,16 +1091,9 @@ class PostgresTable(PostgresBase):
         with DelayCommit(self, commit, silence=True):
             if self._table_exists(tmp_table):
                 drop_tmp()
-            processed_columns = SQL(", ").join([
-                SQL("{0} " + self.col_type[col]).format(Identifier(col))
-                for col in columns
-            ])
-            creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(tmp_table), processed_columns, self._tablespace_clause())
-            self._execute(creator)
-            # We need to add an id column and populate it correctly
-            if label_col != "id":
-                coladd = SQL("ALTER TABLE {0} ADD COLUMN id " + self.col_type["id"]).format(Identifier(tmp_table))
-                self._execute(coladd)
+            self._create_table(tmp_table,
+                               [(col, self.col_type[col]) for col in columns],
+                               addid=(label_col != "id" and self.col_type["id"]))
             self._copy_from(datafile, tmp_table, columns, True, kwds)
             if label_col != "id":
                 # When using _copy_from, the id column was just added consecutively
