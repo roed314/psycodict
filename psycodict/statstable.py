@@ -815,7 +815,7 @@ class PostgresStatsTable(PostgresBase):
                 bucketed_constraint.update(D)
             yield bucketed_constraint
 
-    def add_bucketed_counts(self, cols, buckets, constraint={}, commit=True):
+    def add_bucketed_counts(self, cols, buckets, constraint={}):
         """
         A convenience function for adding statistics on a given set of columns,
         where rows are grouped into intervals by a bucketing dictionary.
@@ -834,7 +834,7 @@ class PostgresStatsTable(PostgresBase):
         # as a constraint.
         cols = [col for col in cols if col not in buckets]
         for bucketed_constraint in self._bucket_iterator(buckets, constraint):
-            self.add_stats(cols, bucketed_constraint, commit=commit)
+            self.add_stats(cols, bucketed_constraint)
 
     def _split_dict(self, D):
         """
@@ -950,9 +950,7 @@ class PostgresStatsTable(PostgresBase):
         )
         return self._execute(selecter, values)
 
-    def add_numstats(
-        self, col, grouping, constraint=None, threshold=None, suffix="", commit=True
-    ):
+    def add_numstats(self, col, grouping, constraint=None, threshold=None, suffix=""):
         """
         For each value taken on by the columns in ``grouping``, numerical statistics on ``col`` (min, max, avg) will be added.
 
@@ -972,7 +970,6 @@ class PostgresStatsTable(PostgresBase):
         - ``threshold`` -- if given, only sets of values for the grouping columns where the
             count surpasses this threshold will be included.
         - ``suffix`` -- if given, the counts will be performed on the table with the suffix appended.
-        - ``commit`` -- if false, the results will not be committed to the database.
         """
         if isinstance(grouping, str):
             grouping = [grouping]
@@ -990,7 +987,7 @@ class PostgresStatsTable(PostgresBase):
             self.logger.info("Numstats already exist")
             return
         now = time.time()
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             counts_to_add = []
             stats_to_add = []
             total = 0
@@ -1245,7 +1242,6 @@ class PostgresStatsTable(PostgresBase):
         threshold=None,
         split_list=False,
         suffix="",
-        commit=True,
     ):
         """
         Add statistics on counts, average, min and max values for a given set of columns.
@@ -1262,7 +1258,6 @@ class PostgresStatsTable(PostgresBase):
             the counts for 2, 4 and 8 would each be incremented.  Constraint columns are not split.
             This option is not supported for nontrivial thresholds.
         - ``suffix`` -- if given, the counts will be performed on the table with the suffix appended.
-        - ``commit`` -- if false, the results will not be committed to the database.
 
         OUTPUT:
 
@@ -1305,7 +1300,7 @@ class PostgresStatsTable(PostgresBase):
             avg = 0
             mn = None
             mx = None
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             cur = self._compute_stats(cols, where, values, constraint, threshold, split_list, suffix)
             for countvec in cur:
                 seen_one = True

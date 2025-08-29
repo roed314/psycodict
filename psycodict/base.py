@@ -89,7 +89,7 @@ types_whitelist = {
 }
 types_whitelist.update(number_types)
 # add arrays
-for elt in types_whitelist:
+for elt in list(types_whitelist):
     types_whitelist[elt + "[]"] = -1
 
 
@@ -814,8 +814,8 @@ class PostgresBase():
         if "id" in names_set:
             if names[0] != "id":
                 raise ValueError("id must be the first column")
-            if header_cols[0][1] != "bigint":
-                raise ValueError("id must be of type bigint")
+            if header_cols[0][1] not in ["int2", "smallint", "int4", "integer", "int8", "bigint"]:
+                raise ValueError("id must be of integeral type")
             names_set.discard("id")
             header_cols = header_cols[1:]
 
@@ -948,6 +948,17 @@ class PostgresBase():
             if not any(regexp.match(typ.lower()) for regexp in param_types_whitelist):
                 raise RuntimeError("%s is not a valid type" % (typ))
 
+    def _pairs_to_dict(self, L):
+        """
+        Standardize input format for search_columns and extra_columns
+        """
+        if L is None:
+            return L
+        D = defaultdict(list)
+        for (col, typ) in L:
+            D[typ].append(col)
+        return D
+
     def _get_type_sortkey(self, typ):
         """
         Returns the negated storage cost, together with the type
@@ -960,7 +971,29 @@ class PostgresBase():
                 return -cost, typ
         raise RuntimeError("%s is not a valid type" % (typ))
 
-    def _create_table(self, name, columns):
+    def _order_columns(self, coldict, addid="bigint"):
+        """
+        For space reasons, we sort the columns by type, then alphabetically within each type
+
+        This function returns the correct order of the columns.
+        coldict should be in the format output by _pairs_to_dict.
+        """
+        if addid and not any("id" in vals for vals in coldict.values()):
+            if addid not in coldict: # coldict might be a normal dictionary, not a defaultdict
+                coldict[addid] = []
+            coldict[addid].append("id")
+        allcols = []
+        # Note that _get_typlen checks that the type is valid
+        dictorder = sorted(coldict, key=self._get_type_sortkey)
+        for typ in dictorder:
+            for col in sorted(coldict[typ]):
+                # We have whitelisted the types, so it's okay to use string formatting
+                # to insert them into the SQL command.
+                # This is useful so that we can specify the collation in the type
+                allcols.append(SQL("{0} " + typ).format(Identifier(col)))
+        return allcols
+
+    def _create_table(self, name, columns, addid="bigint", tablespace=None):
         """
         Utility function: creates a table with the schema specified by ``columns``.
 
@@ -972,14 +1005,15 @@ class PostgresBase():
         - ``columns`` -- list of pairs, where the first entry is
           the column name and the second one is the corresponding type
         """
-        # FIXME make the code use this
-        for col, typ in columns:
-            self._check_col_datatype(typ)
-        table_col = SQL(", ").join(SQL("{0} %s" % typ).format(Identifier(col)) for col, typ in columns)
-        creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(name), table_col, self._tablespace_clause())
+        if not isinstance(columns, dict):
+            columns = self._pairs_to_dict(columns)
+        ordered = self._order_columns(columns, addid=addid)
+
+        table_col = SQL(", ").join(self._order_columns(columns, addid=addid))
+        creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(name), table_col, self._tablespace_clause(tablespace))
         self._execute(creator)
 
-    def _create_table_from_header(self, filename, name, sep, addid=True):
+    def _create_table_from_header(self, filename, name, sep, addid="bigint", tablespace=None):
         """
         Utility function: creates a table with the schema specified in the header of the file.
         Returns column names found in the header
@@ -989,7 +1023,7 @@ class PostgresBase():
         - ``filename`` -- a string, the filename to load the table from
         - ``name`` -- the name of the table
         - ``sep`` -- the separator character, defaulting to tab
-        - ``addid`` -- if true, also adds an id column to the created table
+        - ``addid`` -- if true, also adds an id column to the created table with the given type
 
         OUTPUT:
 
@@ -1006,11 +1040,8 @@ class PostgresBase():
         with open(filename, "r") as F:
             columns = self._read_header_lines(F, sep)
         col_list = [elt[0] for elt in columns]
-        if addid:
-            if ("id", "bigint") not in columns:
-                columns = [("id", "bigint")] + columns
 
-        self._create_table(name, columns)
+        self._create_table(name, columns, addid=addid, tablespace=tablespace)
         return col_list
 
     def _swap(self, tables, source, target):

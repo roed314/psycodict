@@ -483,7 +483,7 @@ class PostgresTable(PostgresBase):
             )
         print("Index %s created in %.3f secs" % (name, time.time() - now))
 
-    def drop_index(self, name, suffix="", permanent=False, commit=True):
+    def drop_index(self, name, suffix="", permanent=False):
         """
         Drop a specified index.
 
@@ -494,7 +494,7 @@ class PostgresTable(PostgresBase):
         - ``permanent`` -- whether to remove the index from the meta_indexes table
         """
         now = time.time()
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             if permanent:
                 deleter = SQL("DELETE FROM meta_indexes WHERE table_name = %s AND index_name = %s")
                 self._execute(deleter, [self.search_table, name])
@@ -548,7 +548,7 @@ class PostgresTable(PostgresBase):
             columns = [Json(col) for col in columns]
         return self._execute(selecter, [self.search_table] + columns, silent=True)
 
-    def drop_indexes(self, columns=[], suffix="", commit=True):
+    def drop_indexes(self, columns=[], suffix=""):
         """
         Drop all indexes and constraints.
 
@@ -562,7 +562,7 @@ class PostgresTable(PostgresBase):
         - ``suffix`` -- a string such as "_tmp" or "_old1" to be appended
             to the names in the drop statements.
         """
-        with DelayCommit(self, commit):
+        with DelayCommit(self):
             for res in self._indexes_touching(columns):
                 self.drop_index(res[0], suffix)
             for res in self._constraints_touching(columns):
@@ -589,7 +589,7 @@ class PostgresTable(PostgresBase):
             for res in self._constraints_touching(columns):
                 self.restore_constraint(res[0], suffix)
 
-    def _pkey_common(self, command, suffix, action, commit):
+    def _pkey_common(self, command, suffix, action):
         """
         Common code for ``drop_pkeys`` and ``restore_pkeys``.
 
@@ -600,7 +600,7 @@ class PostgresTable(PostgresBase):
         - ``action`` -- either "Dropped" or "Built", for printing.
         """
         now = time.time()
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             # Note that the primary keys don't follow the same convention as the other
             # indexes, since they end in _pkey rather than the suffix.
             self._execute(command.format(
@@ -614,7 +614,7 @@ class PostgresTable(PostgresBase):
                 ))
         print("%s primary key on %s in %.3f secs" % (action, self.search_table, time.time() - now))
 
-    def drop_pkeys(self, suffix="", commit=True):
+    def drop_pkeys(self, suffix=""):
         """
         Drop the primary key on the id columns.
 
@@ -623,7 +623,7 @@ class PostgresTable(PostgresBase):
         - ``suffix`` -- a string such as "_tmp" or "_old1" to be appended to the names in the ALTER TABLE statements.
         """
         command = SQL("ALTER TABLE {0} DROP CONSTRAINT {1}")
-        self._pkey_common(command, suffix, "Dropped", commit)
+        self._pkey_common(command, suffix, "Dropped")
 
     def restore_pkeys(self, suffix=""):
         """
@@ -804,7 +804,7 @@ class PostgresTable(PostgresBase):
         table = self.search_table + suffix if search else self.extra_table + suffix
         return type, columns, check_func, table
 
-    def drop_constraint(self, name, suffix="", permanent=False, commit=True):
+    def drop_constraint(self, name, suffix="", permanent=False):
         """
         Drop a specified constraint.
 
@@ -815,7 +815,7 @@ class PostgresTable(PostgresBase):
         - ``permanent`` -- whether to remove the index from the meta_constraint table
         """
         now = time.time()
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             type, columns, _, table = self._get_constraint_data(name, suffix)
             dropper = self._drop_constraint_statement(name + suffix, table, type, columns)
             if permanent:
@@ -956,7 +956,6 @@ class PostgresTable(PostgresBase):
         reindex=True,
         restat=True,
         tostr_func=None,
-        commit=True,
         datafile=None,
         progress_count=10000,
         **kwds
@@ -975,7 +974,6 @@ class PostgresTable(PostgresBase):
         - ``restat`` -- whether to recompute statistics after running the rewrite
         - ``tostr_func`` -- a function to be used when writing data to the temp file
             defaults to copy_dumps from encoding
-        - ``commit`` -- whether to actually execute the rewrite
         - ``datafile`` -- a filename to use for the temp file holding the data
         - ``progress_count`` -- (default 10000) how frequently to print out status reports as the rewrite proceeds
         - ``**kwds`` -- any other keyword arguments are passed on to the ``reload`` method
@@ -1040,7 +1038,6 @@ class PostgresTable(PostgresBase):
                 resort=resort,
                 reindex=reindex,
                 restat=restat,
-                commit=commit,
                 logging=dict(operation="rewrite", query=query, projection=projection),
                 **kwds
             )
@@ -1055,7 +1052,6 @@ class PostgresTable(PostgresBase):
         resort=None,
         reindex=True,
         restat=True,
-        commit=True,
         logging={"operation":"file_update"},
         **kwds
     ):
@@ -1070,7 +1066,6 @@ class PostgresTable(PostgresBase):
         - ``resort`` -- whether this table should be resorted after updating (default is to resort when the sort columns intersect the updated columns)
         - ``reindex`` -- whether the indexes on this table should be dropped and recreated during update (default is to recreate only the indexes that touch the updated columns)
         - ``restat`` -- whether to recompute stats for the table
-        - ``commit`` -- whether to actually commit the changes
         - ``logging`` -- a dictionary of keyword arguments for log_db_change
         - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
         """
@@ -1103,7 +1098,7 @@ class PostgresTable(PostgresBase):
             dropper = SQL("DROP TABLE {0}").format(Identifier(tmp_table))
             self._execute(dropper)
 
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             if self._table_exists(tmp_table):
                 drop_tmp()
             self._create_table(tmp_table,
@@ -1128,7 +1123,7 @@ class PostgresTable(PostgresBase):
             etable = None if self.extra_table is None else self.extra_table + suffix
             if inplace:
                 if reindex:
-                    self.drop_indexes(columns[1:], commit=commit)
+                    self.drop_indexes(columns[1:])
                 if self.extra_table is not None and not ecols:
                     etable = None
             else:
@@ -1186,7 +1181,7 @@ class PostgresTable(PostgresBase):
                     if etable is None
                     else [self.search_table, self.extra_table]
                 )
-                self._swap_in_tmp(swapped_tables, commit=commit)
+                self._swap_in_tmp(swapped_tables)
                 if ordered:
                     self._set_ordered()
             # Delete the temporary table used to load the data
@@ -1195,7 +1190,7 @@ class PostgresTable(PostgresBase):
             self.log_db_change(**logging)
             print("Updated %s in %.3f secs" % (self.search_table, time.time() - now))
 
-    def delete(self, query, restat=True, commit=True):
+    def delete(self, query, restat=True):
         """
         Delete all rows matching the query.
 
@@ -1205,7 +1200,7 @@ class PostgresTable(PostgresBase):
         - ``restat`` -- whether to recreate statistics afterward
         """
         logid = self._check_locks("delete")
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             qstr, values = self._parse_dict(query)
             if qstr is None:
                 qstr = SQL("")
@@ -1227,7 +1222,7 @@ class PostgresTable(PostgresBase):
                     self.stats.refresh_stats(total=False)
             self.log_db_change("delete", logid=logid, query=query, nrows=nrows)
 
-    def update(self, query, changes, resort=True, restat=True, commit=True):
+    def update(self, query, changes, resort=True, restat=True):
         """
         Update a table using Postgres' update command
 
@@ -1243,7 +1238,7 @@ class PostgresTable(PostgresBase):
                 # Have to find the ids using the query, then update....
                 raise NotImplementedError
         logid = self._check_locks("update")
-        with DelayCommit(self, commit):
+        with DelayCommit(self):
             qstr, values = self._parse_dict(query)
             if qstr is None:
                 qstr = SQL("")
@@ -1270,7 +1265,7 @@ class PostgresTable(PostgresBase):
                 self.stats.refresh_stats(total=False)
             self.log_db_change("update", logid=logid, query=query, changes=changes)
 
-    def upsert(self, query, data, commit=True):
+    def upsert(self, query, data):
         """
         Update the unique row satisfying the given query, or insert a new row if no such row exists.
         If more than one row exists, raises an error.
@@ -1283,7 +1278,6 @@ class PostgresTable(PostgresBase):
         - ``query`` -- a dictionary with key/value pairs specifying at most one row of the table.
           The most common case is that there is one key, which is either an id or a label.
         - ``data`` -- a dictionary containing key/value pairs to be set on this row.
-        - ``commit`` -- whether to actually execute the upsert.
 
         The keys of both inputs must be columns in either the search or extras table.
 
@@ -1318,7 +1312,7 @@ class PostgresTable(PostgresBase):
         cases = [(self.search_table, search_data)]
         if self.extra_table is not None:
             cases.append((self.extra_table, extras_data))
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             # We have to split this command into a SELECT and an INSERT statement
             # rather than using postgres' INSERT INTO ... ON CONFLICT statement
             # because we have to take different additional steps depending on whether
@@ -1384,7 +1378,7 @@ class PostgresTable(PostgresBase):
             self.log_db_change("upsert", logid=logid, query=query, data=data)
             return new_row, row_id
 
-    def insert_many(self, data, resort=True, reindex=False, restat=True, commit=True):
+    def insert_many(self, data, resort=True, reindex=False, restat=True):
         """
         Insert multiple rows.
 
@@ -1422,7 +1416,7 @@ class PostgresTable(PostgresBase):
             # we don't want to alter the input
             search_data = data[:]
             search_cols = set(data[0])
-        with DelayCommit(self, commit):
+        with DelayCommit(self):
             jsonb_cols = [col for col, typ in self.col_type.items() if typ == "jsonb"]
             for i, SD in enumerate(search_data):
                 if set(SD) != search_cols:
@@ -1575,7 +1569,7 @@ class PostgresTable(PostgresBase):
                 backup_number += 1
         return backup_number
 
-    def _swap_in_tmp(self, tables, commit=True):
+    def _swap_in_tmp(self, tables):
         """
         Helper function for ``reload``: appends _old{n} to the names of tables/indexes/pkeys
         and renames the _tmp versions to the live versions.
@@ -1586,7 +1580,7 @@ class PostgresTable(PostgresBase):
         """
         now = time.time()
         backup_number = self._next_backup_number()
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             self._swap(tables, "", "_old" + str(backup_number))
             self._swap(tables, "_tmp", "")
             for table in tables:
@@ -1636,7 +1630,6 @@ class PostgresTable(PostgresBase):
         final_swap=True,
         silence_meta=False,
         adjust_schema=False,
-        commit=True,
         **kwds
     ):
         """
@@ -1699,7 +1692,7 @@ class PostgresTable(PostgresBase):
                 (self.stats.stats, _stats_cols, False, statsfile),
             ])
         addedid = None
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             for table, cols, header, filename in tabledata:
                 if filename is None:
                     continue
@@ -1800,8 +1793,7 @@ class PostgresTable(PostgresBase):
             if final_swap:
                 self.reload_final_swap(tables=tables,
                                        metafile=metafile,
-                                       ordered=ordered,
-                                       commit=False)
+                                       ordered=ordered)
             elif metafile is not None and not silence_meta:
                 print(
                     "Warning: since the final swap was not requested, "
@@ -1823,7 +1815,7 @@ class PostgresTable(PostgresBase):
                 % (self.search_table, time.time() - now_overall)
             )
 
-    def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|", commit=True):
+    def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|"):
         """
         Renames the _tmp versions of `tables` to the live versions.
         and updates the corresponding meta_tables row if `metafile` is provided
@@ -1834,7 +1826,7 @@ class PostgresTable(PostgresBase):
         - ``metafile`` -- a string (optional), giving a file containing the meta information for the table.
         - ``sep`` -- a character (default ``|``) to separate columns
         """
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             if tables is None:
                 tables = []
                 for suffix in ["", "_extras", "_stats", "_counts"]:
@@ -1842,7 +1834,7 @@ class PostgresTable(PostgresBase):
                     if self._table_exists(tablename):
                         tables.append(tablename)
 
-            self._swap_in_tmp(tables, commit=False)
+            self._swap_in_tmp(tables)
             if metafile is not None:
                 self.reload_meta(metafile, sep=sep)
             if ordered:
@@ -1874,7 +1866,7 @@ class PostgresTable(PostgresBase):
                     self._execute(SQL("DROP TABLE {0}").format(Identifier(tablename)))
                     print("Dropped {0}".format(tablename))
 
-    def reload_revert(self, backup_number=None, commit=True):
+    def reload_revert(self, backup_number=None):
         """
         Use this method to revert to an older version of a table.
 
@@ -1885,7 +1877,6 @@ class PostgresTable(PostgresBase):
 
         - ``backup_number`` -- the backup version to restore,
             or ``None`` for the most recent.
-        - ``commit`` -- whether to commit the changes.
         """
         if self._table_exists(self.search_table + "_tmp"):
             print(
@@ -1899,7 +1890,7 @@ class PostgresTable(PostgresBase):
                 raise ValueError("No old tables available to revert from.")
         elif not self._table_exists("%s_old%s" % (self.search_table, backup_number)):
             raise ValueError("Backup %s does not exist" % backup_number)
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             old = "_old" + str(backup_number)
             tables = []
             for suffix in ["", "_extras", "_stats", "_counts"]:
@@ -1914,14 +1905,6 @@ class PostgresTable(PostgresBase):
             "Swapped backup %s with %s"
             % (self.search_table, "{0}_old{1}".format(self.search_table, backup_number))
         )
-
-        # OLD VERSION that did something else
-        # with DelayCommit(self, commit, silence=True):
-        #    # drops the `_tmp` tables
-        #    self.cleanup_from_reload(old = False)
-        #    # reverts `meta_indexes` to previous state
-        #    self.revert_indexes()
-        #    print "Reverted %s to its previous state" % (self.search_table,)
 
     def cleanup_from_reload(self, keep_old=0):
         """
@@ -1991,7 +1974,6 @@ class PostgresTable(PostgresBase):
         resort=True,
         reindex=False,
         restat=True,
-        commit=True,
         **kwds
     ):
         """
@@ -2015,7 +1997,7 @@ class PostgresTable(PostgresBase):
         """
         self._check_file_input(searchfile, extrafile, kwds)
         logid = self._check_locks("copy_from", datafile=searchfile)
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             if reindex:
                 self.drop_indexes()
             now = time.time()
@@ -2055,7 +2037,6 @@ class PostgresTable(PostgresBase):
         indexesfile=None,
         constraintsfile=None,
         metafile=None,
-        commit=True,
         columns=None,
         query=None,
         include_id=True,
@@ -2107,7 +2088,7 @@ class PostgresTable(PostgresBase):
         ]
         print("Exporting %s..." % (self.search_table))
         now_overall = time.time()
-        with DelayCommit(self, commit):
+        with DelayCommit(self):
             for table, cols, addid, write_header, filename in tabledata:
                 if filename is None:
                     continue
@@ -2172,7 +2153,7 @@ class PostgresTable(PostgresBase):
 
     # Note that create_table and drop_table are methods on PostgresDatabase
 
-    def set_sort(self, sort, id_ordered=True, resort=True, commit=True):
+    def set_sort(self, sort, id_ordered=True, resort=True):
         """
         Change the default sort order for this table
 
@@ -2185,7 +2166,7 @@ class PostgresTable(PostgresBase):
           and if id_ordered=True
         """
         self._set_sort(sort)
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             sort_json = Json(sort) if sort else None
             self._id_ordered = id_ordered if sort else False
             self._execute(SQL(
@@ -2302,14 +2283,13 @@ class PostgresTable(PostgresBase):
             self.column_description(name, description)
             self.log_db_change("add_column", logid=logid, name=name, datatype=datatype)
 
-    def drop_column(self, name, commit=True, force=False):
+    def drop_column(self, name, force=False):
         """
         Drop a column and any data stored in it.
 
         INPUT:
 
         - ``name`` -- the name of the column
-        - ``commit`` -- whether to actually execute the change
         - ``force`` -- if False, will ask for confirmation
         """
         logid = self._check_locks("drop_column")
@@ -2323,7 +2303,7 @@ class PostgresTable(PostgresBase):
                 "Sorting for %s depends on %s; change default sort order with set_sort() before dropping column"
                 % (self.search_table, name)
             )
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             self.column_description(name, drop=True)
             if name in self.search_cols:
                 table = self.search_table
@@ -2351,7 +2331,7 @@ class PostgresTable(PostgresBase):
             self.log_db_change("drop_column", logid=logid, name=name)
         print("Column %s dropped" % (name))
 
-    def create_extra_table(self, columns, ordered=False, sep="|", commit=True):
+    def create_extra_table(self, columns, ordered=False, sep="|"):
         """
         Splits this search table into two, linked by an id column.
 
@@ -2367,7 +2347,7 @@ class PostgresTable(PostgresBase):
         logid = self._check_locks("create_extra_table")
         if self.extra_table is not None:
             raise ValueError("Extra table already exists")
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             if ordered and not self._id_ordered:
                 updater = SQL("UPDATE meta_tables SET (id_ordered, out_of_order, has_extras) = (%s, %s, %s) WHERE name = %s")
                 self._execute(updater, [True, True, True, self.search_table])
@@ -2453,7 +2433,7 @@ class PostgresTable(PostgresBase):
             self.restore_pkeys()
             self.log_db_change("create_extra_table", logid=logid, columns=columns)
 
-    def _move_column(self, column, src, target, commit):
+    def _move_column(self, column, src, target):
         """
         This function moves a column between two tables, copying the data accordingly.
 
@@ -2461,7 +2441,7 @@ class PostgresTable(PostgresBase):
         columns between search and extra tables.
         """
         logid = self._check_locks("move_column")
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             datatype = self.col_type[column]
             self._check_col_datatype(datatype)
             modifier = SQL("ALTER TABLE {0} ADD COLUMN {1} %s" % datatype).format(
@@ -2478,14 +2458,13 @@ class PostgresTable(PostgresBase):
             print("%s column successfully moved from %s to %s" % (column, src, target))
             self.log_db_change("move_column", logid=logid, name=column, dest=target)
 
-    def move_column_to_extra(self, column, commit=True):
+    def move_column_to_extra(self, column):
         """
         Move a column from a search table to an extra table.
 
         INPUT:
 
         - ``column`` -- the name of the column to move
-        - ``commit`` -- whether to commit the change
         """
         if column not in self.search_cols:
             raise ValueError("%s not a search column" % (column))
@@ -2493,22 +2472,21 @@ class PostgresTable(PostgresBase):
             raise ValueError("Extras table does not exist.  Use create_extra_table")
         if column == self._label_col:
             raise ValueError("Cannot move the label column to extra")
-        self._move_column(column, self.search_table, self.extra_table, commit)
+        self._move_column(column, self.search_table, self.extra_table)
         self.extra_cols.append(column)
         self.search_cols.remove(column)
 
-    def move_column_to_search(self, column, commit=True):
+    def move_column_to_search(self, column):
         """
         Move a column from an extra table to a search table.
 
         INPUT:
 
         - ``column`` -- the name of the column to move
-        - ``commit`` -- whether to commit the change
         """
         if column not in self.extra_cols:
             raise ValueError("%s not an extra column" % (column))
-        self._move_column(column, self.extra_table, self.search_table, commit)
+        self._move_column(column, self.extra_table, self.search_table)
         self.search_cols.insert(bisect(self.search_cols, column), column)
         self.extra_cols.remove(column)
 
