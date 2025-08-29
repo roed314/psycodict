@@ -634,7 +634,7 @@ class PostgresTable(PostgresBase):
         - ``suffix`` -- a string such as "_tmp" or "_old1" to be appended to the names in the ALTER TABLE statements.
         """
         command = SQL("ALTER TABLE {0} ADD CONSTRAINT {1} PRIMARY KEY (id)")
-        self._pkey_common(command, suffix, "Built", True)
+        self._pkey_common(command, suffix, "Built")
 
     def _list_built_constraints(self):
         """
