@@ -1438,7 +1438,7 @@ class PostgresTable(PostgresBase):
             now = time.time()
             if reindex:
                 self.drop_pkeys()
-                self.drop_indexes(permanent=False)
+                self.drop_indexes(search_cols, permanent=False)
             for table, L in cases:
                 template = SQL("({0})").format(SQL(", ").join(map(Placeholder, L[0])))
                 inserter = SQL("INSERT INTO {0} ({1}) VALUES %s")
@@ -1454,7 +1454,7 @@ class PostgresTable(PostgresBase):
                 self.resort()
             if reindex:
                 self.restore_pkeys()
-                self.restore_indexes()
+                self.restore_indexes(search_cols)
             if self.stats.saving:
                 self.stats.total += len(search_data)
                 self.stats._record_count({}, self.stats.total)
@@ -1653,9 +1653,6 @@ class PostgresTable(PostgresBase):
         - ``resort`` -- whether to sort the ids after copying in the data.
             Only relevant for tables that are id_ordered.  Defaults to sorting
             when the searchfile and extrafile do not contain ids.
-        - ``reindex`` -- whether to drop the indexes before importing data
-            and rebuild them afterward.  If the number of rows is a substantial
-            fraction of the size of the table, this will be faster.
         - ``restat`` -- whether to refresh statistics afterward.  Default behavior
             is to refresh stats if either countsfile or statsfile is missing.
         - ``final_swap`` -- whether to perform the final swap exchanging the
@@ -1725,15 +1722,14 @@ class PostgresTable(PostgresBase):
             self.restore_pkeys(suffix=suffix)
 
             # update the indexes
-            # these are needed before reindexing
+            # these are needed before restoring indexes
             if indexesfile is not None:
                 # we do the swap at the end
                 self.reload_indexes(indexesfile, sep=sep)
             if constraintsfile is not None:
                 self.reload_constraints(constraintsfile, sep=sep)
-            if reindex:
-                # Also restores constraints
-                self.restore_indexes(suffix=suffix)
+            # Also restores constraints
+            self.restore_indexes(suffix=suffix)
 
             if resort:
                 if metafile:
