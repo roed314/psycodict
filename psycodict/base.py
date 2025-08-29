@@ -4,6 +4,7 @@ import logging
 import re
 import sys
 import time
+from collections import defaultdict
 
 from psycopg2 import (
     DatabaseError,

@@ -898,7 +898,7 @@ class PostgresTable(PostgresBase):
     def _check_locks(self, changetype, datafile=None, suffix=""):
         """
         This function can be overridden to support additional checks before changing data.
-        To this end, it has a return value (defaulting to 0) that is passed into the eventual
+        To this end, it has a return value (defaulting to None) that is passed into the eventual
         log_db_change in the functions that call this, and it takes a datafile as input to
         support checking the size on disk (nothing is done with this datafile by default).
         """
