@@ -1942,7 +1942,7 @@ class PostgresTable(PostgresBase):
                 print("Dropped {0}".format(table))
             for head, cur_tail, new_tail in to_swap:
                 self._swap([head], f"_old{cur_tail}", f"_old{new_tail}")
-                print("Swapped {0} to {1}".format(head + cur_tail, head + new_tail))
+                print(f"Swapped {head}{cur_tail} to {head}{new_tail}")
 
     def max_id(self, table=None):
         """
