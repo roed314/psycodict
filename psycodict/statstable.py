@@ -1566,10 +1566,19 @@ ORDER BY v.ord LIMIT %s"""
 
             # Regenerate stats and counts
             for cols, ccols, cvals, threshold in stat_cmds:
+                if any(col not in self.table.search_cols for col in cols + ccols):
+                    # Column may have been deleted
+                    continue
                 self.add_stats(cols, (ccols, cvals), threshold, suffix=suffix)
             for cols, ccols, cvals, threshold in split_cmds:
+                if any(col not in self.table.search_cols for col in cols + ccols):
+                    # Column may have been deleted
+                    continue
                 self.add_stats(cols, (ccols, cvals), threshold, split_list=True, suffix=suffix)
             for col, grouping, ccols, cvals, threshold in nstat_cmds:
+                if any(col not in self.table.search_cols for col in cols + ccols):
+                    # Column may have been deleted
+                    continue
                 self.add_numstats(col, grouping, (ccols, cvals), threshold, suffix=suffix)
             self._add_extra_counts(col_value_dict, suffix=suffix)
 
@@ -1651,6 +1660,9 @@ ORDER BY v.ord LIMIT %s"""
             perform and record the counts
         """
         for cols, values_list in col_value_dict.items():
+            if any(col not in self.table.search_cols for col in cols):
+                # Column could have been deleted
+                continue
             for values in values_list:
                 query = self._join_dict(cols, values)
                 if self.quick_count(query, suffix=suffix) is None:

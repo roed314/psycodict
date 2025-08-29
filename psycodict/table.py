@@ -953,7 +953,7 @@ class PostgresTable(PostgresBase):
         func,
         query={},
         resort=True,
-        reindex=True,
+        reindex=None,
         restat=True,
         tostr_func=None,
         datafile=None,
@@ -970,7 +970,7 @@ class PostgresTable(PostgresBase):
         - ``func`` -- a function that takes a record (dictionary) as input and returns the modified record
         - ``query`` -- a query dictionary; only rows satisfying this query will be changed
         - ``resort`` -- whether to resort the table after running the rewrite
-        - ``reindex`` -- whether to reindex the table after running the rewrite
+        - ``reindex`` -- whether to reindex the table after running the rewrite (default is determined by whether the number of rows changed is at least 1000)
         - ``restat`` -- whether to recompute statistics after running the rewrite
         - ``tostr_func`` -- a function to be used when writing data to the temp file
             defaults to copy_dumps from encoding
@@ -1064,7 +1064,7 @@ class PostgresTable(PostgresBase):
         - ``label_col`` -- a column specifying which row(s) of the table should be updated corresponding to each row of the input file.  This will usually be the label for the table, in which case it can be omitted.
         - ``inplace`` -- whether to do the update in place.  If set, the operation cannot be undone with ``reload_revert``.
         - ``resort`` -- whether this table should be resorted after updating (default is to resort when the sort columns intersect the updated columns)
-        - ``reindex`` -- whether the indexes on this table should be dropped and recreated during update (default is to recreate only the indexes that touch the updated columns)
+        - ``reindex`` -- whether the indexes on this table should be dropped and recreated during update (default is to recreate only the indexes that touch the updated columns, and only if inplace and the number of rows edited is at least 1000)
         - ``restat`` -- whether to recompute stats for the table
         - ``logging`` -- a dictionary of keyword arguments for log_db_change
         - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
@@ -1089,6 +1089,11 @@ class PostgresTable(PostgresBase):
             # We don't allow updating id using this interface (it gets in the way of the tie-in with extras tables)
             if "id" in columns[1:]:
                 raise ValueError("Cannot update id using update_from_file")
+            if inplace and reindex is None:
+                rowcount = 0
+                for line in F:
+                    rowcount += 1
+                reindex = rowcount > 1000
         if resort is None:
             resort = bool(set(columns[1:]).intersection(self._sort_keys))
         # Create a temp table to hold the data
@@ -1378,7 +1383,7 @@ class PostgresTable(PostgresBase):
             self.log_db_change("upsert", logid=logid, query=query, data=data)
             return new_row, row_id
 
-    def insert_many(self, data, resort=True, reindex=False, restat=True):
+    def insert_many(self, data, resort=True, reindex=None, restat=True):
         """
         Insert multiple rows.
 
@@ -1389,7 +1394,7 @@ class PostgresTable(PostgresBase):
         - ``data`` -- a list of dictionaries, whose keys are columns and values the values to be set.
           All dictionaries must have the same set of keys.
         - ``resort`` -- whether to sort the ids after copying in the data.  Only relevant for tables that are id_ordered.
-        - ``reindex`` -- boolean (default False). Whether to drop the indexes
+        - ``reindex`` -- boolean (default True iff data has more than 1000 entries). Whether to drop the indexes
           before insertion and restore afterward.  Note that if there is an exception during insertion
           the indexes will need to be restored manually using ``restore_indexes``.
         - ``restat`` -- whether to refresh statistics after insertion
@@ -1400,6 +1405,8 @@ class PostgresTable(PostgresBase):
         logid = self._check_locks("insert_many")
         if not data:
             raise ValueError("No data provided")
+        if reindex is None:
+            reindex = len(data) > 1000
         if self.extra_table is not None:
             search_cols = [col for col in self.search_cols if col in data[0]]
             extra_cols = [col for col in self.extra_cols if col in data[0]]
@@ -1625,7 +1632,6 @@ class PostgresTable(PostgresBase):
         constraintsfile=None,
         metafile=None,
         resort=None,
-        reindex=True,
         restat=None,
         final_swap=True,
         silence_meta=False,
@@ -1968,7 +1974,7 @@ class PostgresTable(PostgresBase):
         searchfile,
         extrafile=None,
         resort=True,
-        reindex=False,
+        reindex=None,
         restat=True,
         **kwds
     ):
@@ -1983,6 +1989,7 @@ class PostgresTable(PostgresBase):
         - ``resort`` -- whether to sort the ids after copying in the data.  Only relevant for tables that are id_ordered.
         - ``reindex`` -- whether to drop the indexes before importing data and rebuild them afterward.
             If the number of rows is a substantial fraction of the size of the table, this will be faster.
+            Defaults to true when the number of rows added is more than 1000
         - ``restat`` -- whether to recreate statistics after reloading.
         - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
 
@@ -1994,6 +2001,12 @@ class PostgresTable(PostgresBase):
         self._check_file_input(searchfile, extrafile, kwds)
         logid = self._check_locks("copy_from", datafile=searchfile)
         with DelayCommit(self, silence=True):
+            if reindex is None:
+                rowcount = 0
+                with open(searchfile) as F:
+                    for line in F:
+                        rowcount += 1
+                reindex = rowcount > 1003 # 3 header lines
             if reindex:
                 self.drop_indexes(permanent=False)
             now = time.time()
