@@ -456,7 +456,7 @@ class PostgresStatsTable(PostgresBase):
         The number of distinct values taken on by the specified columns among rows satisfying the constraint.
         """
         qstr, values = self.table._parse_dict(query)
-        selecter = SQL("SELECT COUNT(*) FROM (SELECT DISTINCT {0} FROM {1}{2}) AS temp").format(
+        selecter = SQL("SELECT COUNT(DISTINCT ({0})) FROM {1}{2}").format(
             SQL(", ").join(map(Identifier, cols)),
             Identifier(self.search_table + suffix),
             SQL("") if qstr is None else SQL(" WHERE {0}").format(qstr))

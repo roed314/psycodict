@@ -1077,6 +1077,8 @@ class PostgresTable(PostgresBase):
             label_col = self._label_col
             if label_col is None:
                 raise ValueError("You must specify a column that is contained in the datafile and uniquely specifies each row")
+        elif label_col not in self.search_cols or self.count_distinct(label_col) != self.count():
+            raise ValueError("You must specify a column that uniquely specifies each row")
         with open(datafile) as F:
             tables = [self.search_table]
             columns = list(self.search_cols)
