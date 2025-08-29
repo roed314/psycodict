@@ -483,7 +483,7 @@ class PostgresTable(PostgresBase):
             )
         print("Index %s created in %.3f secs" % (name, time.time() - now))
 
-    def drop_index(self, name, suffix="", permanent=False):
+    def drop_index(self, name, suffix="", permanent=True):
         """
         Drop a specified index.
 
@@ -494,12 +494,12 @@ class PostgresTable(PostgresBase):
         - ``permanent`` -- whether to remove the index from the meta_indexes table
         """
         now = time.time()
-        with DelayCommit(self, silence=True):
-            if permanent:
-                deleter = SQL("DELETE FROM meta_indexes WHERE table_name = %s AND index_name = %s")
-                self._execute(deleter, [self.search_table, name])
-            dropper = SQL("DROP INDEX {0}").format(Identifier(name + suffix))
-            self._execute(dropper)
+        # We don't want to wrap these in a DelayCommit since we want them to succeed independently
+        if permanent:
+            deleter = SQL("DELETE FROM meta_indexes WHERE table_name = %s AND index_name = %s")
+            self._execute(deleter, [self.search_table, name])
+        dropper = SQL("DROP INDEX IF EXISTS {0}").format(Identifier(name + suffix))
+        self._execute(dropper)
         print("Dropped index %s in %.3f secs" % (name, time.time() - now))
 
     def restore_index(self, name, suffix=""):
@@ -548,7 +548,7 @@ class PostgresTable(PostgresBase):
             columns = [Json(col) for col in columns]
         return self._execute(selecter, [self.search_table] + columns, silent=True)
 
-    def drop_indexes(self, columns=[], suffix=""):
+    def drop_indexes(self, columns=[], suffix="", permanent=True):
         """
         Drop all indexes and constraints.
 
@@ -564,9 +564,9 @@ class PostgresTable(PostgresBase):
         """
         with DelayCommit(self):
             for res in self._indexes_touching(columns):
-                self.drop_index(res[0], suffix)
+                self.drop_index(res[0], suffix, permanent=permanent)
             for res in self._constraints_touching(columns):
-                self.drop_index(res[0], suffix)
+                self.drop_index(res[0], suffix, permanent=permanent)
 
     def restore_indexes(self, columns=[], suffix=""):
         """
@@ -1123,7 +1123,7 @@ class PostgresTable(PostgresBase):
             etable = None if self.extra_table is None else self.extra_table + suffix
             if inplace:
                 if reindex:
-                    self.drop_indexes(columns[1:])
+                    self.drop_indexes(columns[1:], permanent=False)
                 if self.extra_table is not None and not ecols:
                     etable = None
             else:
@@ -1438,7 +1438,7 @@ class PostgresTable(PostgresBase):
             now = time.time()
             if reindex:
                 self.drop_pkeys()
-                self.drop_indexes()
+                self.drop_indexes(permanent=False)
             for table, L in cases:
                 template = SQL("({0})").format(SQL(", ").join(map(Placeholder, L[0])))
                 inserter = SQL("INSERT INTO {0} ({1}) VALUES %s")
@@ -1999,7 +1999,7 @@ class PostgresTable(PostgresBase):
         logid = self._check_locks("copy_from", datafile=searchfile)
         with DelayCommit(self, silence=True):
             if reindex:
-                self.drop_indexes()
+                self.drop_indexes(permanent=False)
             now = time.time()
             search_addid, search_count = self._copy_from(
                 searchfile, self.search_table, self.search_cols, True, kwds
