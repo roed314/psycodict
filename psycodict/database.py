@@ -246,7 +246,7 @@ class PostgresDatabase(PostgresBase):
         else:
             return self.conn.cursor()
 
-    def log_db_change(self, operation, tablename=None, **data):
+    def log_db_change(self, operation, tablename=None, logid=None, **data):
         """
         By default we don't log changes (from updates, etc), but you can
         override this method if you want to do some logging.

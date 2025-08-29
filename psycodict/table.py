@@ -895,10 +895,26 @@ class PostgresTable(PostgresBase):
     # Insertion and updating data                                    #
     ##################################################################
 
-    def _check_locks(self, suffix="", types="all"):
-        locks = self._table_locked(self.search_table + suffix, types)
+    def _check_locks(self, changetype, datafile=None, suffix=""):
+        """
+        This function can be overridden to support additional checks before changing data.
+        To this end, it has a return value (defaulting to 0) that is passed into the eventual
+        log_db_change in the functions that call this, and it takes a datafile as input to
+        support checking the size on disk (nothing is done with this datafile by default).
+        """
+        if changetype in ["upsert", "update"]:
+            locktypes = "update"
+        elif changetype in ["insert_many", "copy_from"]:
+            locktypes = "insert"
+        elif changetype == "delete":
+            locktypes = "delete"
+        elif changetype == "reload":
+            return
+        else:
+            locktypes = "all"
+        locks = self._table_locked(self.search_table + suffix, locktypes)
         if self.extra_table:
-            locks += self._table_locked(self.extra_table + suffix, types)
+            locks += self._table_locked(self.extra_table + suffix, locktypes)
         if locks:
             typelen = max(len(locktype) for (locktype, pid) in locks) + 3
             for locktype, pid in locks:
@@ -1025,10 +1041,9 @@ class PostgresTable(PostgresBase):
                 reindex=reindex,
                 restat=restat,
                 commit=commit,
-                log_change=False,
+                logging=dict(operation="rewrite", query=query, projection=projection),
                 **kwds
             )
-            self.log_db_change("rewrite", query=query, projection=projection)
         finally:
             os.unlink(datafile.name)
 
@@ -1041,7 +1056,7 @@ class PostgresTable(PostgresBase):
         reindex=True,
         restat=True,
         commit=True,
-        log_change=True,
+        logging={"operation":"file_update"},
         **kwds
     ):
         """
@@ -1056,10 +1071,10 @@ class PostgresTable(PostgresBase):
         - ``reindex`` -- whether the indexes on this table should be dropped and recreated during update (default is to recreate only the indexes that touch the updated columns)
         - ``restat`` -- whether to recompute stats for the table
         - ``commit`` -- whether to actually commit the changes
-        - ``log_change`` -- whether to log the update to the log table
+        - ``logging`` -- a dictionary of keyword arguments for log_db_change
         - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
         """
-        self._check_locks()
+        logid = self._check_locks(logging["operation"], datafile=datafile)
         sep = kwds.get("sep", "|")
         print("Updating %s from %s..." % (self.search_table, datafile))
         now = time.time()
@@ -1091,16 +1106,9 @@ class PostgresTable(PostgresBase):
         with DelayCommit(self, commit, silence=True):
             if self._table_exists(tmp_table):
                 drop_tmp()
-            processed_columns = SQL(", ").join([
-                SQL("{0} " + self.col_type[col]).format(Identifier(col))
-                for col in columns
-            ])
-            creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(tmp_table), processed_columns, self._tablespace_clause())
-            self._execute(creator)
-            # We need to add an id column and populate it correctly
-            if label_col != "id":
-                coladd = SQL("ALTER TABLE {0} ADD COLUMN id bigint").format(Identifier(tmp_table))
-                self._execute(coladd)
+            self._create_table(tmp_table,
+                               [(col, self.col_type[col]) for col in columns],
+                               addid=(label_col != "id" and self.col_type["id"]))
             self._copy_from(datafile, tmp_table, columns, True, kwds)
             if label_col != "id":
                 # When using _copy_from, the id column was just added consecutively
@@ -1183,8 +1191,8 @@ class PostgresTable(PostgresBase):
                     self._set_ordered()
             # Delete the temporary table used to load the data
             drop_tmp()
-            if log_change:
-                self.log_db_change("file_update")
+            logging["logid"] = logid
+            self.log_db_change(**logging)
             print("Updated %s in %.3f secs" % (self.search_table, time.time() - now))
 
     def delete(self, query, restat=True, commit=True):
@@ -1196,7 +1204,7 @@ class PostgresTable(PostgresBase):
         - ``query`` -- a query dictionary; rows matching the query will be deleted
         - ``restat`` -- whether to recreate statistics afterward
         """
-        self._check_locks("delete")
+        logid = self._check_locks("delete")
         with DelayCommit(self, commit, silence=True):
             qstr, values = self._parse_dict(query)
             if qstr is None:
@@ -1217,7 +1225,7 @@ class PostgresTable(PostgresBase):
                 self.stats._record_count({}, self.stats.total)
                 if restat:
                     self.stats.refresh_stats(total=False)
-            self.log_db_change("delete", query=query, nrows=nrows)
+            self.log_db_change("delete", logid=logid, query=query, nrows=nrows)
 
     def update(self, query, changes, resort=True, restat=True, commit=True):
         """
@@ -1234,6 +1242,7 @@ class PostgresTable(PostgresBase):
             if col in self.extra_cols:
                 # Have to find the ids using the query, then update....
                 raise NotImplementedError
+        logid = self._check_locks("update")
         with DelayCommit(self, commit):
             qstr, values = self._parse_dict(query)
             if qstr is None:
@@ -1259,7 +1268,7 @@ class PostgresTable(PostgresBase):
                 self.resort()
             if restat and self.stats.saving:
                 self.stats.refresh_stats(total=False)
-            self.log_db_change("update", query=query, changes=changes)
+            self.log_db_change("update", logid=logid, query=query, changes=changes)
 
     def upsert(self, query, data, commit=True):
         """
@@ -1283,7 +1292,7 @@ class PostgresTable(PostgresBase):
         - ``new_row`` -- whether a new row was inserted
         - ``row_id`` -- the id of the found/new row
         """
-        self._check_locks("update")
+        logid = self._check_locks("upsert")
         if not query or not data:
             raise ValueError("Both query and data must be nonempty")
         if "id" in data:
@@ -1372,7 +1381,7 @@ class PostgresTable(PostgresBase):
                 if self.stats.saving:
                     self.stats.total += 1
             self._break_stats()
-            self.log_db_change("upsert", query=query, data=data)
+            self.log_db_change("upsert", logid=logid, query=query, data=data)
             return new_row, row_id
 
     def insert_many(self, data, resort=True, reindex=False, restat=True, commit=True):
@@ -1394,7 +1403,7 @@ class PostgresTable(PostgresBase):
         If the search table has an id, the dictionaries will be updated with the ids of the inserted records,
         though note that those ids will change if the ids are resorted.
         """
-        self._check_locks("insert")
+        logid = self._check_locks("insert_many")
         if not data:
             raise ValueError("No data provided")
         if self.extra_table is not None:
@@ -1457,7 +1466,7 @@ class PostgresTable(PostgresBase):
                 self.stats._record_count({}, self.stats.total)
                 if restat:
                     self.stats.refresh_stats(total=False)
-            self.log_db_change("insert_many", nrows=len(search_data))
+            self.log_db_change("insert_many", logid=logid, nrows=len(search_data))
 
     def resort(self, suffix="", sort=None):
         """
@@ -1490,7 +1499,7 @@ class PostgresTable(PostgresBase):
         if sort_order is None:
             print("resort failed, no sort order given")
             return False
-        self._check_locks(suffix=suffix)
+        self._check_locks("resort", suffix=suffix)
         with DelayCommit(self, silence=True):
             if (self._id_ordered and self._out_of_order) or suffix:
                 now = time.time()
@@ -1499,10 +1508,9 @@ class PostgresTable(PostgresBase):
                     "CREATE TEMP SEQUENCE {0} MINVALUE 0 START 0 CACHE 10000"
                 ).format(tmp_seq))
 
+                id_type = self.col_type["id"]
                 self._execute(SQL(
-                    "CREATE TEMP TABLE {0} "
-                    "(oldid bigint, newid bigint NOT NULL DEFAULT nextval('{1}')) "
-                    "ON COMMIT DROP"
+                    "CREATE TEMP TABLE {0} (oldid %s, newid %s NOT NULL DEFAULT nextval('{1}')) ON COMMIT DROP" % (id_type, id_type)
                 ).format(tmp_table, tmp_seq))
 
                 self._execute(SQL(
@@ -1629,7 +1637,6 @@ class PostgresTable(PostgresBase):
         silence_meta=False,
         adjust_schema=False,
         commit=True,
-        log_change=True,
         **kwds
     ):
         """
@@ -1664,7 +1671,6 @@ class PostgresTable(PostgresBase):
         - ``adjust_schema`` -- If True, it will create the new tables using the
             header columns, otherwise expects the schema specified by the files
             to match the current one
-        - ``log_change`` -- whether to log the reload to the log table
         - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
 
         .. NOTE:
@@ -1678,6 +1684,7 @@ class PostgresTable(PostgresBase):
             restat = countsfile is None or statsfile is None
         self._check_file_input(searchfile, extrafile, kwds)
         print("Reloading %s..." % (self.search_table))
+        logid = self._check_locks("reload", datafile=searchfile)
         now_overall = time.time()
 
         tables = []
@@ -1805,12 +1812,12 @@ class PostgresTable(PostgresBase):
                     "pass the metafile as an argument to update the meta_tables"
                 )
 
-            if log_change:
-                self.log_db_change(
-                    "reload",
-                    counts=(countsfile is not None),
-                    stats=(statsfile is not None),
-                )
+            self.log_db_change(
+                "reload",
+                logid=logid,
+                counts=(countsfile is not None),
+                stats=(statsfile is not None),
+            )
             print(
                 "Reloaded %s in %.3f secs"
                 % (self.search_table, time.time() - now_overall)
@@ -2007,6 +2014,7 @@ class PostgresTable(PostgresBase):
             starting immediately after the current max id (or at 1 if empty).
         """
         self._check_file_input(searchfile, extrafile, kwds)
+        logid = self._check_locks("copy_from", datafile=searchfile)
         with DelayCommit(self, commit, silence=True):
             if reindex:
                 self.drop_indexes()
@@ -2036,7 +2044,7 @@ class PostgresTable(PostgresBase):
                     self.stats.refresh_stats(total=False)
                 self.stats.total += search_count
                 self.stats._record_count({}, self.stats.total)
-            self.log_db_change("copy_from", nrows=search_count)
+            self.log_db_change("copy_from", logid=logid, nrows=search_count)
 
     def copy_to(
         self,
@@ -2269,7 +2277,7 @@ class PostgresTable(PostgresBase):
             raise ValueError("You must provide a description of this column")
         elif description is None:
             description = ""
-        self._check_locks()
+        logid = self._check_locks("add_column")
         self._check_col_datatype(datatype)
         self.col_type[name] = datatype
         if extra:
@@ -2292,7 +2300,7 @@ class PostgresTable(PostgresBase):
             if label:
                 self.set_label(name)
             self.column_description(name, description)
-            self.log_db_change("add_column", name=name, datatype=datatype)
+            self.log_db_change("add_column", logid=logid, name=name, datatype=datatype)
 
     def drop_column(self, name, commit=True, force=False):
         """
@@ -2304,7 +2312,7 @@ class PostgresTable(PostgresBase):
         - ``commit`` -- whether to actually execute the change
         - ``force`` -- if False, will ask for confirmation
         """
-        self._check_locks()
+        logid = self._check_locks("drop_column")
 
         if not force:
             ok = input("Are you sure you want to drop %s? (y/N) " % name)
@@ -2340,7 +2348,7 @@ class PostgresTable(PostgresBase):
             modifier = SQL("ALTER TABLE {0} DROP COLUMN {1}").format(Identifier(table), Identifier(name))
             self._execute(modifier)
             self.col_type.pop(name, None)
-            self.log_db_change("drop_column", name=name)
+            self.log_db_change("drop_column", logid=logid, name=name)
         print("Column %s dropped" % (name))
 
     def create_extra_table(self, columns, ordered=False, sep="|", commit=True):
@@ -2356,7 +2364,7 @@ class PostgresTable(PostgresBase):
         - ``sep`` -- a character (default ``|``) to separate columns in
             the temp file used to move data
         """
-        self._check_locks()
+        logid = self._check_locks("create_extra_table")
         if self.extra_table is not None:
             raise ValueError("Extra table already exists")
         with DelayCommit(self, commit, silence=True):
@@ -2370,7 +2378,7 @@ class PostgresTable(PostgresBase):
                 updater = SQL("UPDATE meta_tables SET (has_extras) = (%s) WHERE name = %s")
                 self._execute(updater, [True, self.search_table])
             self.extra_table = self.search_table + "_extras"
-            col_type = [("id", "bigint")]
+            col_type = [("id", self.col_type["id"])]
             cur = self._indexes_touching(columns)
             if cur.rowcount > 0:
                 raise ValueError(
@@ -2443,7 +2451,7 @@ class PostgresTable(PostgresBase):
                 updater = SQL("UPDATE {0} SET id = nextval('tmp_id')").format(Identifier(self.extra_table))
                 self._execute(updater)
             self.restore_pkeys()
-            self.log_db_change("create_extra_table", columns=columns)
+            self.log_db_change("create_extra_table", logid=logid, columns=columns)
 
     def _move_column(self, column, src, target, commit):
         """
@@ -2452,7 +2460,7 @@ class PostgresTable(PostgresBase):
         The two tables must have corresponding id columns, so this is most useful for moving
         columns between search and extra tables.
         """
-        self._check_locks()
+        logid = self._check_locks("move_column")
         with DelayCommit(self, commit, silence=True):
             datatype = self.col_type[column]
             self._check_col_datatype(datatype)
@@ -2468,7 +2476,7 @@ class PostgresTable(PostgresBase):
             modifier = SQL("ALTER TABLE {0} DROP COLUMN {1}").format(Identifier(src), Identifier(column))
             self._execute(modifier)
             print("%s column successfully moved from %s to %s" % (column, src, target))
-            self.log_db_change("move_column", name=column, dest=target)
+            self.log_db_change("move_column", logid=logid, name=column, dest=target)
 
     def move_column_to_extra(self, column, commit=True):
         """
@@ -2504,7 +2512,7 @@ class PostgresTable(PostgresBase):
         self.search_cols.insert(bisect(self.search_cols, column), column)
         self.extra_cols.remove(column)
 
-    def log_db_change(self, operation, **data):
+    def log_db_change(self, operation, logid=None, **data):
         """
         Log changes to search tables.
 
@@ -2513,7 +2521,7 @@ class PostgresTable(PostgresBase):
         - ``operation`` -- a string, explaining what operation was performed
         - ``**data`` -- any additional information to install in the logging table (will be stored as a json dictionary)
         """
-        self._db.log_db_change(operation, tablename=self.search_table, **data)
+        self._db.log_db_change(operation, tablename=self.search_table, logid=logid, **data)
 
     def set_importance(self, importance):
         """
