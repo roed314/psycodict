@@ -541,9 +541,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 if not cols:
                     D.pop(typ)
         if not extra_columns:
-            extra_columns = extra_order = None
-        else:
-            extra_order = table.extra_cols
+            extra_columns = None
         label_col = table._label_col
         table_description = table.description()
         col_description = table.column_description()
@@ -559,8 +557,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             sort,
             id_ordered,
             extra_columns,
-            search_order,
-            extra_order,
             tablespace=tablespace,
         )
         if data:
@@ -596,6 +592,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         extra_columns=None,
         tablespace=None,
         force_description=False,
+        id_type="bigint",
     ):
         """
         Add a new search table to the database.  See also `create_table_like`.
@@ -606,7 +603,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         - ``search_columns`` -- either a dictionary whose keys are valid postgres types and whose values
             are lists of column names (or just a string if only one column has the specified type);
             or a list of pairs (col, type).
-            An id column of type bigint will be added as a primary key if not present.
+            An id column of type ``id_type`` will be added as a primary key if not present.
         - ``label_col`` -- the column holding the LMFDB label.  This will be used in the ``lookup`` method
             and in the display of results on the API.  Use None if there is no appropriate column.
         - ``table_description`` -- a text description of this table
@@ -622,6 +619,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             in the search table, speeding up scans.
         - ``tablespace`` -- (optional) a postgres tablespace to use for the new table
         - ``force_description`` -- whether to require descriptions
+        - ``id_type`` -- what postgres type to use for the id column
 
         COMMON TYPES:
 
@@ -646,6 +644,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         # Standardize input format for search_columns and extra_columns
         def pairs_to_dict(L):
+            if L is None:
+                return L
             D = defaultdict(list)
             for (col, typ) in L:
                 D[typ].append(col)
@@ -681,9 +681,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         def process_columns(coldict):
             if not any("id" in cols for cols in coldict.values()):
-                if "bigint" not in coldict:
-                    coldict["bigint"] = []
-                coldict["bigint"].append("id")
+                if id_type not in coldict:
+                    coldict[id_type] = []
+                coldict[id_type].append("id")
             allcols = []
             # For space reasons, we sort the columns by type, then alphabetically within each type
             # Note that _get_typlen checks that the type is valid
@@ -707,12 +707,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             if len(valid_extra_list) != len(valid_extra_set):
                 C = Counter(valid_extra_list)
                 raise ValueError("Column %s repeated" % (C.most_common(1)[0][0]))
-            if extra_order is not None:
-                for col in extra_order:
-                    if col not in valid_extra_set:
-                        raise ValueError("Column %s does not exist" % (col))
-                if len(extra_order) != len(valid_extra_set):
-                    raise ValueError("Must include all columns")
             processed_extra_columns = process_columns(extra_columns)
         else:
             processed_extra_columns = []
@@ -723,7 +717,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             if isinstance(col, str):
                 description_columns.append(col)
             else:
-                description_columns.extend(col)
+                description_columns.extend([c for c in col if c != "id"])
         if force_description:
             if table_description is None or col_description is None:
                 raise ValueError("You must provide table and column descriptions")
@@ -812,8 +806,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             sort=sort,
             id_ordered=id_ordered,
             extra_columns=extra_columns,
-            search_order=search_order,
-            extra_order=extra_order,
         )
         print("Table %s created in %.3f secs" % (name, time.time() - now))
 

@@ -92,7 +92,10 @@ def numeric_converter(value, cur=None):
             # Sage isn't installed, so we fall back on Python floats
             return float(value)
     else:
-        return Integer(value)
+        if SAGE_MODE:
+            return Integer(value)
+        else:
+            return int(value)
 
 
 class Array():
