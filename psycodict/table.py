@@ -1127,32 +1127,55 @@ class PostgresTable(PostgresBase):
                 ecols = [col for col in columns[1:] if col in self.extra_cols]
             suffix = "" if inplace else "_tmp"
             stable = self.search_table + suffix
-            etable = None if self.extra_table is None else self.extra_table + suffix
+            etable = None if (self.extra_table is None or not ecols) else self.extra_table + suffix
             if inplace:
                 if reindex:
                     self.drop_indexes(columns[1:], permanent=False)
-                if self.extra_table is not None and not ecols:
-                    etable = None
+                scols = SQL(", ").join([
+                    SQL("{0} = {1}.{0}").format(Identifier(col), Identifier(tmp_table))
+                    for col in scols
+                ])
+                updater = SQL("UPDATE {0} SET {1} FROM {2} WHERE {0}.{3} = {2}.{3}")
+                self._execute(updater.format(
+                    Identifier(stable),
+                    scols,
+                    Identifier(tmp_table),
+                    Identifier(label_col),
+                ))
+                if etable is not None:
+                    ecols = SQL(", ").join([
+                        SQL("{0} = {1}.{0}").format(Identifier(col), Identifier(tmp_table))
+                        for col in ecols
+                    ])
+                    self._execute(updater.format(
+                        Identifier(etable),
+                        ecols,
+                        Identifier(tmp_table),
+                        Identifier(label_col),
+                    ))
             else:
                 self._clone(self.search_table, stable)
-                inserter = SQL("INSERT INTO {0} SELECT * FROM {1}")
-                self._execute(inserter.format(Identifier(stable), Identifier(self.search_table)))
-                if self.extra_table is None or not ecols:
-                    etable = None
-                else:
+                inserter = SQL("INSERT INTO {0} ({1}) SELECT {2} FROM {3} tdisk LEFT JOIN {4} tcur ON tdisk.{5} = tcur.{5}")
+                self._execute(inserter.format(
+                    Identifier(stable),
+                    SQL(", ").join(Identifier(col) for col in ["id"] + self.search_cols),
+                    SQL(", ").join((SQL("COALESCE(tdisk.{0}, tcur.{0})") if col in scols else
+                                    SQL("tcur.{0}")).format(Identifier(col))
+                                   for col in ["id"] + self.search_cols),
+                    Identifier(tmp_table),
+                    Identifier(self.search_table),
+                    Identifier(label_col)))
+                if etable is not None:
                     self._clone(self.extra_table, etable)
-                    self._execute(inserter.format(Identifier(etable), Identifier(self.extra_table)))
-            scols = SQL(", ").join([
-                SQL("{0} = {1}.{0}").format(Identifier(col), Identifier(tmp_table))
-                for col in scols
-            ])
-            updater = SQL("UPDATE {0} SET {1} FROM {2} WHERE {0}.{3} = {2}.{3}")
-            self._execute(updater.format(
-                Identifier(stable),
-                scols,
-                Identifier(tmp_table),
-                Identifier(label_col),
-            ))
+                    self._execute(inserter.format(
+                        Identifier(etable),
+                        SQL(", ").join(Identifier(col) for col in ["id"] + self.extra_cols),
+                        SQL(", ").join((SQL("COALESCE(tdisk.{0}, tcur.{0})") if col in ecols else
+                                        SQL("tcur.{0}")).format(Identifier(col))
+                                       for col in ["id"] + self.extra_cols),
+                        Identifier(tmp_table),
+                        Identifier(self.extra_table),
+                        Identifier(label_col)))
             if reindex and inplace:
                 # also restores constraints
                 self.restore_indexes(columns[1:])
@@ -1165,17 +1188,6 @@ class PostgresTable(PostgresBase):
                 ordered = self.resort(suffix=suffix)
             else:
                 ordered = False
-            if etable is not None:
-                ecols = SQL(", ").join([
-                    SQL("{0} = {1}.{0}").format(Identifier(col), Identifier(tmp_table))
-                    for col in ecols
-                ])
-                self._execute(updater.format(
-                    Identifier(etable),
-                    ecols,
-                    Identifier(tmp_table),
-                    Identifier(label_col),
-                ))
             if restat and self.stats.saving:
                 if not inplace:
                     for table in [self.stats.counts, self.stats.stats]:
