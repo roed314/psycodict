@@ -246,7 +246,7 @@ class PostgresDatabase(PostgresBase):
         else:
             return self.conn.cursor()
 
-    def log_db_change(self, operation, tablename=None, logid=None, **data):
+    def log_db_change(self, operation, tablename=None, logid=None, aborted=False, **data):
         """
         By default we don't log changes (from updates, etc), but you can
         override this method if you want to do some logging.
@@ -560,20 +560,26 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             tablespace=tablespace,
         )
         if data:
-            cols = SQL(", ").join(map(Identifier, ["id"] + table.search_cols))
-            self._execute(
-                SQL("INSERT INTO {0} ( {1} ) SELECT {1} FROM {2}").format(
-                    Identifier(new_name), cols, Identifier(table.search_table)
-                ),
-            )
-            if extra_columns:
-                extra_cols = SQL(", ").join(map(Identifier, ["id"] + table.extra_cols))
+            logid = table._check_locks("create_table_like")
+            aborted = True
+            try:
+                cols = SQL(", ").join(map(Identifier, ["id"] + table.search_cols))
                 self._execute(
                     SQL("INSERT INTO {0} ( {1} ) SELECT {1} FROM {2}").format(
-                        Identifier(new_name + "_extras"), extra_cols,
-                        Identifier(table.extra_table)
+                        Identifier(new_name), cols, Identifier(table.search_table)
                     ),
                 )
+                if extra_columns:
+                    extra_cols = SQL(", ").join(map(Identifier, ["id"] + table.extra_cols))
+                    self._execute(
+                        SQL("INSERT INTO {0} ( {1} ) SELECT {1} FROM {2}").format(
+                            Identifier(new_name + "_extras"), extra_cols,
+                            Identifier(table.extra_table)
+                        ),
+                    )
+                aborted = False
+            finally:
+                table.log_db_change("create_table_like", logid=logid, aborted=aborted, new_name=new_name)
         if indexes:
             for idata in table.list_indexes(verbose=False).values():
                 self[new_name].create_index(**idata)

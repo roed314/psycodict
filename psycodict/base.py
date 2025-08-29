@@ -410,6 +410,7 @@ class PostgresBase():
         - 'delete'
         - 'insert'
         - 'index'
+        - 'select'
         - 'all' (includes all locks)
 
         The valid lock types to filter on are:
@@ -443,6 +444,10 @@ class PostgresBase():
                     "ShareRowExclusiveLock",
                     "ExclusiveLock",
                     "AccessExclusiveLock",
+                ]
+            elif types == "select":
+                types = [
+                    "AccessExclusiveLock"
                 ]
             elif types != "all":
                 raise ValueError("Invalid lock type")
