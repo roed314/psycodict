@@ -197,25 +197,30 @@ class DelayCommit():
 
     Entering this context in a with statement will cause `_execute` calls to not commit by
     default.  When the final DelayCommit is exited, the connection will commit.
+
+    Setting active=False disables the DelayCommit completely, which can be helpful since it's often used in a with context and conditionally entering that context is annoying to write with if statements.
     """
 
-    def __init__(self, obj, final_commit=True, silence=None):
+    def __init__(self, obj, final_commit=True, silence=None, active=True):
         self.obj = obj._db
         self.final_commit = final_commit
+        self.active = active
         self._orig_silenced = obj._db._silenced
         if silence is not None:
             obj._silenced = silence
 
     def __enter__(self):
-        self.obj._nocommit_stack += 1
+        if self.active:
+            self.obj._nocommit_stack += 1
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.obj._nocommit_stack -= 1
-        self.obj._silenced = self._orig_silenced
-        if exc_type is None and self.obj._nocommit_stack == 0 and self.final_commit:
-            self.obj.conn.commit()
-        if exc_type is not None:
-            self.obj.conn.rollback()
+        if self.active:
+            self.obj._nocommit_stack -= 1
+            self.obj._silenced = self._orig_silenced
+            if exc_type is None and self.obj._nocommit_stack == 0 and self.final_commit:
+                self.obj.conn.commit()
+            if exc_type is not None:
+                self.obj.conn.rollback()
 
 # Reraise an exception, possibly with a different message, type, or traceback.
 if sys.version_info.major < 3:  # Python 2?

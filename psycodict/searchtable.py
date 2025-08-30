@@ -186,6 +186,13 @@ class PostgresSearchTable(PostgresTable):
             sage: statement.as_string(db.conn), vals
             ('"ramps" @> %s', [[2, 3, 5]])
         """
+        if col_type is not None and col_type.endswith("[]"):
+            # SQL does not correctly parse the =ANY(...) construction with array types, so we convert to an equivalent OR construction
+            if key == "$in":
+                key = "$or"
+            elif key == "$nin":
+                key = "$not"
+                value = {"$or": value}
         if key in ["$or", "$and"]:
             pairs = [
                 self._parse_dict(clause, outer=col, outer_type=col_type)
@@ -249,11 +256,11 @@ class PostgresSearchTable(PostgresTable):
                 cmd = SQL("array_max({0}) >= %s")
             elif key == "$anylte":
                 cmd = SQL("%s >= ANY({0})")
-            elif key == "$in":
+            elif key == "$in": # This now handles scalar $in or jsonb $in
                 if col_type == "jsonb":
                     # jsonb_path_ops modifiers for the GIN index doesn't support this query
                     cmd = SQL("{0} <@ %s")
-                else:
+                else: # Note that array types are handled at the beginning of the function
                     cmd = SQL("{0} = ANY(%s)")
             elif key == "$nin":
                 if col_type == "jsonb":
@@ -280,7 +287,7 @@ class PostgresSearchTable(PostgresTable):
             else:
                 raise ValueError("Error building query: {0}".format(key))
             if col_type == "jsonb":
-                value = Json(value)
+                value = Json(value) if not isinstance(value, Json) else value
             cmd = cmd.format(col)
             # For some array types (e.g. numeric), operators such as = and @> can't automatically typecast so we have to do it manually.
             typecast = self._create_typecast(key, value, col, col_type)
