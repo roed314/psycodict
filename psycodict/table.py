@@ -1124,7 +1124,7 @@ class PostgresTable(PostgresBase):
                         Identifier(self.search_table),
                         Identifier(label_col),
                     )
-                self._execute(idadder)
+                    self._execute(idadder)
                 # don't include the label col
                 scols = [col for col in columns[1:] if col in self.search_cols]
                 if self.extra_table is not None:
