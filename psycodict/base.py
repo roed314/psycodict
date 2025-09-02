@@ -1046,9 +1046,6 @@ class PostgresBase():
         with open(filename, "r") as F:
             columns = self._read_header_lines(F, sep)
         col_list = [elt[0] for elt in columns]
-        if addid:
-            if "id" not in [col for (col,typ) in columns]:
-                columns = [("id", "bigint")] + columns
 
         self._create_table(name, columns, addid=addid, tablespace=tablespace)
         return col_list

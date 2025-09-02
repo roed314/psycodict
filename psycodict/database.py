@@ -648,18 +648,10 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         if id_ordered is None:
             id_ordered = sort is not None
 
-        # Standardize input format for search_columns and extra_columns
-        def pairs_to_dict(L):
-            if L is None:
-                return L
-            D = defaultdict(list)
-            for (col, typ) in L:
-                D[typ].append(col)
-            return D
         if not isinstance(search_columns, dict):
-            search_columns = pairs_to_dict(search_columns)
+            search_columns = self._pairs_to_dict(search_columns)
         if not isinstance(extra_columns, dict):
-            extra_columns = pairs_to_dict(extra_columns)
+            extra_columns = self._pairs_to_dict(extra_columns)
         for typ, L in list(search_columns.items()):
             if isinstance(L, str):
                 search_columns[typ] = [L]
@@ -685,26 +677,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 if col not in valid_set:
                     raise ValueError("Column %s does not exist" % (col))
 
-        def process_columns(coldict):
-            if not any("id" in cols for cols in coldict.values()):
-                if id_type not in coldict:
-                    coldict[id_type] = []
-                coldict[id_type].append("id")
-            allcols = []
-            # For space reasons, we sort the columns by type, then alphabetically within each type
-            # Note that _get_typlen checks that the type is valid
-            dictorder = sorted(coldict, key=self._get_type_sortkey)
-            for typ in dictorder:
-                for col in sorted(coldict[typ]):
-                    if col == "id":
-                        hasid = True
-                    # We have whitelisted the types, so it's okay to use string formatting
-                    # to insert them into the SQL command.
-                    # This is useful so that we can specify the collation in the type
-                    allcols.append(SQL("{0} " + typ).format(Identifier(col)))
-            return allcols
-
-        processed_search_columns = process_columns(search_columns)
         # Check that descriptions are provided if required
         if extra_columns is not None:
             valid_extra_list = sum(extra_columns.values(), [])
@@ -713,9 +685,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             if len(valid_extra_list) != len(valid_extra_set):
                 C = Counter(valid_extra_list)
                 raise ValueError("Column %s repeated" % (C.most_common(1)[0][0]))
-            processed_extra_columns = process_columns(extra_columns)
-        else:
-            processed_extra_columns = []
         description_columns = []
         for col in itertools.chain(search_columns.values(), [] if extra_columns is None else extra_columns.values()):
             if col == 'id':
@@ -736,22 +705,11 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 col_description = {col: "" for col in description_columns}
 
         tablespace = self._tablespace_clause(tablespace)
-        with DelayCommit(self, silence=True):
-            creator = SQL("CREATE TABLE {0} ({1}){2}").format(
-                Identifier(name),
-                SQL(", ").join(processed_search_columns),
-                tablespace,
-            )
-            self._execute(creator)
+        with DelayCommit(self, commit, silence=True):
+            self._create_table(name, search_columns, addid=id_type, tablespace=tablespace)
             self.grant_select(name)
             if extra_columns is not None:
-                creator = SQL("CREATE TABLE {0} ({1}){2}")
-                creator = creator.format(
-                    Identifier(name + "_extras"),
-                    SQL(", ").join(processed_extra_columns),
-                    tablespace,
-                )
-                self._execute(creator)
+                self._create_table(name + "_extras", extra_columns, addid=id_type, tablespace=tablespace)
                 self.grant_select(name + "_extras")
             creator = SQL(
                 "CREATE TABLE {0} "
