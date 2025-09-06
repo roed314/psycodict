@@ -246,7 +246,7 @@ class PostgresDatabase(PostgresBase):
         else:
             return self.conn.cursor()
 
-    def log_db_change(self, operation, tablename=None, **data):
+    def log_db_change(self, operation, tablename=None, logid=None, aborted=False, **data):
         """
         By default we don't log changes (from updates, etc), but you can
         override this method if you want to do some logging.
@@ -513,7 +513,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         print("Table meta_tables_hist created")
 
-    def create_table_like(self, new_name, table, tablespace=None, data=False, indexes=False, commit=True):
+    def create_table_like(self, new_name, table, tablespace=None, data=False, indexes=False):
         """
         Copies the schema from an existing table, but none of the data, indexes or stats.
 
@@ -558,25 +558,28 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             id_ordered,
             extra_columns,
             tablespace=tablespace,
-            commit=commit,
         )
         if data:
-            cols = SQL(", ").join(map(Identifier, ["id"] + table.search_cols))
-            self._execute(
-                SQL("INSERT INTO {0} ( {1} ) SELECT {1} FROM {2}").format(
-                    Identifier(new_name), cols, Identifier(table.search_table)
-                ),
-                commit=commit,
-            )
-            if extra_columns:
-                extra_cols = SQL(", ").join(map(Identifier, ["id"] + table.extra_cols))
+            logid = table._check_locks("create_table_like")
+            aborted = True
+            try:
+                cols = SQL(", ").join(map(Identifier, ["id"] + table.search_cols))
                 self._execute(
                     SQL("INSERT INTO {0} ( {1} ) SELECT {1} FROM {2}").format(
-                        Identifier(new_name + "_extras"), extra_cols,
-                        Identifier(table.extra_table)
+                        Identifier(new_name), cols, Identifier(table.search_table)
                     ),
-                    commit=commit,
                 )
+                if extra_columns:
+                    extra_cols = SQL(", ").join(map(Identifier, ["id"] + table.extra_cols))
+                    self._execute(
+                        SQL("INSERT INTO {0} ( {1} ) SELECT {1} FROM {2}").format(
+                            Identifier(new_name + "_extras"), extra_cols,
+                            Identifier(table.extra_table)
+                        ),
+                    )
+                aborted = False
+            finally:
+                table.log_db_change("create_table_like", logid=logid, aborted=aborted, new_name=new_name)
         if indexes:
             for idata in table.list_indexes(verbose=False).values():
                 self[new_name].create_index(**idata)
@@ -595,7 +598,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         extra_columns=None,
         tablespace=None,
         force_description=False,
-        commit=True,
         id_type="bigint",
     ):
         """
@@ -771,14 +773,13 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         )
         print("Table %s created in %.3f secs" % (name, time.time() - now))
 
-    def drop_table(self, name, commit=True, force=False):
+    def drop_table(self, name, force=False):
         """
         Drop a table.
 
         INPUT:
 
         - ``name`` -- the name of the table
-        - ``commit`` -- whether to actually execute the drop command
         - ``force`` -- refrain from asking for confirmation
 
         NOTE:
@@ -793,7 +794,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             ok = input("Are you sure you want to drop %s? (y/N) " % (name))
             if not (ok and ok[0] in ["y", "Y"]):
                 return
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             table.cleanup_from_reload()
             indexes = list(self._execute(
                 SQL("SELECT index_name FROM meta_indexes WHERE table_name = %s"),
@@ -819,7 +820,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             self.tablenames.remove(name)
             delattr(self, name)
 
-    def rename_table(self, old_name, new_name, commit=True):
+    def rename_table(self, old_name, new_name):
         """
         Rename a table.
 
@@ -830,7 +831,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         """
         assert old_name != new_name
         assert new_name not in self.tablenames
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             table = self[old_name]
             # first rename indexes and constraints
             icols = [Identifier(s) for s in ["index_name", "table_name"]]
@@ -1001,7 +1002,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         reindex=True,
         restat=None,
         adjust_schema=False,
-        commit=True,
         sequential_swap=False,
         **kwds
     ):
@@ -1018,7 +1018,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         INPUTS passed to `reload` function in `PostgresTable`:
 
-                - ``resort``, ``reindex``, ``restat``, ``adjust_schema``, ``commit``, and any extra keywords
+                - ``resort``, ``reindex``, ``restat``, ``adjust_schema``, and any extra keywords
 
 
 
@@ -1031,7 +1031,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         if not data_folder.is_dir():
             raise ValueError("The path {} is not a directory".format(data_folder))
         sep = kwds.get("sep", "|")
-        with DelayCommit(self, commit, silence=True, active=not sequential_swap):
+        with DelayCommit(self, silence=True, active=not sequential_swap):
             file_list = []
             tablenames = []
             non_existent_tables = []
@@ -1188,7 +1188,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         else:
             print("Successfully reloaded %s" % (", ".join(tablenames)))
 
-    def reload_all_revert(self, data_folder, commit=True):
+    def reload_all_revert(self, data_folder):
         """
         Reverts the most recent ``reload_all`` by swapping with the backup table
         for each search table modified.
@@ -1204,18 +1204,18 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         if not data_folder.is_dir():
             raise ValueError("The path {} is not a directory".format(data_folder))
 
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             for tablename in self.tablenames:
                 searchfile = data_folder / (tablename + ".txt")
                 if not searchfile.exists():
                     continue
                 self[tablename].reload_revert()
 
-    def cleanup_all(self, commit=True):
+    def cleanup_all(self):
         """
         Drops all `_tmp` and `_old` tables created by the reload() method.
         """
-        with DelayCommit(self, commit, silence=True):
+        with DelayCommit(self, silence=True):
             for tablename in self.tablenames:
                 table = self[tablename]
                 table.cleanup_from_reload()

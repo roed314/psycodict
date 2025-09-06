@@ -4,6 +4,7 @@ import logging
 import re
 import sys
 import time
+from collections import defaultdict
 
 from psycopg2 import (
     DatabaseError,
@@ -409,6 +410,7 @@ class PostgresBase():
         - 'delete'
         - 'insert'
         - 'index'
+        - 'select'
         - 'all' (includes all locks)
 
         The valid lock types to filter on are:
@@ -442,6 +444,10 @@ class PostgresBase():
                     "ShareRowExclusiveLock",
                     "ExclusiveLock",
                     "AccessExclusiveLock",
+                ]
+            elif types == "select":
+                types = [
+                    "AccessExclusiveLock"
                 ]
             elif types != "all":
                 raise ValueError("Invalid lock type")

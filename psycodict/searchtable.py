@@ -1376,7 +1376,7 @@ class PostgresSearchTable(PostgresTable):
             cur = self._execute(selecter, values, buffered=True)
             return self._search_iterator(cur, search_cols, extra_cols, projection, query=query, silent=silent)
 
-    def copy_to_example(self, searchfile, extrafile=None, id=None, sep="|", commit=True):
+    def copy_to_example(self, searchfile, extrafile=None, id=None, sep="|"):
         """
         This function writes files in the format used for copy_from and reload.
         It writes the header and a single random row.
@@ -1393,13 +1393,13 @@ class PostgresSearchTable(PostgresTable):
         if id is None:
             id = self.random({}, "id")
             if id is None:
-                return self.copy_to(searchfile, extrafile, commit=commit, sep=sep)
+                return self.copy_to(searchfile, extrafile, sep=sep)
         tabledata = [
             # tablename, cols, addid, write_header, filename
             (self.search_table, ["id"] + self.search_cols, searchfile),
             (self.extra_table, ["id"] + self.extra_cols, extrafile),
         ]
-        with DelayCommit(self, commit):
+        with DelayCommit(self):
             for table, cols, filename in tabledata:
                 if filename is None:
                     continue
