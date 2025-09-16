@@ -1159,7 +1159,7 @@ class PostgresTable(PostgresBase):
                         ))
                 else:
                     self._clone(self.search_table, stable)
-                    inserter = SQL("INSERT INTO {0} ({1}) SELECT {2} FROM {3} tdisk LEFT JOIN {4} tcur ON tdisk.{5} = tcur.{5}")
+                    inserter = SQL("INSERT INTO {0} ({1}) SELECT {2} FROM {3} tdisk RIGHT JOIN {4} tcur ON tdisk.{5} = tcur.{5}")
                     self._execute(inserter.format(
                         Identifier(stable),
                         SQL(", ").join(Identifier(col) for col in ["id"] + self.search_cols),
