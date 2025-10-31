@@ -704,13 +704,13 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             if col_description is None:
                 col_description = {col: "" for col in description_columns}
 
-        tablespace = self._tablespace_clause(tablespace)
         with DelayCommit(self, silence=True):
             self._create_table(name, search_columns, addid=id_type, tablespace=tablespace)
             self.grant_select(name)
             if extra_columns is not None:
                 self._create_table(name + "_extras", extra_columns, addid=id_type, tablespace=tablespace)
                 self.grant_select(name + "_extras")
+            tablespace = self._tablespace_clause(tablespace)
             creator = SQL(
                 "CREATE TABLE {0} "
                 "(cols jsonb, values jsonb, count bigint, "
