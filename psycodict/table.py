@@ -1179,7 +1179,7 @@ class PostgresTable(PostgresBase):
                                            for col in ["id"] + self.extra_cols),
                             Identifier(tmp_table),
                             Identifier(self.extra_table),
-                            Identifier(label_col)))
+                            Identifier("id")))
                 if reindex and inplace:
                     # also restores constraints
                     self.restore_indexes(columns[1:])
