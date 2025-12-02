@@ -999,7 +999,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         data_folder,
         halt_on_errors=True,
         resort=None,
-        reindex=True,
         restat=None,
         adjust_schema=False,
         sequential_swap=False,
@@ -1018,7 +1017,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         INPUTS passed to `reload` function in `PostgresTable`:
 
-                - ``resort``, ``reindex``, ``restat``, ``adjust_schema``, and any extra keywords
+                - ``resort``, ``restat``, ``adjust_schema``, and any extra keywords
 
 
 
@@ -1161,7 +1160,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     table.reload(
                         *filedata,
                         resort=resort,
-                        reindex=reindex,
                         restat=restat,
                         final_swap=False,
                         silence_meta=True,
