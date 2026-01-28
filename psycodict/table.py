@@ -1226,7 +1226,7 @@ class PostgresTable(PostgresBase):
         """
         logid = self._check_locks("delete")
         aborted = True
-        nrows = None
+        nrows = 0
         try:
             with DelayCommit(self, silence=True):
                 qstr, values = self._parse_dict(query)
@@ -2038,7 +2038,7 @@ class PostgresTable(PostgresBase):
         self._check_file_input(searchfile, extrafile, kwds)
         logid = self._check_locks("copy_from", datafile=searchfile)
         aborted = True
-        search_count = None
+        search_count = 0
         try:
             with DelayCommit(self, silence=True):
                 if reindex is None:
