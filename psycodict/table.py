@@ -1251,7 +1251,7 @@ class PostgresTable(PostgresBase):
         finally:
             self.log_db_change("delete", aborted=aborted, logid=logid, query=query, nrows=nrows)
 
-    def update(self, query, changes, resort=True, restat=True):
+    def update(self, query, changes, resort=False, restat=True):
         """
         Update a table using Postgres' update command
 
@@ -1415,7 +1415,7 @@ class PostgresTable(PostgresBase):
         finally:
             self.log_db_change("upsert", aborted=aborted, logid=logid, query=query, data=data)
 
-    def insert_many(self, data, resort=True, reindex=None, restat=True):
+    def insert_many(self, data, resort=False, reindex=None, restat=True):
         """
         Insert multiple rows.
 
@@ -2008,7 +2008,7 @@ class PostgresTable(PostgresBase):
         self,
         searchfile,
         extrafile=None,
-        resort=True,
+        resort=False,
         reindex=None,
         restat=True,
         **kwds
