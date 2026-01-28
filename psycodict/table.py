@@ -1226,6 +1226,7 @@ class PostgresTable(PostgresBase):
         """
         logid = self._check_locks("delete")
         aborted = True
+        nrows = -1
         try:
             with DelayCommit(self, silence=True):
                 qstr, values = self._parse_dict(query)
@@ -1436,6 +1437,7 @@ class PostgresTable(PostgresBase):
         """
         logid = self._check_locks("insert_many")
         aborted = True
+        search_data = []
         try:
             if not data:
                 raise ValueError("No data provided")
@@ -2036,6 +2038,7 @@ class PostgresTable(PostgresBase):
         self._check_file_input(searchfile, extrafile, kwds)
         logid = self._check_locks("copy_from", datafile=searchfile)
         aborted = True
+        search_count = -1
         try:
             with DelayCommit(self, silence=True):
                 if reindex is None:
