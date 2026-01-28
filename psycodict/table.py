@@ -1827,7 +1827,7 @@ class PostgresTable(PostgresBase):
                                 self._clone(table, table + suffix)
                             # Add to tables list so it gets backed up in the swap
                             tables.append(table)
-                    
+
                     # Only refresh stats if restat is True
                     if restat and (countsfile is None or statsfile is None):
                         self.stats.refresh_stats(suffix=suffix)
