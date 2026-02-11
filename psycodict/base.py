@@ -1067,7 +1067,7 @@ class PostgresBase():
 
         def target_name(name, tablename, kind):
             original_name = name[:]
-            if name.endswith(source) and source != "":
+            if source != "" and name.endswith(source):
                 # drop the suffix
                 original_name = original_name[: -len(source)]
                 assert original_name + source == name
