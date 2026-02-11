@@ -1030,17 +1030,15 @@ class PostgresBase():
 
         def target_name(name, tablename, kind):
             original_name = name[:]
-            if not name.endswith(source):
+            if source != "" and name.endswith(source):
+                # drop the suffix
+                original_name = original_name[: -len(source)]
+                assert original_name + source == name
+            elif source != "":
                 logging.warning(
                     "{} of {} with name {}".format(kind, tablename, name)
                     + " does not end with the suffix {}".format(source)
                 )
-
-            elif source != "":
-                # drop the suffix
-                original_name = original_name[: -len(source)]
-
-            assert original_name + source == name
 
             target_name = original_name + target
             try:
@@ -1052,8 +1050,6 @@ class PostgresBase():
                     + "The name will be extended with a _ in the swap"
                 )
                 target_name = original_name + "_" + target
-            # assure that the rename will be successful
-            self._rename_if_exists(target_name)
             return target_name
 
         with DelayCommit(self, silence=True):
@@ -1080,22 +1076,26 @@ class PostgresBase():
                     if constraint in done:
                         continue
                     c_target = target_name(constraint, tablename_new, "Constraint")
-                    self._execute(
-                        rename_constraint.format(
-                            Identifier(tablename_new),
-                            Identifier(constraint),
-                            Identifier(c_target),
+                    if c_target != constraint:
+                        self._rename_if_exists(c_target)
+                        self._execute(
+                            rename_constraint.format(
+                                Identifier(tablename_new),
+                                Identifier(constraint),
+                                Identifier(c_target),
+                            )
                         )
-                    )
                     done.add(c_target)
 
                 for index in self._list_indexes(tablename_new):
                     if index in done:
                         continue
                     i_target = target_name(index, tablename_new, "Index")
-                    self._execute(
-                        rename_index.format(Identifier(index), Identifier(i_target))
-                    )
+                    if i_target != index:
+                        self._rename_if_exists(i_target)
+                        self._execute(
+                            rename_index.format(Identifier(index), Identifier(i_target))
+                        )
                     done.add(i_target)  # not really needed
 
     def _read_header_lines(self, F, sep="|"):
