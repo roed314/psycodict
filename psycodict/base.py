@@ -1067,17 +1067,17 @@ class PostgresBase():
 
         def target_name(name, tablename, kind):
             original_name = name[:]
-            if not name.endswith(source):
+            if name.endswith(source) and source != "":
+                # drop the suffix
+                original_name = original_name[: -len(source)]
+                assert original_name + source == name
+            elif source != "":
+                # name doesn't end with source suffix
                 logging.warning(
                     "{} of {} with name {}".format(kind, tablename, name)
                     + " does not end with the suffix {}".format(source)
                 )
-
-            elif source != "":
-                # drop the suffix
-                original_name = original_name[: -len(source)]
-
-            assert original_name + source == name
+                # Keep the original name as-is since it doesn't have the expected suffix
 
             target_name = original_name + target
             try:
