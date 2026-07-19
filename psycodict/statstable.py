@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+import itertools
 import logging
+import math
 import time
 from collections import defaultdict
 
@@ -784,7 +786,6 @@ class PostgresStatsTable(PostgresBase):
         Iterates over the cartesian product of the buckets formed, yielding in each case
         a dictionary that can be used as a query.
         """
-        from sage.all import cartesian_product_iterator
         expanded_buckets = []
         for col, divisions in buckets.items():
             parse_singleton = pg_to_py[self.table.col_type[col]]
@@ -806,7 +807,7 @@ class PostgresStatsTable(PostgresBase):
                     a, b = map(parse_singleton, L)
                     cur_list.append({col: {"$gte": a, "$lte": b}})
             expanded_buckets.append(cur_list)
-        for X in cartesian_product_iterator(expanded_buckets):
+        for X in itertools.product(*expanded_buckets):
             if constraint is None:
                 bucketed_constraint = {}
             else:
@@ -1271,7 +1272,6 @@ class PostgresStatsTable(PostgresBase):
         if self._db._read_only:
             self.logger.info("Read only mode, not recording stats")
             return
-        from sage.all import cartesian_product_iterator
         if split_list and threshold is not None:
             raise ValueError("split_list and threshold not simultaneously supported")
         cols = sorted(cols)
@@ -1318,7 +1318,7 @@ class PostgresStatsTable(PostgresBase):
                             allcolvals.append(constraint[col])
                 if split_list:
                     listed = [(x if isinstance(x, list) else list(x)) for x in allcolvals]
-                    for vals in cartesian_product_iterator(listed):
+                    for vals in itertools.product(*listed):
                         total += count
                         to_add[(allcols, vals)] += count
                 else:
@@ -1451,7 +1451,6 @@ ORDER BY v.ord LIMIT %s"""
         - ``max_depth`` -- the maximum number of columns to include
         - ``threshold`` -- only counts above this value will be included.
         """
-        from sage.all import binomial
         with DelayCommit(self, silence=True):
             if cols is None:
                 cols = self._common_cols()
@@ -1463,7 +1462,7 @@ ORDER BY v.ord LIMIT %s"""
                     i = 0
                     logging.info(
                         "Starting level %s/%s (%s/%s colvecs)"
-                        % (level, len(cols), len(curlevel), binomial(len(cols), level))
+                        % (level, len(cols), len(curlevel), math.comb(len(cols), level))
                     )
                     while i < len(curlevel):
                         colvec, _ = curlevel[i]

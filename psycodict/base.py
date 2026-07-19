@@ -1188,7 +1188,8 @@ class PostgresBase():
         meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
         try:
             cur = self._db.cursor()
-            cur.copy_from(filename, meta_name, columns=meta_cols, sep=sep)
+            with open(filename) as F:
+                cur.copy_from(F, meta_name, columns=meta_cols, sep=sep)
         except Exception:
             self.conn.rollback()
             raise

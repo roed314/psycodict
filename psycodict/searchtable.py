@@ -248,6 +248,16 @@ class PostgresSearchTable(PostgresTable):
                 cmd, value = filter_sql_injection(value, col, col_type, postgres_infix_ops[key], self)
             else:
                 raise ValueError("Error building query: {0} (in $raw)".format(key))
+        elif key in ["$in", "$nin"] and col_type == "jsonb" and any(isinstance(v, (dict, list)) for v in value):
+            # jsonb containment (<@), used below for scalar values, cannot match
+            # composite values (objects/arrays), so we fall back to a disjunction
+            # of equality tests for those
+            eq = SQL(" OR ").join(SQL("{0} = %s").format(col) * len(value))
+            if key == "$in":
+                cmd = SQL("({0})").format(eq)
+            else:
+                cmd = SQL("NOT ({0})").format(eq)
+            value = [v if isinstance(v, Json) else Json(v) for v in value]
         else:
             if key in postgres_infix_ops:
                 cmd = SQL("{0} " + postgres_infix_ops[key] + " %s")
