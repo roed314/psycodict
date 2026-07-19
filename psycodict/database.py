@@ -8,6 +8,7 @@ import itertools
 from collections import defaultdict, Counter
 
 from psycopg2 import connect, DatabaseError
+from psycopg2.errors import UndefinedTable
 from psycopg2.sql import SQL, Identifier, Placeholder
 from psycopg2.extensions import (
     register_type,
@@ -21,7 +22,12 @@ from psycopg2.extensions import (
 from psycopg2.extras import register_json
 
 from .encoding import Json, numeric_converter
-from .base import PostgresBase, _meta_tables_cols
+from .base import (
+    PostgresBase,
+    _meta_tables_cols,
+    _meta_tables_defaults,
+    _meta_cols_types_jsonb_idx,
+)
 from .searchtable import PostgresSearchTable
 from .utils import DelayCommit
 
@@ -62,6 +68,9 @@ class PostgresDatabase(PostgresBase):
 
     INPUT:
 
+    - ``create`` -- if True, create psycodict's metadata tables (meta_tables,
+      meta_indexes, meta_constraints and their _hist counterparts) when they
+      are missing, allowing use of a fresh database
     - ``**kwargs`` -- passed on to psycopg's connect method
 
     ATTRIBUTES:
@@ -129,7 +138,7 @@ class PostgresDatabase(PostgresBase):
         obj.conn = self.conn
         self._objects.append(obj)
 
-    def __init__(self, config=None, secretsfile=None, **kwargs):
+    def __init__(self, config=None, secretsfile=None, create=False, **kwargs):
         if config is None:
             from .config import Configuration
             config = Configuration()
@@ -142,6 +151,11 @@ class PostgresDatabase(PostgresBase):
         PostgresBase.__init__(self, "db_all", self)
         if self._user == "webserver":
             self._execute(SQL("SET SESSION statement_timeout = '25s'"))
+
+        if create:
+            # Create any missing metadata tables before the read-only detection
+            # below, which concludes read-only when no tables are visible
+            self._bootstrap_meta()
 
         if self._execute(SQL("SELECT pg_is_in_recovery()")).fetchone()[0]:
             self._read_only = True
@@ -217,10 +231,17 @@ class PostgresDatabase(PostgresBase):
                 data_types[table_name] = []
             data_types[table_name].append((column_name, regtype))
 
-        cur = self._execute(SQL(
-            "SELECT name, label_col, sort, count_cutoff, id_ordered, out_of_order, "
-            "has_extras, stats_valid, total, include_nones FROM meta_tables"
-        ))
+        try:
+            cur = self._execute(SQL(
+                "SELECT name, label_col, sort, count_cutoff, id_ordered, out_of_order, "
+                "has_extras, stats_valid, total, include_nones FROM meta_tables"
+            ))
+        except UndefinedTable:
+            raise ValueError(
+                "This database does not contain psycodict's metadata tables. "
+                "If this is a fresh database, connect with PostgresDatabase(create=True) "
+                "to create them."
+            )
         self.tablenames = []
         for tabledata in cur:
             tablename = tabledata[0]
@@ -253,6 +274,22 @@ class PostgresDatabase(PostgresBase):
         """
         pass
 
+    def _existing_roles(self, users):
+        """
+        Filters a list of role names down to those that exist in the cluster.
+
+        Missing roles produce a warning rather than an error, so that table
+        creation works on clusters without the LMFDB roles (lmfdb, webserver).
+        """
+        existing = {rec[0] for rec in self._execute(SQL("SELECT rolname FROM pg_roles"))}
+        missing = [user for user in users if user not in existing]
+        if missing:
+            logging.warning(
+                "Postgres role(s) %s do not exist; skipping grants",
+                ", ".join(missing),
+            )
+        return [user for user in users if user in existing]
+
     def _grant(self, action, table_name, users):
         """
         Utility function for granting permissions on tables.
@@ -261,7 +298,7 @@ class PostgresDatabase(PostgresBase):
         if action not in ["SELECT", "INSERT", "UPDATE", "DELETE"]:
             raise ValueError("%s is not a valid action" % action)
         grantor = SQL("GRANT %s ON TABLE {0} TO {1}" % action)
-        for user in users:
+        for user in self._existing_roles(users):
             self._execute(grantor.format(Identifier(table_name), Identifier(user)), silent=True)
 
     def grant_select(self, table_name, users=["lmfdb", "webserver"]):
@@ -414,104 +451,103 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             sizes[name]["total_bytes"] += total_bytes
         return sizes
 
-    def _create_meta_indexes_hist(self):
+    def _meta_creator(self, meta_name, hist=False):
+        """
+        Create one of the six metadata tables, with columns generated from
+        the shared definitions in base.py (_meta_*_cols and _meta_*_types),
+        so that the DDL cannot drift from the code that reads and writes
+        these tables.
+        """
+        meta_cols, meta_types, _ = _meta_cols_types_jsonb_idx(meta_name)
+        cols = list(meta_cols)
+        types = dict(meta_types)
+        if hist:
+            cols.append("version")
+            types["version"] = "integer"
+        defaults = _meta_tables_defaults if meta_name == "meta_tables" else {}
+        parts = []
+        for col in cols:
+            # The types and defaults are module constants, not user input
+            part = SQL("{0} " + types[col]).format(Identifier(col))
+            if col in defaults:
+                part = part + SQL(" DEFAULT " + defaults[col])
+            parts.append(part)
+        tbl = meta_name + ("_hist" if hist else "")
+        self._execute(SQL("CREATE TABLE {0} ({1})").format(Identifier(tbl), SQL(", ").join(parts)))
+        self.grant_select(tbl)
+
+    def _create_meta_tables(self):
         with DelayCommit(self, silence=True):
-            self._execute(SQL(
-                "CREATE TABLE meta_indexes_hist "
-                "(index_name text, table_name text, type text, columns jsonb, "
-                "modifiers jsonb, storage_params jsonb, version integer)"
-            ))
-            version = 0
+            self._meta_creator("meta_tables")
+        print("Table meta_tables created")
 
-            # copy data from meta_indexes
-            rows = self._execute(SQL(
-                "SELECT index_name, table_name, type, columns, modifiers, "
-                "storage_params FROM meta_indexes"
-            ))
-
-            for row in rows:
-                self._execute(
-                    SQL(
-                        "INSERT INTO meta_indexes_hist (index_name, table_name, "
-                        "type, columns, modifiers, storage_params, version) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s)"
-                    ),
-                    row + (version,),
-                )
-
-            self.grant_select("meta_indexes_hist")
-
-        print("Table meta_indexes_hist created")
+    def _create_meta_indexes(self):
+        with DelayCommit(self, silence=True):
+            self._meta_creator("meta_indexes")
+        print("Table meta_indexes created")
 
     def _create_meta_constraints(self):
         with DelayCommit(self, silence=True):
-            self._execute(SQL(
-                "CREATE TABLE meta_constraints "
-                "(constraint_name text, table_name text, "
-                "type text, columns jsonb, check_func jsonb)"
-            ))
-            self.grant_select("meta_constraints")
+            self._meta_creator("meta_constraints")
         print("Table meta_constraints created")
 
-    def _create_meta_constraints_hist(self):
+    def _create_meta_hist(self, meta_name):
+        """
+        Create the _hist counterpart of a metadata table, copying any rows
+        already present in the base table at version 0.
+        """
+        meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name)
         with DelayCommit(self, silence=True):
-            self._execute(SQL(
-                "CREATE TABLE meta_constraints_hist "
-                "(constraint_name text, table_name text, "
-                "type text, columns jsonb, check_func jsonb, version integer)"
+            self._meta_creator(meta_name, hist=True)
+            cols = meta_cols + ("version",)
+            rows = self._execute(SQL("SELECT {0} FROM {1}").format(
+                SQL(", ").join(map(Identifier, meta_cols)),
+                Identifier(meta_name),
             ))
-            version = 0
-
-            # copy data from meta_constraints
-            rows = self._execute(SQL(
-                "SELECT constraint_name, table_name, type, columns, check_func "
-                "FROM meta_constraints"
-            ))
-
+            inserter = SQL("INSERT INTO {0} ({1}) VALUES ({2})").format(
+                Identifier(meta_name + "_hist"),
+                SQL(", ").join(map(Identifier, cols)),
+                SQL(", ").join(Placeholder() * len(cols)),
+            )
             for row in rows:
-                self._execute(
-                    SQL(
-                        "INSERT INTO meta_constraints_hist "
-                        "(constraint_name, table_name, type, columns, check_func, version) "
-                        "VALUES (%s, %s, %s, %s, %s, %s)"
-                    ),
-                    row + (version,),
-                )
+                row = [
+                    Json(elt) if i in jsonb_idx else elt for i, elt in enumerate(row)
+                ]
+                self._execute(inserter, row + [0])
+        print("Table %s_hist created" % meta_name)
 
-            self.grant_select("meta_constraints_hist")
+    def _bootstrap_meta(self):
+        """
+        Create any missing psycodict metadata tables (meta_tables, meta_indexes,
+        meta_constraints and their _hist counterparts), for use on a fresh
+        database.  Called from the constructor when ``create=True`` is passed.
+        """
+        existing = {
+            rec[0] for rec in self._execute(SQL(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public'"
+            ))
+        }
+        # The base tables must be created before the _hist creators, which copy from them
+        for name, creator in [
+            ("meta_tables", self._create_meta_tables),
+            ("meta_indexes", self._create_meta_indexes),
+            ("meta_constraints", self._create_meta_constraints),
+            ("meta_tables_hist", self._create_meta_tables_hist),
+            ("meta_indexes_hist", self._create_meta_indexes_hist),
+            ("meta_constraints_hist", self._create_meta_constraints_hist),
+        ]:
+            if name not in existing:
+                creator()
 
-        print("Table meta_constraints_hist created")
+    def _create_meta_indexes_hist(self):
+        self._create_meta_hist("meta_indexes")
+
+    def _create_meta_constraints_hist(self):
+        self._create_meta_hist("meta_constraints")
 
     def _create_meta_tables_hist(self):
-        with DelayCommit(self, silence=True):
-            self._execute(SQL(
-                "CREATE TABLE meta_tables_hist "
-                "(name text, sort jsonb, count_cutoff smallint DEFAULT 1000, "
-                "id_ordered boolean, out_of_order boolean, has_extras boolean, "
-                "stats_valid boolean DEFAULT true, label_col text, total bigint, "
-                "include_nones boolean, version integer)"
-            ))
-            version = 0
-
-            # copy data from meta_tables
-            rows = self._execute(SQL(
-                "SELECT name, sort, id_ordered, out_of_order, has_extras, label_col, total, include_nones FROM meta_tables "
-            ))
-
-            for row in rows:
-                self._execute(
-                    SQL(
-                        "INSERT INTO meta_tables_hist "
-                        "(name, sort, id_ordered, out_of_order, has_extras, label_col, "
-                        "total, include_nones, version) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
-                    ),
-                    row + (version,),
-                )
-
-            self.grant_select("meta_tables_hist")
-
-        print("Table meta_tables_hist created")
+        self._create_meta_hist("meta_tables")
 
     def create_table_like(self, new_name, table, tablespace=None, data=False, indexes=False):
         """
@@ -756,6 +792,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             has_extras=(extra_columns is not None),
             total=0,
         )
+        # Add the primary key on id, so that methods like drop_pkeys (used by
+        # insert_many and reload) find the constraint they expect
+        new_table.restore_pkeys()
         new_table.description(table_description)
         new_table.column_description(description=col_description)
         self.__dict__[name] = new_table

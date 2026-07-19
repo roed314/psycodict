@@ -133,7 +133,15 @@ _meta_tables_cols_notrequired = (
     "total",
     "important",
     "include_nones",
-)  # defaults: 1000, true, 0, false, false
+)
+# SQL literals giving the default values for the columns above
+_meta_tables_defaults = {
+    "count_cutoff": "1000",
+    "stats_valid": "true",
+    "total": "0",
+    "important": "false",
+    "include_nones": "false",
+}
 _meta_tables_types = dict(zip(_meta_tables_cols, (
     "text",
     "jsonb",
@@ -1188,7 +1196,8 @@ class PostgresBase():
         meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
         try:
             cur = self._db.cursor()
-            cur.copy_from(filename, meta_name, columns=meta_cols, sep=sep)
+            with open(filename) as F:
+                cur.copy_from(F, meta_name, columns=meta_cols, sep=sep)
         except Exception:
             self.conn.rollback()
             raise
