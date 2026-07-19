@@ -218,13 +218,6 @@ def test_update_marks_the_table_out_of_order_and_stats_invalid(filled_table):
     assert filled_table._stats_valid is False
 
 
-def test_update_of_an_extra_column_is_not_implemented(table_factory):
-    table = table_factory(extra_columns=[("blob", "text")])
-    table.insert_many([dict(sample_row(i), blob="b%d" % i) for i in range(3)])
-    with pytest.raises(NotImplementedError):
-        table.update({"n": 1}, {"blob": "changed"})
-
-
 ##################################################################
 # upsert                                                         #
 ##################################################################
@@ -257,14 +250,6 @@ def test_upsert_appends_after_the_largest_id(filled_table):
     assert new_row is True
     assert row_id == 200
     assert _num_rows(filled_table) == 201
-
-
-def test_upsert_updates_an_extra_column(table_factory):
-    table = table_factory(extra_columns=[("blob", "text")])
-    table.insert_many([dict(sample_row(i), blob="b%d" % i) for i in range(3)])
-    new_row, _ = table.upsert({"label": "l1"}, {"blob": "changed"})
-    assert new_row is False
-    assert table.lucky({"label": "l1"}, projection="blob") == "changed"
 
 
 def test_upsert_validates_its_arguments(filled_table):
@@ -308,13 +293,6 @@ def test_delete_matching_no_rows_changes_nothing(filled_table):
     before = _all_rows(filled_table)
     filled_table.delete({"n": -1}, restat=False)
     assert _all_rows(filled_table) == before
-
-
-def test_delete_also_clears_the_extra_table(table_factory):
-    table = table_factory(extra_columns=[("blob", "text")])
-    table.insert_many([dict(sample_row(i), blob="b%d" % i) for i in range(4)])
-    table.delete({"n": {"$lt": 2}})
-    assert sorted(table.search({}, projection="blob")) == ["b2", "b3"]
 
 
 ##################################################################

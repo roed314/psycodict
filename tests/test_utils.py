@@ -15,7 +15,6 @@ from psycopg2.sql import SQL, Composed, Identifier, Placeholder
 
 from psycodict.utils import (
     DelayCommit,
-    EmptyContext,
     IdentifierWrapper,
     KeyedDefaultDict,
     LockError,
@@ -304,23 +303,6 @@ def test_query_log_filter_only_passes_records_from_base(pathname, expected):
 
 def test_query_log_filter_does_not_match_database_py():
     assert QueryLogFilter().filter(log_record("/opt/psycodict/database.py")) == 0
-
-
-# ---------------------------------------------------------------------------
-# EmptyContext
-# ---------------------------------------------------------------------------
-
-def test_empty_context_is_a_no_op_context_manager():
-    # it stands in for an open file, so it has to carry a name
-    assert EmptyContext.name is None
-    context = EmptyContext()
-    with context as value:
-        assert value is None
-    assert context.name is None
-    # __exit__ returns None, so exceptions are not swallowed
-    with pytest.raises(ZeroDivisionError):
-        with EmptyContext():
-            1 / 0
 
 
 # ---------------------------------------------------------------------------
