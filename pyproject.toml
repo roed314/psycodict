@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "psycodict"
 version = "0.1.13"
 description = "dictionary-based python interface to PostgreSQL databases"
+# Required by the `twine check --strict` gate in CI: without it the package
+# has no long_description and the PyPI project page renders empty.
+readme = "README.md"
 requires-python = ">=3.8"
 authors = [{name = "David Roe", email = "roed.math@gmail.com"}, {name = "Edgar Costa", email = "edgarc@mit.edu"}]
 license = {text = "GPL v2+"}
@@ -18,4 +21,32 @@ repository = "https://github.com/roed314/psycodict"
 [project.optional-dependencies]
 pgsource = ["psycopg2>=2.8"]
 pgbinary = ["psycopg2-binary>=2.8"]
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "devmirror: read-only tests against the public LMFDB mirror; needs network access and PSYCODICT_TEST_DEVMIRROR=1",
+]
+# psycodict logs every query it runs; without this a failing test drowns in
+# connection chatter before the assertion that matters.
+log_cli_level = "WARNING"
+filterwarnings = ["error::DeprecationWarning:psycodict.*"]
+
+[tool.ruff]
+target-version = "py38"
+
+[tool.ruff.lint.per-file-ignores]
+# The psycopg2 availability check in __init__.py deliberately runs before the
+# imports that depend on it.
+"psycodict/__init__.py" = ["E402"]
+# Pre-existing findings, silenced so that adopting a linter does not smuggle
+# behavioural changes into an infrastructure change.  Each is a one-line fix
+# for a follow-up PR:
+#   base.py:229      E741  logger alias named `l`
+#   base.py:1024     F841  `ordered` assigned from a call kept for its side
+#                          effect (_order_columns mutates its argument)
+#   database.py:586  F841  `search_order` assigned and never used
+"psycodict/base.py" = ["E741", "F841"]
+"psycodict/database.py" = ["F841"]
 

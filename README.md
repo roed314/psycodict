@@ -28,3 +28,41 @@ You will first need to install [postgres](https://www.postgresql.org/) and creat
     ALTER USER psetpartners WITH password 'good password';
     GRANT ALL PRIVILEGES ON DATABASE database_name TO username;
 
+# Running the tests
+
+Install the test dependencies and point the standard PostgreSQL environment
+variables at a database you do not mind being written to:
+
+```
+pip3 install -e ".[pgbinary,test]"
+createdb psycodict_test
+PGDATABASE=psycodict_test pytest
+```
+
+The connection is configured through `PGHOST`, `PGPORT`, `PGUSER`,
+`PGPASSWORD` and `PGDATABASE`, defaulting to `postgres@localhost:5432` and a
+database named `psycodict_test`.  The database only needs to be empty: the
+meta tables are bootstrapped on first connection, and every test creates its
+own randomly named tables and drops them afterwards.
+
+If no server is reachable the tests that need one are skipped, so
+`pytest tests/test_encoding.py tests/test_utils.py tests/test_config.py`
+works with no database at all.
+
+Two further sets of tests are opt-in:
+
+```
+PSYCODICT_TEST_DEVMIRROR=1 pytest tests/test_devmirror.py
+```
+
+runs read-only queries against LMFDB's public mirror at `devmirror.lmfdb.xyz`,
+which checks psycodict against a real 190-table schema, and
+
+```
+PSYCODICT_TEST_DB_REQUIRED=1 pytest
+```
+
+turns "no database, skip" into a hard failure — which is what continuous
+integration wants, so that a misconfigured job cannot report success by
+quietly skipping everything.
+
