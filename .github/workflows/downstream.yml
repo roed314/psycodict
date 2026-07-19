@@ -71,85 +71,19 @@ jobs:
         with:
           path: psycodict
 
-      - name: Check out LMFDB
-        uses: actions/checkout@v4
-        with:
-          repository: LMFDB/lmfdb
-          ref: main
-          path: lmfdb
-
-      - name: Install LMFDB's dependencies
-        working-directory: lmfdb
-        # This pulls psycodict from its git URL, which the next step replaces.
-        run: sage -pip install -r requirements.txt
-
-      # Editable, so that the next step can prove which psycodict is loaded by
-      # looking at the import path.  --no-deps because psycopg2 arrived with
-      # LMFDB's requirements and psycodict's own dependencies are all extras.
-      - name: Install psycodict from this pull request
-        run: sage -pip install --no-deps --force-reinstall -e ./psycodict
-
-      # The dependency is declared as a direct git URL, so pip will happily
-      # reinstall it over a local copy if the ordering is ever changed.  A
-      # version check would not catch that (a PR rarely bumps the version),
-      # so check the import path instead.
-      # Run from the LMFDB checkout, not the workspace root: the root holds a
-      # directory named psycodict/, which Python would import as a namespace
-      # package (__file__ is None) instead of the installed one.  Checking
-      # from where the tests actually run is the honest check anyway.
-      - name: Verify the swap took effect
-        working-directory: lmfdb
-        run: |
-          sage -python - <<'PY'
-          import os
-          import psycodict
-          path = psycodict.__file__
-          print("psycodict imported from", path)
-          expected = os.path.realpath(os.path.join("..", "psycodict"))
-          assert path and os.path.realpath(path).startswith(expected + os.sep), (
-              "LMFDB is running some other psycodict than this pull request's: %r" % (path,)
-          )
-          PY
-
-      - name: Point LMFDB at the public mirror
-        working-directory: lmfdb
-        # These are LMFDB's own defaults, written explicitly so that the job
-        # does not depend on the default surviving.  The keepalives are there
-        # because devmirror is reached over the open internet and a dropped
-        # connection is otherwise a spurious failure.
-        run: |
-          cat > config.ini <<'EOF'
-          [core]
-          debug = False
-          restart = False
-          color = 19
-          [web]
-          port = 37777
-          bindip = 127.0.0.1
-          [logging]
-          logfile = flasklog
-          loglevel = 20
-          slowcutoff = 10.0
-          slowlogfile = slow_queries.log
-          editor =
-          [postgresql]
-          host = devmirror.lmfdb.xyz
-          port = 5432
-          user = lmfdb
-          password = lmfdb
-          dbname = lmfdb
-          keepalives = 1
-          keepalives_idle = 30
-          keepalives_interval = 10
-          keepalives_count = 5
-          EOF
+      - name: Set up LMFDB against devmirror
+        uses: ./psycodict/.github/actions/lmfdb-env
 
       # A subset chosen for psycodict signal per second rather than coverage
       # of LMFDB: test_utils fires ~80 queries across ~20 tables and calls
       # stats.numstats; test_api walks /api/<table> for 21 tables across every
       # database; test_random_redirects hits PostgresSearchTable.random on 28
       # tables; the last two render raw database rows through psycodict's type
-      # conversion.  LMFDB's own CI covers the rest.
+      # conversion.  Measured against the live mirror: 51 passed, 2 skipped,
+      # about four and a half minutes.
+      #
+      # This is the cheap check that belongs in a pull request's feedback
+      # loop.  The whole suite runs in lmfdb-full.yml, which gates releases.
       #
       # Deliberately excluded: test_homepage.py and test_workshoplinks.py make
       # real outbound HTTP requests to third-party sites.
