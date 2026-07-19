@@ -7,11 +7,20 @@
 # is the failure this repository most needs to avoid.
 #
 # Triggers:
-#   - pushing a v* tag, so a release cannot happen without this having run;
+#   - pushing a v* tag;
 #   - manually, which is the better habit -- run it *before* tagging, since a
 #     tag that fails this is a tag you have to delete.  The dispatch form also
 #     takes an LMFDB ref, for checking against an LMFDB branch before it
 #     merges.
+#
+# IMPORTANT, for whoever adds the publishing workflow: this does not gate a
+# release by itself.  Two workflows triggered by the same tag run in parallel
+# -- GitHub Actions does not sequence them -- so an upload would go out while
+# these jobs are still running, and a PyPI version can be yanked but never
+# replaced.  The agreed mechanism is a GitHub Environment named `pypi` with a
+# required reviewer on the publishing job: the tag starts both, the upload
+# parks awaiting approval, and you approve once these eleven groups are green.
+# That also gates every future check, rather than just this one.
 #
 # Cost: eleven parallel jobs in the SageMath container, each pulling a
 # multi-gigabyte image and installing LMFDB's dependencies, all querying the
@@ -44,6 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      sage: ${{ steps.sage.outputs.version }}
     steps:
       - name: Check out psycodict
         uses: actions/checkout@v4
@@ -68,6 +78,23 @@ jobs:
           echo "$matrix" | python3 -m json.tool
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
+      # Which SageMath to run LMFDB under is LMFDB's decision, not ours: their
+      # .environment.yml pins the version their own CI validates against.
+      # Reading it rather than pinning a number keeps us testing the
+      # configuration they support, and stays right when they bump it.  Using
+      # sagemath:latest instead tests whether LMFDB works on unreleased Sage,
+      # which fails for reasons no psycodict change can cause.
+      - name: Resolve the SageMath version
+        id: sage
+        run: |
+          version=$(grep -oE 'sage=[0-9.]+' lmfdb/.environment.yml | head -1 | cut -d= -f2)
+          if [ -z "$version" ]; then
+            echo "::error::could not read the sage pin from LMFDB's .environment.yml"
+            exit 1
+          fi
+          echo "LMFDB pins SageMath $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   test:
     name: ${{ matrix.label }}
     needs: plan
@@ -79,7 +106,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     container:
-      image: sagemath/sagemath:latest
+      image: sagemath/sagemath:${{ needs.plan.outputs.sage }}
       options: --user root
     steps:
       - name: Check out psycodict

@@ -56,14 +56,44 @@ jobs:
           PSYCODICT_TEST_DEVMIRROR: "1"
         run: pytest tests/test_devmirror.py -v --durations=10
 
+  # Which SageMath to run LMFDB under is LMFDB's decision, not ours: their
+  # .environment.yml pins the version their own CI validates against.  Reading
+  # it here rather than pinning a number keeps us testing the configuration
+  # they support, and stays right when they bump it.  Testing against
+  # sagemath:latest instead means testing whether LMFDB works on unreleased
+  # Sage, which fails for reasons no psycodict change can cause -- as it did:
+  # latest currently tracks 10.10 betas, where LMFDB's hypergeometric motive
+  # code hits 'GaloisGroup_v2_with_category' object has no attribute 'group'.
+  lmfdb-sage:
+    name: Resolve SageMath version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: LMFDB/lmfdb
+          ref: main
+          path: lmfdb
+      - id: resolve
+        run: |
+          version=$(grep -oE 'sage=[0-9.]+' lmfdb/.environment.yml | head -1 | cut -d= -f2)
+          if [ -z "$version" ]; then
+            echo "::error::could not read the sage pin from LMFDB's .environment.yml"
+            exit 1
+          fi
+          echo "LMFDB pins SageMath $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   lmfdb:
     name: LMFDB test suite
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs: lmfdb-sage
     # LMFDB requires SageMath, which is far too slow to build and awkward to
     # install from conda here; the upstream image is the cheap way in.
     container:
-      image: sagemath/sagemath:latest
+      image: sagemath/sagemath:${{ needs.lmfdb-sage.outputs.version }}
       options: --user root
     steps:
       - name: Check out psycodict
