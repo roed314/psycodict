@@ -145,6 +145,10 @@ jobs:
         # setuptools supplies the distutils shim that seminars/users needs on
         # Python 3.12+, and costs nothing on 3.11.
         run: |
+          if ! grep -q psycodict requirements.txt; then
+            echo "::error::seminars' requirements.txt no longer names psycodict; this step needs rewriting"
+            exit 1
+          fi
           grep -v psycodict requirements.txt > ci-requirements.txt
           python -m pip install -r ci-requirements.txt pygments setuptools
 

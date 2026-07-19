@@ -27,11 +27,24 @@ runs:
         ref: ${{ inputs.lmfdb-ref }}
         path: lmfdb
 
+    # LMFDB pins psycodict as `git+https://...`, which pip cannot fetch here:
+    # the SageMath image ships no git.  (actions/checkout papers over that by
+    # falling back to a tarball download, so the failure surfaces later, at
+    # pip.)  Dropping the line is the right fix rather than installing git,
+    # since the next step replaces that psycodict anyway -- this just stops us
+    # downloading a copy in order to throw it away.  It is the only git+
+    # requirement; LMFDB's own runtime use of git, in app.py's git_infos(),
+    # already degrades to "-" when the command is missing.
     - name: Install LMFDB's dependencies
       shell: bash
       working-directory: lmfdb
-      # This pulls psycodict from its git URL, which the next step replaces.
-      run: sage -pip install -r requirements.txt
+      run: |
+        if ! grep -q psycodict requirements.txt; then
+          echo "::error::LMFDB's requirements.txt no longer names psycodict; this step needs rewriting"
+          exit 1
+        fi
+        grep -v psycodict requirements.txt > ci-requirements.txt
+        sage -pip install -r ci-requirements.txt
 
     # Editable, so that the next step can prove which psycodict is loaded by
     # looking at the import path.  --no-deps because psycopg2 arrived with
