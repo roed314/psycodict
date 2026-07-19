@@ -489,13 +489,26 @@ class PostgresSearchTable(PostgresTable):
             sage: statement, vals = db.nf_fields._build_query({"class_number":1}, 20)
             sage: statement.as_string(db.conn), vals
             (' WHERE "class_number" = %s ORDER BY "id" LIMIT %s', [1, 20])
+
+        A ``raw_values`` list passed in by the caller is not mutated, even
+        though the limit and offset are appended to the returned values::
+
+            sage: raw_values = []
+            sage: statement, vals = db.nf_fields._build_query({}, 20, raw="degree = 2", raw_values=raw_values)
+            sage: statement.as_string(db.conn), vals
+            (' WHERE degree = 2 ORDER BY "degree", "disc_abs", "disc_sign", "iso_number" LIMIT %s', [20])
+            sage: raw_values
+            []
         """
         if raw_values is None:
             raw_values = []
         if raw is None:
             qstr, values = self._parse_dict(query)
         else:
-            qstr, values = SQL(raw), raw_values
+            # Copy raw_values: we append limit/offset to ``values`` below, and
+            # must not mutate the list passed in by the caller (in particular
+            # the shared default of search()/lucky()).
+            qstr, values = SQL(raw), list(raw_values)
         if qstr is None:
             where = SQL("")
             values = []
@@ -630,7 +643,7 @@ class PostgresSearchTable(PostgresTable):
         else:
             return Identifier(self.search_table)
 
-    def lucky(self, query={}, projection=2, offset=0, sort=[], raw=None, raw_values=[]):
+    def lucky(self, query={}, projection=2, offset=0, sort=[], raw=None, raw_values=None):
         # FIXME Nulls aka Nones are being erased, we should perhaps just leave them there
         """
         One of the two main public interfaces for performing SELECT queries,
@@ -721,7 +734,7 @@ class PostgresSearchTable(PostgresTable):
         one_per=None,
         silent=False,
         raw=None,
-        raw_values=[],
+        raw_values=None,
     ):
         """
         One of the two main public interfaces for performing SELECT queries,
