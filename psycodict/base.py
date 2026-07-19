@@ -133,7 +133,15 @@ _meta_tables_cols_notrequired = (
     "total",
     "important",
     "include_nones",
-)  # defaults: 1000, true, 0, false, false
+)
+# SQL literals giving the default values for the columns above
+_meta_tables_defaults = {
+    "count_cutoff": "1000",
+    "stats_valid": "true",
+    "total": "0",
+    "important": "false",
+    "include_nones": "false",
+}
 _meta_tables_types = dict(zip(_meta_tables_cols, (
     "text",
     "jsonb",
