@@ -69,11 +69,17 @@ def db(config):
     """
     A ``PostgresDatabase`` connected to the test database, meta tables created.
     """
+    import psycopg2
+
     from psycodict.database import PostgresDatabase
 
     try:
         database = PostgresDatabase(config=config, create=True)
-    except Exception as err:
+    except psycopg2.OperationalError as err:
+        # Only a failure to reach the server means "skip".  Catching every
+        # exception here would turn a genuine regression in the constructor
+        # into a skip, and a run that skips everything looks like a run that
+        # passed -- anything else must propagate.
         conn = _connection_kwargs()
         message = "no PostgreSQL server at %s:%s/%s as %s (%s: %s)" % (
             conn["host"], conn["port"], conn["dbname"], conn["user"],

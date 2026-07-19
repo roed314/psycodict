@@ -21,7 +21,7 @@ runs:
   using: composite
   steps:
     - name: Check out LMFDB
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         repository: LMFDB/lmfdb
         ref: ${{ inputs.lmfdb-ref }}

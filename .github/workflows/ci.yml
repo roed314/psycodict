@@ -30,9 +30,9 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -54,9 +54,9 @@ jobs:
       matrix:
         python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -109,9 +109,9 @@ jobs:
       # to report success.
       PSYCODICT_TEST_DB_REQUIRED: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -129,9 +129,9 @@ jobs:
     name: Package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -147,16 +147,30 @@ jobs:
       - name: Check metadata
         run: twine check --strict dist/*
 
+      # Run from outside the checkout.  This is a flat-layout project, so the
+      # repository root contains a real psycodict/ package directory, and an
+      # interpreter started there imports *that* in preference to anything
+      # installed -- which made this check pass against a wheel with its
+      # modules deleted.  Asserting where the import came from is what makes
+      # the test about the wheel rather than about the source tree.
       - name: Wheel installs and imports
         run: |
-          python -m venv smoke
-          smoke/bin/pip install "$(echo dist/*.whl)[pgbinary]"
-          smoke/bin/python -c "
-          import importlib.metadata, psycodict
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/pip" install "$(echo "$PWD"/dist/*.whl)[pgbinary]"
+          cd "$RUNNER_TEMP"
+          smoke/bin/python - <<PY
+          import importlib.metadata, os
+          import psycodict
           from psycodict.database import PostgresDatabase
-          assert PostgresDatabase is not None
-          print('psycodict', importlib.metadata.version('psycodict'), 'imports cleanly')
-          "
+          from psycodict.encoding import Json
+          path = os.path.realpath(psycodict.__file__)
+          checkout = os.path.realpath("$GITHUB_WORKSPACE")
+          assert not path.startswith(checkout + os.sep), (
+              "imported the checkout rather than the installed wheel: %s" % path
+          )
+          assert PostgresDatabase is not None and Json is not None
+          print("psycodict", importlib.metadata.version("psycodict"), "imports from", path)
+          PY
 
       # psycopg2 is deliberately an optional dependency, so that users choose
       # between the source and binary builds.  Importing without it must fail
@@ -164,8 +178,10 @@ jobs:
       # ImportError -- this asserts that contract holds.
       - name: Import without psycopg2 gives a helpful message
         run: |
-          python -m venv bare
-          bare/bin/pip install "$(echo dist/*.whl)"
+          python -m venv "$RUNNER_TEMP/bare"
+          "$RUNNER_TEMP/bare/bin/pip" install "$(echo "$PWD"/dist/*.whl)"
+          # Outside the checkout, for the same reason as the step above.
+          cd "$RUNNER_TEMP"
           set +e
           output=$(bare/bin/python -c "import psycodict" 2>&1)
           status=$?
@@ -180,7 +196,7 @@ jobs:
             *) echo "::error::missing the install-psycopg2 hint"; exit 1 ;;
           esac
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/

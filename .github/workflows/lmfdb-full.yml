@@ -56,12 +56,12 @@ jobs:
       sage: ${{ steps.sage.outputs.version }}
     steps:
       - name: Check out psycodict
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: psycodict
 
       - name: Check out LMFDB
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: LMFDB/lmfdb
           ref: ${{ inputs.lmfdb-ref || 'main' }}
@@ -110,7 +110,7 @@ jobs:
       options: --user root
     steps:
       - name: Check out psycodict
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: psycodict
 

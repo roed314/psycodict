@@ -41,9 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -70,7 +70,7 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: LMFDB/lmfdb
           ref: main
@@ -97,7 +97,7 @@ jobs:
       options: --user root
     steps:
       - name: Check out psycodict
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: psycodict
 
@@ -148,12 +148,12 @@ jobs:
           --health-retries 5
     steps:
       - name: Check out psycodict
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: psycodict
 
       - name: Check out seminars
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: roed314/seminars
           ref: master
@@ -161,7 +161,7 @@ jobs:
 
       # seminars/users/__init__.py imports distutils, which was removed in
       # 3.12; setuptools' shim covers it, but 3.11 avoids the question.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
