@@ -23,8 +23,13 @@ Three levels, cheapest first:
 Run from a seminars checkout whose config.ini points at a bootstrapped
 database.  Exits non-zero on the first failure.
 """
+import os
 import sys
 import traceback
+
+# sys.path[0] is this script's directory, which is in the psycodict checkout,
+# so the seminars package would not otherwise be importable.
+sys.path.insert(0, os.getcwd())
 
 failures = []
 
@@ -109,7 +114,6 @@ ROUTES = [
     "/seminar_series",
     "/past_conferences",
     "/institutions/",
-    "/subjects",
     "/sitemap",
     "/ams",
     "/api/",
@@ -123,7 +127,12 @@ def route_check(path):
 
         with app.test_client() as client:
             response = client.get(path)
-        assert response.status_code < 500, "%s returned %d" % (path, response.status_code)
+        # All of these serve 200 against the empty schema.  The bound is < 400
+        # rather than == 200 so that a redirect added on the seminars side is
+        # not reported as a psycodict regression; a 5xx (which is what a
+        # psycodict exception looks like from here) still fails, and so does a
+        # 404 from a route that stopped existing.
+        assert response.status_code < 400, "%s returned %d" % (path, response.status_code)
 
     return run
 

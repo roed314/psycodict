@@ -22,7 +22,14 @@ where it can be kept in sync; see the discussion in the PR that added it.
 Usage: run from a seminars checkout that has a config.ini pointing at the
 target database.
 """
-from seminars import db
+import os
+import sys
+
+# sys.path[0] is this script's directory, which is in the psycodict checkout,
+# so the seminars package would not otherwise be importable.
+sys.path.insert(0, os.getcwd())
+
+from seminars import db  # noqa: E402
 
 # name -> (columns by postgres type, label column)
 TABLES = {

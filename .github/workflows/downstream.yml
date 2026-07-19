@@ -206,9 +206,13 @@ jobs:
       # reinstall it over the copy under test.
       - name: Install seminars' dependencies
         working-directory: seminars
+        # pygments is imported by seminars/api/main.py but missing from its
+        # requirements.txt, so seminars.website will not import without it.
+        # setuptools supplies the distutils shim that seminars/users needs on
+        # Python 3.12+, and costs nothing on 3.11.
         run: |
           grep -v psycodict requirements.txt > ci-requirements.txt
-          python -m pip install -r ci-requirements.txt
+          python -m pip install -r ci-requirements.txt pygments setuptools
 
       - name: Install psycodict from this pull request
         # Quoted: the brackets are a glob pattern to the shell otherwise.
