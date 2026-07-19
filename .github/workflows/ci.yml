@@ -141,9 +141,9 @@ jobs:
           python -m pip install build twine
           python -m build
 
-      # Fails the build on missing/!invalid long_description and on metadata
-      # PyPI would reject at upload time -- catching that here rather than
-      # during a release is the entire point.
+      # Fails the build on a missing or invalid long_description, and on any
+      # metadata PyPI would reject at upload time -- catching that here rather
+      # than during a release is the entire point.
       - name: Check metadata
         run: twine check --strict dist/*
 

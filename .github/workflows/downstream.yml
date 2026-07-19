@@ -93,15 +93,21 @@ jobs:
       # reinstall it over a local copy if the ordering is ever changed.  A
       # version check would not catch that (a PR rarely bumps the version),
       # so check the import path instead.
+      # Run from the LMFDB checkout, not the workspace root: the root holds a
+      # directory named psycodict/, which Python would import as a namespace
+      # package (__file__ is None) instead of the installed one.  Checking
+      # from where the tests actually run is the honest check anyway.
       - name: Verify the swap took effect
+        working-directory: lmfdb
         run: |
           sage -python - <<'PY'
           import os
           import psycodict
-          path = os.path.realpath(psycodict.__file__)
+          path = psycodict.__file__
           print("psycodict imported from", path)
-          assert path.startswith(os.path.realpath("psycodict") + os.sep), (
-              "LMFDB is running some other psycodict than this pull request's"
+          expected = os.path.realpath(os.path.join("..", "psycodict"))
+          assert path and os.path.realpath(path).startswith(expected + os.sep), (
+              "LMFDB is running some other psycodict than this pull request's: %r" % (path,)
           )
           PY
 
@@ -208,15 +214,20 @@ jobs:
         # Quoted: the brackets are a glob pattern to the shell otherwise.
         run: python -m pip install -e "./psycodict[pgbinary]"
 
+      # From the seminars checkout, for the same reason as the LMFDB job: the
+      # workspace root holds a psycodict/ directory that would shadow the
+      # installed package as a namespace package.
       - name: Verify the swap took effect
+        working-directory: seminars
         run: |
           python - <<'PY'
           import os
           import psycodict
-          path = os.path.realpath(psycodict.__file__)
+          path = psycodict.__file__
           print("psycodict imported from", path)
-          assert path.startswith(os.path.realpath("psycodict") + os.sep), (
-              "seminars is running some other psycodict than this pull request's"
+          expected = os.path.realpath(os.path.join("..", "psycodict"))
+          assert path and os.path.realpath(path).startswith(expected + os.sep), (
+              "seminars is running some other psycodict than this pull request's: %r" % (path,)
           )
           PY
 
