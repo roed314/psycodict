@@ -193,10 +193,6 @@ def test_search_info_inexact_count_above_cutoff(filled_table, monkeypatch):
     assert info["exact_count"] is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="info['number'] for the empty query is the stale meta_tables.total; see the stats.saving guard in table.py",
-)
 def test_search_info_number_for_empty_query(filled_table):
     info = {}
     filled_table.search({}, 0, limit=3, info=info)
@@ -308,10 +304,6 @@ def test_count_with_query(filled_table):
     assert filled_table.count({"flag": True}) == 67
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="count() returns stale meta_tables.total; see the stats.saving guard in table.py",
-)
 def test_count_without_query(filled_table):
     assert filled_table.count({}) == 200
 

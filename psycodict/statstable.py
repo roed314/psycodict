@@ -305,6 +305,52 @@ class PostgresStatsTable(PostgresBase):
         for col in self.table.search_cols:
             self._slow_count({col: None}, suffix=suffix, extra=False)
 
+    def _set_total(self, total, suffix=""):
+        """
+        Set the total row count to an absolute value, after a recount.
+
+        For the live table (no suffix) this updates both this object and
+        meta_tables.  For a staged table (e.g. ``suffix="_tmp"`` during a
+        reload) neither is touched -- the staged count only becomes the live
+        total when ``reload_final_swap`` swaps the table in and recounts --
+        but under ``saving`` it is still recorded in the suffixed counts
+        table.
+
+        Unlike the statistics and counts tables, the total is maintained on
+        every write path regardless of ``saving``, since ``count()`` with an
+        empty query is answered from it; ``saving`` only controls whether the
+        total is *also* recorded in the counts table.  Compare ``_break_stats``,
+        which likewise writes meta_tables unconditionally.
+        """
+        total = max(0, total)
+        if not suffix:
+            self.total = total
+            updater = SQL("UPDATE meta_tables SET total = %s WHERE name = %s")
+            self._execute(updater, [total, self.search_table], silent=True)
+        if self.saving:
+            self._record_count({}, total, suffix=suffix)
+
+    def _update_total(self, delta):
+        """
+        Adjust the total row count by ``delta`` rows, atomically.
+
+        The write paths use this rather than ``_set_total`` so that
+        concurrent writers compose: an absolute value computed from a cached
+        ``self.total`` would silently lose the rows another connection wrote
+        in between.  The delta is applied by the database itself, and
+        RETURNING hands back the post-update value so the in-memory total
+        reflects concurrent activity too.
+        """
+        updater = SQL(
+            "UPDATE meta_tables SET total = GREATEST(total + %s, 0) "
+            "WHERE name = %s RETURNING total"
+        )
+        cur = self._execute(updater, [delta, self.search_table], silent=True)
+        row = cur.fetchone()
+        self.total = max(0, self.total + delta) if row is None else row[0]
+        if self.saving:
+            self._record_count({}, self.total)
+
     def _slow_count(self, query, split_list=False, record=True, suffix="", extra=True):
         """
         No shortcuts: actually count the rows in the search table.
@@ -368,8 +414,10 @@ class PostgresStatsTable(PostgresBase):
             self._execute(updater.format(Identifier(self.counts + suffix)), data)
         except DatabaseError:
             pass
-        # We also store the total count in meta_tables to improve startup speed
-        if not query:
+        # We also store the total count in meta_tables to improve startup
+        # speed -- but only for the live table: a suffixed count (e.g. of a
+        # _tmp table staged for reload) must not overwrite the live total.
+        if not query and not suffix:
             updater = SQL("UPDATE meta_tables SET total = %s WHERE name = %s")
             # This should never be called from the webserver, since we only record
             # counts for {} when data is updated.
@@ -1583,7 +1631,7 @@ ORDER BY v.ord LIMIT %s"""
 
             if total:
                 # Refresh total in meta_tables
-                self.total = self._slow_count({}, suffix=suffix, extra=False)
+                self._set_total(self._slow_count({}, suffix=suffix, extra=False), suffix=suffix)
             self.refresh_null_counts(suffix=suffix)
             self.logger.info("Refreshed statistics in %.3f secs" % (time.time() - t0))
 

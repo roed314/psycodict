@@ -122,12 +122,6 @@ def test_slow_count_sees_every_row(filled_table):
     assert filled_table.stats._slow_count({}, extra=False) == 200
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="count() returns the stale meta_tables.total: every write path "
-           "guards the total update behind `if self.stats.saving:`, which is "
-           "False by default, so a table filled through psycodict reports 0",
-)
 def test_count_unfiltered_reflects_inserted_rows(filled_table):
     assert filled_table.count() == 200
 
@@ -268,6 +262,40 @@ def _information_schema_query():
 
 def test_total_starts_at_zero_for_new_table(empty_table):
     assert empty_table.stats.total == 0
+
+
+def test_set_total_with_suffix_leaves_the_live_total_alone(db, filled_table):
+    # refresh_stats(suffix="_tmp") runs while a reload is staged; the count
+    # of the staged table must not become the live total before the swap.
+    from psycopg2.sql import SQL
+
+    filled_table.stats._set_total(7, suffix="_tmp")
+    assert filled_table.stats.total == 200
+    (meta_total,) = db._execute(
+        SQL("SELECT total FROM meta_tables WHERE name = %s"),
+        [filled_table.search_table],
+    ).fetchone()
+    assert meta_total == 200
+
+
+def test_concurrent_writers_do_not_lose_total_updates(db, filled_table, config):
+    # Absolute totals computed from a cached value lose concurrent rows: two
+    # connections that both saw N and insert one row each must end at N + 2,
+    # not N + 1.  The second connection connects (caching total = 200), the
+    # first inserts, then the second inserts through its stale cache.
+    from psycodict.database import PostgresDatabase
+
+    other = PostgresDatabase(config=config)
+    try:
+        table2 = other[filled_table.search_table]
+        assert table2.stats.total == 200
+        filled_table.insert_many([sample_row(200)])
+        table2.insert_many([sample_row(201)])
+        assert filled_table.count({"n": {"$gte": 0}}) == 202
+        for handle in (PostgresDatabase(config=config)[filled_table.search_table], table2):
+            assert handle.count() == 202
+    finally:
+        other.conn.close()
 
 
 def test_saving_defaults_to_false(empty_table):
