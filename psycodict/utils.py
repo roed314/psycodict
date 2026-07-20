@@ -209,8 +209,11 @@ class DelayCommit():
         self.final_commit = final_commit
         self.active = active
         self._orig_silenced = obj._db._silenced
-        if silence is not None:
-            obj._silenced = silence
+        # Gated on active: __exit__ only restores the flag when active, so
+        # setting it for an inactive DelayCommit would silence the database
+        # permanently (reload_all uses exactly silence=True, active=False).
+        if active and silence is not None:
+            obj._db._silenced = silence
 
     def __enter__(self):
         if self.active:
