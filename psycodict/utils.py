@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import os.path
 import sys
 import re
 from collections import defaultdict
@@ -143,8 +144,10 @@ def IdentifierWrapper(name, convert=True):
             raise ValueError("%s is not in the proper format" % knife)
         chunks = knife[1:-1].split("][")
         # Prevent SQL injection
-        if not all(all(x.isdigit() for x in chunk.split(":")) for chunk in chunks):
-            raise ValueError("% is must be numeric, brackets and colons" % knife)
+        # As in Python, an empty bound in a slice (e.g. [:10]) means open,
+        # but a bare index (no colon present) must be a number
+        if not all(all(x.isdigit() or (x == "" and ":" in chunk) for x in chunk.split(":")) for chunk in chunks):
+            raise ValueError("%s must be numeric, brackets and colons" % knife)
         if convert:
             for i, s in enumerate(chunks):
                 # each cut is of the format a:b:c
@@ -174,7 +177,7 @@ class QueryLogFilter():
     """
 
     def filter(self, record):
-        if record.pathname.endswith("base.py"):
+        if os.path.basename(record.pathname) == "base.py":
             return 1
         else:
             return 0
@@ -210,7 +213,7 @@ class DelayCommit():
         self.active = active
         self._orig_silenced = obj._db._silenced
         if silence is not None:
-            obj._silenced = silence
+            obj._db._silenced = silence
 
     def __enter__(self):
         if self.active:

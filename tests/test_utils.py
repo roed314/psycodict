@@ -266,23 +266,15 @@ def test_identifier_wrapper_rejects_unbalanced_brackets():
     "name[1:10]; --",
 ])
 def test_identifier_wrapper_rejects_non_numeric_slicers(name):
-    # The exact type is wrong (see the xfail below), but nothing gets through.
-    with pytest.raises((ValueError, TypeError)):
+    with pytest.raises(ValueError):
         IdentifierWrapper(name)
 
 
-@pytest.mark.xfail(strict=True, reason="the rejection branch raises TypeError, not "
-                                       "ValueError: its message '% is must be "
-                                       "numeric...' contains a '% i' conversion "
-                                       "that chokes on the string argument")
 def test_identifier_wrapper_rejects_non_numeric_slicers_with_value_error():
     with pytest.raises(ValueError):
         IdentifierWrapper("name[1];DROP TABLE x]")
 
 
-@pytest.mark.xfail(strict=True, reason="empty slice bounds are documented in the "
-                                       "docstring but rejected, because ''.isdigit() "
-                                       "is False")
 @pytest.mark.parametrize("name,slicer", [
     ("name[:10]", "[:10]"),
     ("name[1:10:3][0::1]", "[2:10:3][1::1]"),
@@ -310,9 +302,6 @@ def test_query_log_filter_only_passes_records_from_base(pathname, expected):
     assert QueryLogFilter().filter(log_record(pathname)) == expected
 
 
-@pytest.mark.xfail(strict=True, reason="the filter tests pathname.endswith('base.py'), "
-                                       "which is also true of psycodict's own "
-                                       "database.py")
 def test_query_log_filter_does_not_match_database_py():
     assert QueryLogFilter().filter(log_record("/opt/psycodict/database.py")) == 0
 
@@ -404,10 +393,6 @@ def test_delay_commit_restores_the_silence_flag_on_exit():
     assert owner._db._silenced is True
 
 
-@pytest.mark.xfail(strict=True, reason="silence= is written to obj._silenced but "
-                                       "read (in base.py) and restored from "
-                                       "obj._db._silenced, so it has no effect "
-                                       "unless obj is the database itself")
 def test_delay_commit_silence_applies_to_the_database():
     owner = make_owner()
     with DelayCommit(owner, silence=True):

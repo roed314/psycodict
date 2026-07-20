@@ -115,7 +115,7 @@ class Configuration():
                 dest="postgresql_password",
                 metavar="PASS",
                 help="PostgreSQL password [default: %(default)s]",
-                default=defaults.get("postgres_password", ""),
+                default=defaults.get("postgresql_password", ""),
             )
 
             postgresqlgroup.add_argument(
@@ -218,7 +218,11 @@ class Configuration():
 
         def get(section, key):
             val = _cfgp.get(section, key)
+            # reconstruct the argparse dest: keys without an underscore went
+            # into the misc section with the bare key as dest
             full = section + "_" + key
+            if full not in type_dict and section == "misc":
+                full = key
             type_func = type_dict.get(full)
             if type_func is not None:
                 val = type_func(val)
