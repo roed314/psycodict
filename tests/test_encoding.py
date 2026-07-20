@@ -78,6 +78,26 @@ def test_numeric_converter_decimals(value, expected):
     assert numeric_converter(value) == expected
 
 
+@pytest.mark.parametrize("value,prec", [
+    # the g2c regulator from LMFDB/lmfdb#3569: 12 significant digits (40
+    # bits), where counting all 16 characters gave 54 bits and printed
+    # phantom digits
+    ("0.00459244230167", 40),
+    ("123.456", 20),
+    # trailing zeros were stored, hence are significant
+    ("1.500", 14),
+    # the sign, the decimal point and leading zeros carry no information
+    ("-0.5", 4),
+    ("0.5", 4),
+    # no significant digits at all: RealField's minimum precision
+    ("0.000", 2),
+])
+def test_numeric_precision_counts_significant_digits(value, prec):
+    from psycodict.encoding import numeric_precision
+
+    assert numeric_precision(value) == prec
+
+
 def test_numeric_converter_none_and_unused_cursor():
     assert numeric_converter(None) is None
     assert numeric_converter(None, cur=object()) is None

@@ -6,9 +6,9 @@ and decoding the results.
 import binascii
 import json
 import datetime
+import math
 from psycopg.adapt import Dumper
 try:
-    from sage.all import ceil
     try:
         # this fails in sage 9.3
         from sage.rings.complex_mpfr import ComplexNumber, ComplexField
@@ -83,6 +83,30 @@ else:
             return str(obj).encode()
 
 
+def numeric_precision(value):
+    """
+    The bit precision needed to faithfully represent a decimal string:
+    log(10)/log(2) bits per significant digit, where the sign, the decimal
+    point and leading zeros carry no information.  (Counting every character,
+    as this function's predecessor did, manufactured phantom digits whenever
+    the value was printed at full precision.)  At least 2, the smallest
+    precision a RealField accepts.
+
+    INPUT:
+
+    - ``value`` -- a string representing a decimal number, as Postgres
+      delivers the numeric type
+
+    EXAMPLES::
+
+        sage: numeric_precision("0.00459244230167")  # 12 significant digits
+        40
+    """
+    digits = len(value.lstrip("+-").replace(".", "", 1).lstrip("0"))
+    # log(10)/log(2) = 3.3219280948873626
+    return max(math.ceil(digits * 3.3219280948873626), 2)
+
+
 def numeric_converter(value, cur=None):
     """
     Used for converting numeric values from Postgres to Python.
@@ -94,17 +118,15 @@ def numeric_converter(value, cur=None):
 
     OUTPUT:
 
-    - either a sage integer (if there is no decimal point) or a real number whose precision depends on the number of digits in value.
+    - either a sage integer (if there is no decimal point) or a real number whose precision depends on the number of significant digits in value.
     """
     if value is None:
         return None
     if "." in value:
         if SAGE_MODE:
-            # The following is a good guess for the bit-precision,
-            # but we use LmfdbRealLiterals to ensure that our number
-            # prints the same as we got it.
-            prec = ceil(len(value) * 3.322)
-            return LmfdbRealLiteral(RealField(prec), value)
+            # A good guess for the bit-precision; we use LmfdbRealLiterals
+            # to ensure that our number prints the same as we got it.
+            return LmfdbRealLiteral(RealField(numeric_precision(value)), value)
         else:
             # Sage isn't installed, so we fall back on Python floats
             return float(value)
