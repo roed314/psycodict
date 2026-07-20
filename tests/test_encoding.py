@@ -96,25 +96,55 @@ def test_numeric_converter_dispatches_on_the_decimal_point():
 def test_numeric_converter_needs_a_decimal_point_for_exponents():
     # A documented limitation rather than a live bug: Postgres' numeric output
     # never uses exponent notation, so "1e5" cannot arrive from a numeric
-    # column.  It fails loudly rather than silently truncating.
-    with pytest.raises(ValueError):
+    # column.  It fails loudly rather than silently truncating -- with
+    # ValueError from int() without Sage, TypeError from Integer() with it.
+    with pytest.raises((ValueError, TypeError)):
         numeric_converter("1e5")
 
 
-def test_sage_import_guard_degrades_gracefully():
-    # encoding.py wraps its Sage imports in try/except ImportError and defines
-    # the Sage-only helpers only in the else branch.
-    try:
-        import sage.all  # noqa: F401
-    except ImportError:
-        assert SAGE_MODE is False
-        assert not hasattr(psycodict.encoding, "LmfdbRealLiteral")
-        assert not hasattr(psycodict.encoding, "RealEncoder")
-        # ... and the module still converts, using builtin types.
-        assert type(numeric_converter("5")) is int
-        assert type(numeric_converter("5.5")) is float
-    else:
-        assert isinstance(SAGE_MODE, bool)
+# encoding.py wraps its Sage imports in try/except ImportError and behaves
+# differently on each side of the guard, so each side gets its own tests: the
+# unit CI jobs run this file without Sage, and the downstream LMFDB job runs
+# the same file again under ``sage -python``.
+
+
+@pytest.mark.skipif(SAGE_MODE, reason="tests the sage-free fallback")
+def test_without_sage_falls_back_to_builtin_types():
+    assert not hasattr(psycodict.encoding, "LmfdbRealLiteral")
+    assert not hasattr(psycodict.encoding, "RealEncoder")
+    # The module still converts, using builtin types -- at the price of
+    # rounding fractional values to float precision.
+    assert type(numeric_converter("5")) is int
+    assert type(numeric_converter("5.5")) is float
+
+
+@pytest.mark.skipif(not SAGE_MODE, reason="needs SageMath")
+def test_with_sage_numeric_converter_is_exact():
+    from sage.rings.integer import Integer
+
+    from psycodict.encoding import LmfdbRealLiteral
+
+    big = numeric_converter("368947264000000000000000000")
+    assert isinstance(big, Integer)
+    assert big == 368947264000000000000000000
+    # The entire point of LmfdbRealLiteral: a fractional value prints exactly
+    # as Postgres sent it, digit for digit, far beyond float precision.
+    digits = "3.14159265358979323846264338327950288419716939937510"
+    real = numeric_converter(digits)
+    assert isinstance(real, LmfdbRealLiteral)
+    assert str(real) == digits
+
+
+@pytest.mark.skipif(not SAGE_MODE, reason="needs SageMath")
+def test_with_sage_copy_dumps_round_trips_sage_types():
+    from sage.rings.integer import Integer
+
+    # Sage Integers take the same exact-string path as Python ints ...
+    assert copy_dumps(Integer(2) ** 100, "numeric") == str(2**100)
+    # ... and a RealLiteral is written back as its literal, so a value read
+    # from a numeric column survives a copy_to/copy_from cycle unchanged.
+    digits = "3.14159265358979323846264338327950288419716939937510"
+    assert copy_dumps(numeric_converter(digits), "numeric") == digits
 
 
 # ---------------------------------------------------------------------------

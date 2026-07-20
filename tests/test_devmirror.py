@@ -15,11 +15,14 @@ Because it is both a network dependency and a shared community resource,
 these tests are skipped unless ``PSYCODICT_TEST_DEVMIRROR=1`` is set; CI sets
 it in one job.
 
-Assertions here deliberately check structure and types rather than specific
-values: the mirror tracks a live database, so anything that pins a count or a
-row would rot.
+The mirror tracks a live database, so most assertions here check structure
+and types rather than specific values.  Values are pinned only where the
+mathematics pins them: the number of imaginary quadratic fields of class
+number 1 is a theorem, not a census, and the polredabs-reduced polynomial of
+a labelled field is determined by its label.  Those cannot rot.
 """
 import os
+from collections import Counter
 
 import pytest
 
@@ -89,10 +92,11 @@ def test_lookup_by_label(mirror):
 
 def test_lucky_with_projection(mirror):
     ainvs = mirror.ec_curvedata.lucky({"lmfdb_label": "11.a2"}, "ainvs")
-    # A Weierstrass model is five integers; the point is that an integer[]
-    # column round-trips to a list of Python ints.
-    assert len(ainvs) == 5
-    assert all(isinstance(a, int) for a in ainvs)
+    # A Weierstrass model is five exact integers -- Python ints without Sage,
+    # Sage Integers with it, so assert integrality rather than a type.  For
+    # 11.a2 the model itself is pinned: y^2 + y = x^3 - x^2 - 10x - 20.
+    assert ainvs == [0, -1, 1, -10, -20]
+    assert all(int(a) == a for a in ainvs)
 
 
 def test_lookup_missing_label_returns_none(mirror):
@@ -100,9 +104,13 @@ def test_lookup_missing_label_returns_none(mirror):
 
 
 def test_count_with_constraint(mirror):
-    # Cubic fields exist and are fewer than all fields.
+    # The unfiltered count comes from the cached stats total, which LMFDB
+    # maintains, so this also exercises the quick-count path against totals
+    # that are real -- and makes the comparison meaningful: a constrained
+    # count must land strictly between zero and everything.
+    total = mirror.nf_fields.count()
     cubics = mirror.nf_fields.count({"degree": 3})
-    assert cubics > 0
+    assert 0 < cubics < total
 
 
 def test_count_is_monotone_under_refinement(mirror):
@@ -121,23 +129,32 @@ def test_search_respects_limit_and_sort(mirror):
     assert labels == sorted(labels)
 
 
+# The next two tests query the imaginary quadratic fields of class number 1
+# and 2.  There are exactly 9 and 18 of them (Baker--Heegner--Stark), so both
+# values are guaranteed to appear in a full result set -- whereas a range over
+# a plentiful column, with a limit, fills up with the smallest value and never
+# demonstrates more than one endpoint.  Being theorems, the counts cannot rot.
+
+
 def test_search_range_query(mirror):
-    degrees = list(
+    seen = Counter(
         mirror.nf_fields.search(
-            {"degree": {"$gte": 3, "$lte": 4}}, projection="degree", limit=50
+            {"degree": 2, "r2": 1, "class_number": {"$gte": 1, "$lte": 2}},
+            projection="class_number",
         )
     )
-    assert degrees
-    assert set(degrees) <= {3, 4}
+    assert seen == {1: 9, 2: 18}
 
 
 def test_search_in_operator(mirror):
-    degrees = set(
+    values = list(
         mirror.nf_fields.search(
-            {"degree": {"$in": [2, 5]}}, projection="degree", limit=50
+            {"degree": 2, "r2": 1, "class_number": {"$in": [1, 2]}},
+            projection="class_number",
         )
     )
-    assert degrees <= {2, 5}
+    assert len(values) == 27
+    assert set(values) == {1, 2}
 
 
 def test_exists(mirror):
@@ -162,18 +179,73 @@ def test_stats_column_counts(mirror):
     assert all(isinstance(v, int) for v in counts.values())
 
 
-def test_numeric_column_is_exact(mirror):
-    from decimal import Decimal
+# A numeric column plays two roles in the LMFDB, and the converter treats
+# them differently: values without a decimal point are exact integers of
+# arbitrary size, while values with one are high-precision reals -- exact as
+# *digit strings*, not as numbers.  One test per role.
 
-    # Regulators are numeric, not float: they must not arrive as a float.
+
+def test_numeric_column_large_integers_are_exact(mirror):
+    assert mirror.nf_fields.col_type["disc_abs"] == "numeric"
+    row = mirror.nf_fields.lucky({"degree": 24}, ["label", "disc_abs"])
+    d = row["disc_abs"]
+    # Discriminants of degree-24 fields need far more than the 53 bits a
+    # float carries, so surviving the round trip below proves exactness.
+    assert d > 2**53
+    assert int(d) == d
+    assert mirror.nf_fields.count({"degree": 24, "disc_abs": d}) >= 1
+
+
+def test_numeric_column_fractional_values(mirror):
+    from psycodict.encoding import SAGE_MODE
+
+    # 37.a1 is the first rank-1 elliptic curve, so its regulator is a
+    # genuinely irrational number stored to high precision.
+    assert mirror.ec_curvedata.col_type["regulator"] == "numeric"
+    reg = mirror.ec_curvedata.lucky({"lmfdb_label": "37.a1"}, "regulator")
+    assert 0.0511 < float(reg) < 0.0512
+    if SAGE_MODE:
+        # Under Sage the digits arrive wrapped in an LmfdbRealLiteral, which
+        # prints exactly as Postgres sent them.
+        from psycodict.encoding import LmfdbRealLiteral
+
+        assert isinstance(reg, LmfdbRealLiteral)
+    else:
+        # Without Sage the documented fallback is a float: the tail of the
+        # stored precision is deliberately given up.
+        assert isinstance(reg, float)
+
+
+def test_numeric_column_integral_values_stay_integral(mirror):
+    # 11.a2 has rank 0, so its regulator is exactly 1 -- and must come back
+    # as an integral 1 (int, or Sage Integer), not 1.0.
     reg = mirror.ec_curvedata.lucky({"lmfdb_label": "11.a2"}, "regulator")
-    assert isinstance(reg, (Decimal, int)) or reg is None
+    assert reg == 1
+    assert not isinstance(reg, float)
 
 
 def test_jsonb_column_round_trips(mirror):
-    # A jsonb column should come back as ordinary Python containers.
-    row = mirror.nf_fields.lucky({"degree": 4}, ["label", "coeffs"])
-    assert isinstance(row["coeffs"], list)
+    # iwdata is genuinely heterogeneous jsonb: within one document the
+    # per-prime values are either a [lambda, mu] pair or a string marker.
+    # (nf_fields.coeffs, the obvious-looking candidate, is numeric[], not
+    # jsonb -- see test_numeric_array_column.)
+    assert mirror.ec_iwasawa.col_type["iwdata"] == "jsonb"
+    iwdata = mirror.ec_iwasawa.lookup("100.a1", "iwdata")
+    assert isinstance(iwdata, dict) and iwdata
+    assert all(isinstance(key, str) for key in iwdata)
+    kinds = {type(value) for value in iwdata.values()}
+    assert list in kinds and str in kinds
+    pair = next(value for value in iwdata.values() if isinstance(value, list))
+    assert all(int(entry) == entry for entry in pair)
+
+
+def test_numeric_array_column(mirror):
+    # x^2 - x - 1 is the polredabs-reduced polynomial of Q(sqrt 5), pinned
+    # by the label, so the decoded value itself can be asserted.
+    assert mirror.nf_fields.col_type["coeffs"] == "numeric[]"
+    coeffs = mirror.nf_fields.lookup("2.2.5.1", "coeffs")
+    assert coeffs == [-1, -1, 1]
+    assert all(int(c) == c for c in coeffs)
 
 
 def test_search_table_reports_its_columns(mirror):

@@ -104,6 +104,14 @@ jobs:
       - name: Set up LMFDB against devmirror
         uses: ./psycodict/.github/actions/lmfdb-env
 
+      # The unit jobs run these same files without Sage; this is the only job
+      # with Sage on the path, so it is where the SAGE_MODE half of the
+      # encoding layer -- sage Integers, LmfdbRealLiteral round-trips -- gets
+      # exercised.  Database-free, a few seconds.
+      - name: Run psycodict's database-free tests under Sage
+        working-directory: psycodict
+        run: sage -python -m pytest tests/test_encoding.py tests/test_utils.py tests/test_config.py -v
+
       # A subset chosen for psycodict signal per second rather than coverage
       # of LMFDB: test_utils fires ~80 queries across ~20 tables and calls
       # stats.numstats; test_api walks /api/<table> for 21 tables across every
