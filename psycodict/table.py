@@ -1453,15 +1453,20 @@ class PostgresTable(PostgresBase):
                 search_cols = set(search_cols)
                 extra_cols = set(extra_cols)
             else:
-                # we don't want to alter the input
-                search_data = data[:]
+                # The INSERT payload is a copy of each row: the documented
+                # API stamps the assigned id onto the caller's dictionaries
+                # (see the docstring), but the Json wrapping below is an
+                # implementation detail that must not leak into them.
+                search_data = [dict(D) for D in data]
                 search_cols = set(data[0])
             with DelayCommit(self):
                 jsonb_cols = [col for col, typ in self.col_type.items() if typ == "jsonb"]
                 for i, SD in enumerate(search_data):
                     if set(SD) != search_cols:
                         raise ValueError("All dictionaries must have the same set of keys")
-                    SD["id"] = self.max_id() + i + 1
+                    # Stamped on the caller's dictionary too -- the docstring
+                    # promises the input is updated with the assigned ids.
+                    SD["id"] = data[i]["id"] = self.max_id() + i + 1
                     for col in jsonb_cols:
                         if col in SD:
                             SD[col] = Json(SD[col])
