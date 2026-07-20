@@ -263,7 +263,11 @@ class PostgresSearchTable(PostgresTable):
                 cmd = SQL("{0} " + postgres_infix_ops[key] + " %s")
             # FIXME, we should do recursion with _parse_special
             elif key == "$maxgte":
-                cmd = SQL("array_max({0}) >= %s")
+                # Inline rather than array_max(): that function is a custom
+                # definition that exists on the LMFDB's servers but not on a
+                # stock PostgreSQL, and this subquery is exactly its body
+                # (which the planner inlines identically).
+                cmd = SQL("(SELECT max(unnested) FROM unnest({0}) AS unnested) >= %s")
             elif key == "$anylte":
                 cmd = SQL("%s >= ANY({0})")
             elif key == "$in": # This now handles scalar $in or jsonb $in

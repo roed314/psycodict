@@ -501,10 +501,6 @@ def test_array_anylte(filled_table):
     assert filled_table.count({"vec": {"$anylte": 0}}) == 40
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="$maxgte emits array_max(), a function that psycodict never creates",
-)
 def test_array_maxgte(filled_table):
     # max(vec) = n + 1
     assert filled_table.count({"vec": {"$maxgte": 200}}) == 1
