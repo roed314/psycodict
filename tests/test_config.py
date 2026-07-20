@@ -250,11 +250,6 @@ def test_store_true_options_are_coerced_by_strbool(paths):
     assert config.options["misc"]["verbose"] is True
 
 
-@pytest.mark.xfail(strict=True, reason="get() looks the type up under "
-                                       "'<section>_<option>', so a dest without an "
-                                       "underscore (section 'misc') never matches "
-                                       "and strbool is skipped, leaving the truthy "
-                                       "string 'False'")
 def test_store_true_options_with_a_plain_dest_are_coerced(paths):
     parser = make_parser(paths)
     parser.add_argument("--quiet", dest="quiet", action="store_true")
