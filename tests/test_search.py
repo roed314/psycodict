@@ -354,8 +354,9 @@ def test_max_min_sum_with_constraint(filled_table):
 def test_max_error_cases(filled_table):
     with pytest.raises(ValueError):
         filled_table.max("not_a_column")
-    # documented: "Will raise an error if there are no non-null values"
-    with pytest.raises(TypeError):
+    # documented: "Will raise an error if there are no non-null values" --
+    # now a deliberate ValueError rather than an accidental TypeError.
+    with pytest.raises(ValueError, match="no non-null values"):
         filled_table.max("n", {"n": -1})
 
 

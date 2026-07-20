@@ -712,13 +712,17 @@ class PostgresStatsTable(PostgresBase):
         )
         selecter = base_selecter + SQL("LIMIT 1")
         cur = self._execute(selecter, values)
-        m = cur.fetchone()[0]
+        # With no matching rows there is no row to fetch at all (fetchone()
+        # returns None), and the statistic is None.
+        row = cur.fetchone()
+        m = None if row is None else row[0]
         if m is None and kind == "max":
             # the default order ends with NULLs, so we now have to use NULLS LAST,
             # preventing the use of indexes.
             selecter = base_selecter + SQL("NULLS LAST LIMIT 1")
             cur = self._execute(selecter, values)
-            m = cur.fetchone()[0]
+            row = cur.fetchone()
+            m = None if row is None else row[0]
         return m
 
     def _record_statistic(self, col, ccols, cvals, m, kind="max"):
@@ -774,6 +778,10 @@ class PostgresStatsTable(PostgresBase):
         m = self._quick_statistic(col, ccols, cvals, kind="max")
         if m is None:
             m = self._slow_statistic(col, constraint, kind="max")
+            if m is None:
+                # The docstring's promised error, deliberately, rather than
+                # the TypeError that used to escape from fetchone().
+                raise ValueError("no non-null values of %s in %s" % (col, self.search_table))
             if record and self.saving:
                 self._record_statistic(col, ccols, cvals, m, kind="max")
         return m
@@ -803,6 +811,10 @@ class PostgresStatsTable(PostgresBase):
         m = self._quick_statistic(col, ccols, cvals, kind="min")
         if m is None:
             m = self._slow_statistic(col, constraint, kind="min")
+            if m is None:
+                # The docstring's promised error, deliberately, rather than
+                # the TypeError that used to escape from fetchone().
+                raise ValueError("no non-null values of %s in %s" % (col, self.search_table))
             if record and self.saving:
                 self._record_statistic(col, ccols, cvals, m, kind="min")
         return m

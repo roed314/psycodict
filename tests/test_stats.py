@@ -54,21 +54,17 @@ def test_min_with_constraint(filled_table):
     assert filled_table.stats.min("n", constraint={"n": {"$gte": 50}}) == 50
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="max()/min() on an empty table raise TypeError: _aggregate does "
-           "`cur.fetchone()[0]` and fetchone() is None when nothing matched",
-)
-def test_max_on_empty_table(empty_table):
-    assert empty_table.stats.max("n") is None
+def test_max_on_empty_table_raises(empty_table):
+    # The docstring promises an error when there are no non-null values; it
+    # is now a deliberate ValueError rather than a TypeError escaping from
+    # fetchone() on an empty cursor.
+    with pytest.raises(ValueError, match="no non-null values"):
+        empty_table.stats.max("n")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="see test_max_on_empty_table; min() crashes the same way",
-)
-def test_min_on_empty_table(empty_table):
-    assert empty_table.stats.min("n") is None
+def test_min_on_empty_table_raises(empty_table):
+    with pytest.raises(ValueError, match="no non-null values"):
+        empty_table.stats.min("n")
 
 
 def test_sum_on_empty_table(empty_table):
