@@ -587,15 +587,24 @@ def test_jsonb_explicit_none_is_stored_as_sql_null(table_factory):
 ##################################################################
 
 def test_numeric_and_float_roundtrip(filled_table, nullable_table):
+    from psycodict.encoding import SAGE_MODE
+
     integral = filled_table.lucky({"n": 3}, ["num", "mat", "x"])
     assert integral == {"num": 37, "mat": [3, 9], "x": 1.5}
-    assert isinstance(integral["num"], int)
     assert isinstance(integral["x"], float)
-    # numeric values are converted to int or float, never to Decimal
     fractional = nullable_table.lucky({"n": 0}, ["num", "mat", "x"])
     assert fractional == {"num": 1.25, "mat": [0.5, 2], "x": 0.5}
-    assert isinstance(fractional["num"], float)
-    assert isinstance(fractional["mat"][1], int)
+    # Integral numerics stay exact and fractional ones carry the digits --
+    # int/float without Sage, Integer/LmfdbRealLiteral with it, and never
+    # Decimal in either mode.
+    if SAGE_MODE:
+        from psycodict.encoding import LmfdbRealLiteral
+
+        assert isinstance(fractional["num"], LmfdbRealLiteral)
+    else:
+        assert isinstance(integral["num"], int)
+        assert isinstance(fractional["num"], float)
+    assert not isinstance(fractional["mat"][1], float)
 
 
 def test_nulls_are_omitted_from_results(nullable_table, monkeypatch):

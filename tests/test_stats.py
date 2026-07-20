@@ -14,11 +14,10 @@ Second, ``add_stats`` and friends run entirely in Python and SQL; the sage
 imports that psycodict makes elsewhere are not needed, so these tests must
 pass in a plain (sage-free) interpreter -- which is also how CI runs them.
 """
-from decimal import Decimal
-
 import pytest
 
 from conftest import sample_row
+from psycodict.encoding import SAGE_MODE
 
 
 @pytest.fixture
@@ -87,10 +86,10 @@ def test_sum_with_constraint(filled_table):
 
 
 def test_sum_of_numeric_column_is_exact(filled_table):
-    # `num` is a numeric column, so the sum must come back as an exact
-    # Decimal rather than a float.
+    # `num` is a numeric column with integral values, so the sum must come
+    # back exactly (int without Sage, Integer with it) -- never as a float.
     total = filled_table.stats.sum("num")
-    assert total == Decimal(sum(i * 10 + 7 for i in range(200)))
+    assert total == sum(i * 10 + 7 for i in range(200))
     assert not isinstance(total, float)
 
 
@@ -178,6 +177,7 @@ def test_add_stats_returns_true(filled_table):
     assert filled_table.stats.add_stats(["flag"]) is True
 
 
+@pytest.mark.skipif(SAGE_MODE, reason="asserts the sage-free code path")
 def test_add_stats_without_sage(filled_table):
     # add_stats used to import sage.all unconditionally, which made the whole
     # code path unusable in a plain interpreter.  Keep it honest.
