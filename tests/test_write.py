@@ -332,6 +332,29 @@ def test_copy_to_copy_from_roundtrips_nulls(empty_table, table_factory, tmp_path
     assert target.count({"vec": None}) == 1
 
 
+def test_copy_to_copy_from_respect_a_custom_null_marker(table_factory, tmp_path):
+    # psycopg2's copy_to/copy_from accepted null=..., so the COPY statements
+    # that replaced them must keep supporting it
+    source = table_factory(columns=[("n", "integer"), ("label", "text")])
+    source.insert_many([{"n": 0, "label": None}, {"n": 1, "label": "NULLISH"}])
+    searchfile = str(tmp_path / "search.txt")
+    source.copy_to(searchfile, null="NULL")
+    lines = _read(searchfile).split("\n")
+    header = lines[0].split("|")
+    data = {}
+    for line in lines[3:]:
+        if line:
+            rec = dict(zip(header, line.split("|")))
+            data[rec["n"]] = rec["label"]
+    # the null column is written as the custom marker; a value merely
+    # starting with it is left alone
+    assert data == {"0": "NULL", "1": "NULLISH"}
+    target = table_factory(columns=[("n", "integer"), ("label", "text")])
+    target.copy_from(searchfile, null="NULL")
+    assert target.lucky({"n": 0}, "label") is None
+    assert target.lucky({"n": 1}, "label") == "NULLISH"
+
+
 def test_copy_to_copy_from_roundtrips_jsonb_and_arrays(empty_table, table_factory, tmp_path):
     empty_table.insert_many([{
         "n": 1,

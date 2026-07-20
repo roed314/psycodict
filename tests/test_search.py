@@ -623,3 +623,26 @@ def test_random_sample_repeatable(filled_table):
     first = list(filled_table.random_sample(0.5, projection="n", mode="bernoulli", repeatable=42))
     second = list(filled_table.random_sample(0.5, projection="n", mode="bernoulli", repeatable=42))
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# analyze
+# ---------------------------------------------------------------------------
+
+def test_analyze_prints_the_query_and_a_plan(filled_table, capsys):
+    # analyze used cursor.mogrify, which only ClientCursor has under psycopg3,
+    # so it crashed before running EXPLAIN
+    filled_table.analyze({"n": {"$lt": 10}}, limit=5)
+    out = capsys.readouterr().out
+    assert "SELECT" in out and "FROM" in out
+    # the bound value is interpolated into the printed query
+    assert "10" in out
+    assert "cost=" in out
+    assert "Execution Time" in out
+
+
+def test_analyze_explain_only_skips_execution(filled_table, capsys):
+    filled_table.analyze({"n": {"$lt": 10}}, limit=5, explain_only=True)
+    out = capsys.readouterr().out
+    assert "cost=" in out
+    assert "Execution Time" not in out

@@ -218,8 +218,7 @@ class PostgresTable(PostgresBase):
             analyzer = SQL("EXPLAIN {0}").format(selecter)
         else:
             analyzer = SQL("EXPLAIN ANALYZE {0}").format(selecter)
-        cur = self._db.cursor()
-        print(cur.mogrify(selecter, values))
+        print(self._mogrify(selecter, values))
         cur = self._execute(analyzer, values, silent=True)
         for line in cur:
             print(line[0])
@@ -1976,10 +1975,12 @@ class PostgresTable(PostgresBase):
         - ``columns`` -- a list of column names to export
         - ``query`` -- a query dictionary
         - ``include_id`` -- whether to include the id column in the output file
-        - ``kwds`` -- passed on to psycopg2's ``copy_to``.  Cannot include "columns".
+        - ``kwds`` -- may contain ``sep`` and ``null`` options for the COPY.
+            Cannot include "columns".
         """
         self._check_file_input(searchfile, kwds)
         sep = kwds.pop("sep", "|")
+        null = kwds.pop("null", r"\N")
 
         search_cols = [col for col in self.search_cols if columns is None or col in columns]
         if columns is not None and len(columns) != len(search_cols):
@@ -2015,10 +2016,15 @@ class PostgresTable(PostgresBase):
                     try:
                         if write_header:
                             self._write_header_lines(F, cols, include_id=include_id, sep=sep)
-                        if sep == "\t":
-                            sep_clause = SQL("")
+                        options = []
+                        if sep != "\t":
+                            options.append(SQL("DELIMITER {0}").format(Literal(sep)))
+                        if null != r"\N":
+                            options.append(SQL("NULL {0}").format(Literal(null)))
+                        if options:
+                            sep_clause = SQL(" ({0})").format(SQL(", ").join(options))
                         else:
-                            sep_clause = SQL(" (DELIMITER {0})").format(Literal(sep))
+                            sep_clause = SQL("")
                         if query is None:
                             copyto = SQL("COPY {0} ({1}) TO STDOUT{2}").format(
                                 Identifier(table),
