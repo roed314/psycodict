@@ -287,12 +287,13 @@ class Json(pgJson):
             )
         elif obj is None:
             return None
+        elif isinstance(obj, datetime.datetime):
+            # must come before the date branch, since datetime is a subclass of date
+            return {"__datetime__": 0, "data": "%s" % (obj)}
         elif isinstance(obj, datetime.date):
             return {"__date__": 0, "data": "%s" % (obj)}
         elif isinstance(obj, datetime.time):
             return {"__time__": 0, "data": "%s" % (obj)}
-        elif isinstance(obj, datetime.datetime):
-            return {"__datetime__": 0, "data": "%s" % (obj)}
         elif isinstance(obj, (str, bool, float, int)):
             return obj
         else:
@@ -317,6 +318,9 @@ class Json(pgJson):
         Takes an object extracted by the json parser and decodes the
         special-formating dictionaries used to store special types.
         """
+        # prep recurses into lists and dicts, so extract must too
+        if isinstance(obj, list):
+            return [cls.extract(x) for x in obj]
         if isinstance(obj, dict) and "data" in obj:
             if len(obj) == 2 and "__ComplexList__" in obj:
                 return [complex(*v) for v in obj["data"]]
@@ -338,7 +342,9 @@ class Json(pgJson):
                 return vector([cls._extract(base, v) for v in obj["data"]])
             elif len(obj) == 2 and "__Rational__" in obj:
                 assert SAGE_MODE
-                return Rational(*obj["data"])
+                # Rational's second positional argument is the base, so the
+                # [numerator, denominator] pair must be passed as one tuple
+                return Rational(tuple(obj["data"]))
             elif len(obj) == 3 and "__RealLiteral__" in obj and "prec" in obj:
                 assert SAGE_MODE
                 return LmfdbRealLiteral(RealField(obj["prec"]), obj["data"])
@@ -388,9 +394,14 @@ class Json(pgJson):
             elif len(obj) == 2 and "__date__" in obj:
                 return datetime.datetime.strptime(obj["data"], "%Y-%m-%d").date()
             elif len(obj) == 2 and "__time__" in obj:
-                return datetime.datetime.strptime(obj["data"], "%H:%M:%S.%f").time()
+                # prep omits the microseconds when they are zero
+                fmt = "%H:%M:%S.%f" if "." in obj["data"] else "%H:%M:%S"
+                return datetime.datetime.strptime(obj["data"], fmt).time()
             elif len(obj) == 2 and "__datetime__" in obj:
-                return datetime.datetime.strptime(obj["data"], "%Y-%m-%d %H:%M:%S.%f")
+                fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in obj["data"] else "%Y-%m-%d %H:%M:%S"
+                return datetime.datetime.strptime(obj["data"], fmt)
+        if isinstance(obj, dict):
+            return {k: cls.extract(v) for k, v in obj.items()}
         return obj
 
 
@@ -404,10 +415,25 @@ def copy_dumps(inp, typ, recursing=False):
     - ``typ`` -- the Postgres type of the column in which this data is being stored.
     """
     if inp is None:
-        return "\\N"
+        # inside an array the null marker is the array literal NULL, since
+        # COPY's field-level unescaping would turn \N into the letter N
+        return "NULL" if recursing else "\\N"
     elif typ in ("text", "char", "varchar"):
         if not isinstance(inp, str):
             inp = str(inp)
+        # As an array element, quote anything the array parser would misread:
+        # array syntax, whitespace (trimmed when unquoted), the empty string
+        # and the literal NULL.  The array-level escaping of backslashes and
+        # double quotes must happen before the COPY field-level escaping below,
+        # while the enclosing quotes are added after it, so that they reach
+        # the array parser unescaped.
+        quote = recursing and (
+            not inp
+            or inp.upper() == "NULL"
+            or any(c in '{},"\\' or c.isspace() for c in inp)
+        )
+        if quote:
+            inp = inp.replace("\\", "\\\\").replace('"', '\\"')
         inp = (
             inp.replace("\\", "\\\\")
             .replace("\r", r"\r")
@@ -415,7 +441,7 @@ def copy_dumps(inp, typ, recursing=False):
             .replace("\t", r"\t")
             .replace('"', r"\"")
         )
-        if recursing and ("{" in inp or "}" in inp):
+        if quote:
             inp = '"' + inp + '"'
         return inp
     elif typ in ("json", "jsonb"):
@@ -442,15 +468,16 @@ def copy_dumps(inp, typ, recursing=False):
             elif subtyp != typ[:-2]:
                 raise ValueError("Array dimensions must be uniform")
         return "{" + ",".join(copy_dumps(x, subtyp, recursing=True) for x in inp) + "}"
+    elif typ == "boolean":
+        # must come before the numeric branch, since bool is a subclass of int
+        return "t" if inp else "f"
     elif SAGE_MODE and isinstance(inp, RealLiteral):
         return inp.literal
     elif isinstance(inp, (float, int)) or SAGE_MODE and isinstance(inp, (Integer, RealNumber)):
         return str(inp).replace("L", "")
-    elif typ == "boolean":
-        return "t" if inp else "f"
     elif isinstance(inp, (datetime.date, datetime.time, datetime.datetime)):
         return "%s" % (inp)
     elif typ == "bytea":
-        return r"\\x" + "".join(binascii.hexlify(c) for c in inp)
+        return r"\\x" + binascii.hexlify(inp).decode()
     else:
         raise TypeError("Invalid input %s (%s) for postgres type %s" % (inp, type(inp), typ))

@@ -222,27 +222,37 @@ def test_json_prep_escape_backslashes():
     assert Json.prep(original, escape_backslashes=True) == r'a\tb\\c\"d\ne\rf'
 
 
-@pytest.mark.xfail(strict=True, reason="Json.prep recurses but Json.extract only "
-                                       "decodes the top level, so nested special "
-                                       "types do not survive a round trip")
 @pytest.mark.parametrize("obj", [{"a": 1 + 2j}, [[1 + 2j]]])
 def test_json_roundtrips_nested_special_types(obj):
+    # extract recurses into lists and dicts just as prep does
     assert Json.loads(Json.dumps(obj)) == obj
 
 
-@pytest.mark.xfail(strict=True, reason="datetime.datetime is a subclass of "
-                                       "datetime.date and prep tests for date "
-                                       "first, so datetimes are tagged __date__ "
-                                       "and then fail to parse back")
+@pytest.mark.skipif(not SAGE_MODE, reason="needs SageMath")
+def test_with_sage_json_roundtrips_nested_sage_types():
+    from sage.all import QQ, RealField, vector
+
+    for obj in [
+        # a top-level Rational exercises the extract branch that must not
+        # pass the denominator to Rational as its base argument
+        QQ(3) / 7,
+        {"r": QQ(3) / 7},
+        {"v": vector(QQ, [1, QQ(1) / 2])},
+        {"outer": [{"deep": RealField(100)("1.5")}]},
+    ]:
+        assert Json.loads(Json.dumps(obj)) == obj
+
+
 def test_json_roundtrips_datetimes():
+    # datetime.datetime is a subclass of datetime.date, so prep has to
+    # dispatch on datetime first for the __datetime__ tag to be reachable
     stamp = datetime.datetime(2020, 1, 2, 3, 4, 5, 6)
     assert Json.loads(Json.dumps(stamp)) == stamp
 
 
-@pytest.mark.xfail(strict=True, reason="extract parses __time__ with '%H:%M:%S.%f', "
-                                       "which rejects the microsecond-free string "
-                                       "that prep writes")
 def test_json_roundtrips_times_without_microseconds():
+    # prep writes no fractional part when the microseconds are zero, and
+    # extract accepts both spellings
     noon = datetime.time(12, 30)
     assert Json.loads(Json.dumps(noon)) == noon
 
@@ -346,40 +356,35 @@ def test_copy_dumps_rejects_unsupported_types():
     assert "Invalid input" in message and "set" in message and "integer" in message
 
 
-@pytest.mark.xfail(strict=True, reason="array elements are quoted only when they "
-                                       "contain braces, so commas, empty strings, "
-                                       "leading spaces and the literal NULL are "
-                                       "misparsed by Postgres")
 @pytest.mark.parametrize("value,expected", [
-    (["a,b"], '{"a,b"}'),       # currently {a,b}: two elements
-    ([""], '{""}'),             # currently {}: the empty array
-    ([" a"], '{" a"}'),         # currently { a}: Postgres trims the space
-    (["NULL"], '{"NULL"}'),     # currently {NULL}: an SQL NULL
+    (["a,b"], '{"a,b"}'),       # unquoted, the comma would split the element
+    ([""], '{""}'),             # unquoted, this would be the empty array
+    ([" a"], '{" a"}'),         # unquoted, Postgres would trim the space
+    (["NULL"], '{"NULL"}'),     # unquoted, this would be an SQL NULL
+    # backslashes and double quotes are escaped once for the array parser and
+    # once more for COPY's field-level unescaping, while a tab is a plain
+    # character to the array parser and escaped only at the field level
+    (['he said "hi"'], r'{"he said \\\"hi\\\""}'),
+    (["back\\slash"], r'{"back\\\\slash"}'),
+    (["tab\there"], r'{"tab\there"}'),
 ])
 def test_copy_dumps_quotes_array_elements_that_need_it(value, expected):
     assert copy_dumps(value, "text[]") == expected
 
 
-@pytest.mark.xfail(strict=True, reason="a None inside an array is written as the "
-                                       "field-level marker \\N, which COPY "
-                                       "unescapes to the letter N, not NULL")
 def test_copy_dumps_writes_null_array_elements_as_null():
+    # the field-level marker \N would be unescaped by COPY to the letter N,
+    # so inside an array a None must become the array literal NULL
     assert copy_dumps([None, 1], "integer[]") == "{NULL,1}"
 
 
-@pytest.mark.xfail(strict=True, reason="bool is a subclass of int, so booleans are "
-                                       "caught by the numeric branch and written as "
-                                       "True/False; the typ == 'boolean' branch is "
-                                       "unreachable for them (Postgres happens to "
-                                       "accept both spellings)")
 @pytest.mark.parametrize("value,expected", [(True, "t"), (False, "f")])
 def test_copy_dumps_booleans(value, expected):
+    # bool is a subclass of int, so the boolean branch has to come before
+    # the numeric one
     assert copy_dumps(value, "boolean") == expected
 
 
-@pytest.mark.xfail(strict=True, reason="the bytea branch calls binascii.hexlify on "
-                                       "each element of the input, which are ints "
-                                       "under Python 3, and joins bytes with str")
 def test_copy_dumps_bytea():
     assert copy_dumps(b"abc", "bytea") == r"\\x616263"
 
