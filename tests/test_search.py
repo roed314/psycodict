@@ -558,10 +558,6 @@ def test_jsonb_exists(filled_table, nullable_table):
     assert nullable_table.count({"data": {"$exists": True}}) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="insert_many wraps jsonb values in Json unconditionally, so an explicit None is stored as the JSON value null rather than SQL NULL",
-)
 def test_jsonb_explicit_none_is_stored_as_sql_null(table_factory):
     table = table_factory()
     table.insert_many([{"n": 0, "label": "a", "data": None}])

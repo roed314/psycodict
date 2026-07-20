@@ -1468,7 +1468,10 @@ class PostgresTable(PostgresBase):
                     # promises the input is updated with the assigned ids.
                     SD["id"] = data[i]["id"] = self.max_id() + i + 1
                     for col in jsonb_cols:
-                        if col in SD:
+                        # None must stay None: wrapping it in Json would store
+                        # the jsonb value 'null' rather than SQL NULL, and the
+                        # documented {col: None} query could never match it.
+                        if col in SD and SD[col] is not None:
                             SD[col] = Json(SD[col])
                 cases = [(self.search_table, search_data)]
                 if self.extra_table is not None:
@@ -1477,7 +1480,7 @@ class PostgresTable(PostgresBase):
                             raise ValueError("All dictionaries must have the same set of keys")
                         ED["id"] = self.max_id() + i + 1
                         for col in jsonb_cols:
-                            if col in ED:
+                            if col in ED and ED[col] is not None:
                                 ED[col] = Json(ED[col])
                     cases.append((self.extra_table, extra_data))
                 now = time.time()
