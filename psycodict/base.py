@@ -1302,7 +1302,7 @@ class PostgresBase():
             cols_sql = SQL(", ").join(map(Identifier, meta_cols))
             rows = self._execute(
                 SQL("SELECT {} FROM {} WHERE {} = %s AND version = %s").format(
-                    meta_name_hist_sql, cols_sql, table_name_sql
+                    cols_sql, meta_name_hist_sql, table_name_sql
                 ),
                 [search_table, version],
             )
