@@ -259,3 +259,38 @@ def test_execute_raw_sql(mirror):
 
     (one,) = mirror._execute(SQL("SELECT 1")).fetchone()
     assert one == 1
+
+
+def test_joined_search(mirror):
+    # The query joins motivated: constrain and project across ec_nfcurves and
+    # the nf_fields row it references by label.
+    join = [("field_label", "nf_fields.label")]
+    res = mirror.ec_nfcurves.search(
+        {"rank": 1, "nf_fields.r2": 1},
+        ["label", "field_label", "nf_fields.degree", "nf_fields.r2"],
+        join=join,
+        limit=3,
+    )
+    assert len(res) == 3
+    for rec in res:
+        assert set(rec) == {"label", "field_label", "nf_fields.degree", "nf_fields.r2"}
+        assert rec["nf_fields.r2"] == 1
+        # r1 + 2*r2 = degree, so one pair of complex places needs degree >= 2
+        assert rec["nf_fields.degree"] >= 2
+        # the joined columns agree with the field's own row
+        field = mirror.nf_fields.lucky({"label": rec["field_label"]}, ["degree", "r2"])
+        assert field == {"degree": rec["nf_fields.degree"], "r2": rec["nf_fields.r2"]}
+    assert mirror.ec_nfcurves.lucky(
+        {"label": res[0]["label"]}, "nf_fields.degree", join=join
+    ) == res[0]["nf_fields.degree"]
+
+
+def test_col_compares_columns_on_real_data(mirror):
+    # disc_abs = |disc| equals disc_rad exactly when the discriminant is
+    # squarefree; check $col against a Python-side comparison of the same rows.
+    query = {"degree": 2, "disc_abs": {"$lte": 50}}
+    rows = list(mirror.nf_fields.search(query, ["disc_abs", "disc_rad"], sort=[]))
+    expected = sum(1 for rec in rows if rec["disc_abs"] == rec["disc_rad"])
+    assert 0 < expected < len(rows)
+    query["disc_abs"] = {"$lte": 50, "$col": "disc_rad"}
+    assert mirror.nf_fields.count(query) == expected

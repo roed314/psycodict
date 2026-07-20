@@ -428,6 +428,37 @@ def test_query_raw_nested_in_comparison(filled_table):
     assert filled_table.count({"num": {"$lt": {"$raw": "n*11"}}}) == 192
 
 
+def test_query_col_equality(filled_table):
+    # vec = [n, n + 1, n % 5], so vec[2] (the third entry, written with a
+    # Python-style zero-based slicer) equals n exactly when n < 5
+    assert filled_table.search({"n": {"$col": "vec[2]"}}, "n", limit=10) == [0, 1, 2, 3, 4]
+
+
+def test_query_col_nested_in_comparison(filled_table):
+    # num = 10 * n + 7 > n always, and never equal
+    assert filled_table.count({"num": {"$gt": {"$col": "n"}}}) == 200
+    assert filled_table.count({"num": {"$lte": {"$col": "n"}}}) == 0
+    assert filled_table.count({"num": {"$ne": {"$col": "n"}}}) == 200
+
+
+def test_query_col_inside_or(filled_table):
+    assert filled_table.search(
+        {"n": {"$or": [{"$col": "vec[2]"}, {"$gte": 198}]}}, "n", limit=10
+    ) == [0, 1, 2, 3, 4, 198, 199]
+
+
+def test_query_col_rejects_bad_input(filled_table):
+    with pytest.raises(ValueError, match="not a column"):
+        filled_table.count({"n": {"$col": "missing"}})
+    with pytest.raises(ValueError, match="not a column"):
+        filled_table.count({"n": {"$gte": {"$col": "missing"}}})
+    with pytest.raises(ValueError, match="column name"):
+        filled_table.count({"n": {"$col": 5}})
+    # $col only makes sense as the operand of a comparison operator
+    with pytest.raises(ValueError, match=r"\$col"):
+        filled_table.count({"vec": {"$contains": {"$col": "n"}}})
+
+
 ##################################################################
 # array columns                                                  #
 ##################################################################

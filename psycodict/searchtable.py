@@ -16,6 +16,22 @@ from .utils import IdentifierWrapper, DelayCommit, filter_sql_injection, postgre
 pg_cursor = (Cursor, ServerCursor)
 
 
+def _qualify(frag, tablename):
+    """
+    Rewrites the bare column Identifiers in an SQL fragment produced by
+    ``_parse_dict``, ``_sort_str`` or ``IdentifierWrapper`` into
+    table-qualified form ("table"."column"), for use in a query that joins
+    several tables.  Literals, placeholders and plain SQL are left alone.
+    """
+    if isinstance(frag, Composed):
+        return Composed([_qualify(part, tablename) for part in frag])
+    elif isinstance(frag, Identifier):
+        # _obj holds the tuple of name parts; psycopg3 has no public accessor
+        return Identifier(tablename, frag._obj[-1])
+    else:
+        return frag
+
+
 class PostgresSearchTable(PostgresTable):
     ##################################################################
     # Helper functions for querying                                  #
@@ -132,6 +148,18 @@ class PostgresSearchTable(PostgresTable):
             return "%s::" + col_type + "[]"
         return "%s"
 
+    def _col_identifier(self, name):
+        """
+        Wraps a column name given as the value of a ``$col`` special key,
+        after checking that it is a column of this table.  An array slicer
+        (as in ``vec[2]``) is allowed.
+        """
+        if not isinstance(name, str):
+            raise ValueError("$col takes a column name, not %s" % (type(name).__name__,))
+        if name != "id" and name.split("[", 1)[0] not in self.search_cols:
+            raise ValueError("%s is not a column of %s" % (name, self.search_table))
+        return IdentifierWrapper(name)
+
     def _parse_special(self, key, value, col, col_type):
         """
         Implements more complicated query conditions than just testing for equality:
@@ -160,6 +188,9 @@ class PostgresSearchTable(PostgresTable):
             - ``$ilike`` -- for text columns, matches strings according to the ILIKE, the case-insensitive version of LIKE in PostgreSQL.
             - ``$regex`` -- for text columns, matches the given regex expression supported by PostgresSQL
             - ``$raw`` -- a string to be inserted as SQL after filtering against SQL injection
+            - ``$col`` -- the name of another column of this table: ``{"col1": {"$col": "col2"}}``
+              imposes ``col1 = col2``, and ``{"$col": "col2"}`` can also be used as the value
+              for any of the infix comparison operators above.
         - ``value`` -- The value to compare to.  The meaning depends on the key.
         - ``col`` -- The name of the column, wrapped in SQL
         - ``col_type`` -- the SQL type of the column
@@ -249,6 +280,19 @@ class PostgresSearchTable(PostgresTable):
                 cmd, value = filter_sql_injection(value["$raw"], col, col_type, postgres_infix_ops[key], self)
             else:
                 raise ValueError("Error building query: {0} (in $raw)".format(key))
+        elif key == "$col":
+            # {'col1': {'$col': 'col2'}} imposes "col1" = "col2"
+            cmd = SQL("{0} = {1}").format(col, self._col_identifier(value))
+            value = []
+        elif isinstance(value, dict) and len(value) == 1 and "$col" in value:
+            # {'col1': {'$lte': {'$col': 'col2'}}} imposes "col1" <= "col2"
+            if key in postgres_infix_ops:
+                cmd = SQL("{0} " + postgres_infix_ops[key] + " {1}").format(
+                    col, self._col_identifier(value["$col"])
+                )
+                value = []
+            else:
+                raise ValueError("Error building query: {0} (in $col)".format(key))
         elif key in ["$in", "$nin"] and col_type == "jsonb" and any(isinstance(v, (dict, list)) for v in value):
             # jsonb containment (<@), used below for scalar values, cannot match
             # composite values (objects/arrays), so we fall back to a disjunction
@@ -659,7 +703,7 @@ class PostgresSearchTable(PostgresTable):
                 queries.sort(key=lambda Q: str(Q.get(col)), reverse=(asc != 1))
         return queries
 
-    def lucky(self, query={}, projection=2, offset=0, sort=[], raw=None, raw_values=None):
+    def lucky(self, query={}, projection=2, offset=0, sort=[], raw=None, raw_values=None, join=None):
         # FIXME Nulls aka Nones are being erased, we should perhaps just leave them there
         """
         One of the two main public interfaces for performing SELECT queries,
@@ -691,6 +735,8 @@ class PostgresSearchTable(PostgresTable):
                 the query then the choice of the result is arbitrary.
         - ``raw`` -- a string, to be used as the WHERE part of the query.  DO NOT USE THIS DIRECTLY FOR INPUT FROM WEBSITE.
         - ``raw_values`` -- a list of values to be substituted for %s entries in the raw string.  Useful when strings might include quotes.
+        - ``join`` -- a list of tuples describing other search tables to join to this one,
+          as for ``search``.  Not compatible with ``raw``.
 
         OUTPUT:
 
@@ -721,6 +767,10 @@ class PostgresSearchTable(PostgresTable):
             sage: nf.lucky({'label':u'6.6.409587233.1'},projection=['regulator'])
             {'regulator':455.191694993}
         """
+        if join is not None:
+            if raw is not None or raw_values is not None:
+                raise ValueError("raw is not supported with join")
+            return self._join_lucky(query, projection, join, offset=offset, sort=sort)
         search_cols = self._parse_projection(projection)
         cols = SQL(", ").join(map(IdentifierWrapper, search_cols))
         qstr, values = self._build_query(query, 1, offset, sort=sort, raw=raw, raw_values=raw_values)
@@ -750,6 +800,7 @@ class PostgresSearchTable(PostgresTable):
         silent=False,
         raw=None,
         raw_values=None,
+        join=None,
     ):
         """
         One of the two main public interfaces for performing SELECT queries,
@@ -780,6 +831,18 @@ class PostgresSearchTable(PostgresTable):
         - ``silent`` -- a boolean.  If True, slow query warnings will be suppressed.
         - ``raw`` -- a string, to be used as the WHERE part of the query.  DO NOT USE THIS DIRECTLY FOR INPUT FROM WEBSITE.
         - ``raw_values`` -- a list of values to be substituted for %s entries in the raw string.  Useful when strings might include quotes.
+        - ``join`` -- a list of tuples ``(col1, col2)`` or ``(col1, col2, jointype)``
+          describing other search tables to join to this one.  In each tuple, ``col2``
+          must be qualified as ``"table.column"`` and names the table being joined;
+          ``col1`` is a column of this table, or of a previously joined table if
+          qualified.  ``jointype`` is ``"inner"`` (the default) or ``"left"``.
+          When ``join`` is given, query keys and projection entries may be qualified
+          as ``"table.column"`` to refer to columns of the joined tables (unqualified
+          names refer to this table, with periods keeping their usual path meaning),
+          and the keys in the result dictionaries match the projection entries as
+          given.  Sorting is by columns of this table only, counts are never cached,
+          and ``split_ors``, ``one_per`` and ``raw`` are not supported.  See the
+          Joined queries section of QueryLanguage.md for details.
 
         OUTPUT:
 
@@ -812,7 +875,27 @@ class PostgresSearchTable(PostgresTable):
              {'label': u'2.0.84.1', 'ramps': [2, 3, 7]}]
             sage: info['number'], info['exact_count']
             (1000, False)
+
+        Columns of other tables can be searched on and projected onto by
+        joining the tables::
+
+            sage: db.ec_nfcurves.search(
+            ....:     {"rank": 1, "nf_fields.r2": 1},
+            ....:     ["label", "nf_fields.degree"],
+            ....:     join=[("field_label", "nf_fields.label")],
+            ....:     limit=3)
+            [{'label': '2.0.1003.1-9.1-c1', 'nf_fields.degree': 2},
+             {'label': '2.0.1003.1-9.1-c2', 'nf_fields.degree': 2},
+             {'label': '2.0.1003.1-9.1-d1', 'nf_fields.degree': 2}]
         """
+        if join is not None:
+            if raw is not None or raw_values is not None:
+                raise ValueError("raw is not supported with join")
+            if split_ors:
+                raise ValueError("split_ors is not supported with join")
+            if one_per:
+                raise ValueError("one_per is not supported with join")
+            return self._join_search(query, projection, join, limit=limit, offset=offset, sort=sort, info=info, silent=silent)
         if offset < 0:
             raise ValueError("Offset cannot be negative")
         search_cols = self._parse_projection(projection)
@@ -963,203 +1046,298 @@ class PostgresSearchTable(PostgresTable):
             info["exact_count"] = exact_count
         return results
 
-    def join_search(
-        self,
-        query={},
-        projection=1,
-        join=[],
-        limit=None,
-        offset=0,
-        sort=None,
-        info=None,
-        one_per=None,
-        silent=False,
-    ):
-        """
-        A version of search that can also include columns from other tables.
+    ##################################################################
+    # Joined queries: the join= option of search, count and lucky    #
+    ##################################################################
 
-        Does not support the parameters raw, split_ors from search.
+    def _parse_join(self, join):
+        """
+        Validates a join specification and builds the FROM clause.
 
         INPUT:
 
-        - ``query`` -- either a dictionary (in which case all constraints are on this table) or a list of pairs ``(table, dictionary)``
-        - ``projection`` -- a list with entries that are either strings (column names from this table),
-            or pairs ``(table, column)``; or an integer (with meaning the same as for search())
-        - ``join`` -- a list of quadruples (tbl1, col1, tbl2, col2).  tbl1 should have already appeared (or be self for the first entry), while tbl2 should be new
-        - ``sort`` -- if provided, can only contain columns from this table (for simplicity)
+        - ``join`` -- a list of tuples ``(col1, col2)`` or ``(col1, col2, jointype)``,
+          as described in the ``search`` method.
 
-        EXAMPLES::
+        OUTPUT:
 
-            sage: db.ec_nfcurves.join_search({"rank":1}, ["label", ("nf_fields", "r2")], [("ec_nfcurves", "field_label", "nf_fields", "label")], limit=3)
-            [{'label': '2.0.11.1-47.1-a1', ('nf_fields', 'r2'): 1},
-             {'label': '2.0.11.1-47.2-a1', ('nf_fields', 'r2'): 1},
-             {'label': '2.0.11.1-108.1-a1', ('nf_fields', 'r2'): 1}]
+        - a dictionary mapping table names to ``PostgresSearchTable`` objects,
+          one for each joined table (not including this one)
+        - an SQL Composable giving the FROM clause, including all JOINs
+        """
+        if not join or not isinstance(join, (list, tuple)):
+            raise ValueError("join must be a nonempty list of (col1, col2) or (col1, col2, jointype) tuples")
+        joined = {}
+        frm = Identifier(self.search_table)
+        for entry in join:
+            if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+                raise ValueError(
+                    "each join entry must be (col1, col2) or (col1, col2, jointype) "
+                    "with col2 qualified as 'table.column', not %r" % (entry,)
+                )
+            col1, col2 = entry[0], entry[1]
+            jointype = entry[2] if len(entry) == 3 else "inner"
+            if not (isinstance(jointype, str) and jointype.lower() in ("inner", "left")):
+                raise ValueError("join type must be 'inner' or 'left', not %r" % (jointype,))
+            if not isinstance(col2, str) or "." not in col2:
+                raise ValueError(
+                    "%r: the second column of a join entry names the table being "
+                    "joined, so must be qualified as 'table.column'" % (col2,)
+                )
+            tname2, cname2 = col2.split(".", 1)
+            if tname2 == self.search_table or tname2 in joined:
+                raise ValueError("%s is already part of the join (each table can appear only once)" % (tname2,))
+            table2 = self._db[tname2]
+            if not isinstance(col1, str):
+                raise ValueError("%r: join columns must be strings" % (col1,))
+            tname1, dot, cname1 = col1.partition(".")
+            if dot:
+                if tname1 == self.search_table:
+                    table1 = self
+                elif tname1 in joined:
+                    table1 = joined[tname1]
+                else:
+                    raise ValueError(
+                        "%s: %s is not part of the join yet (join entries are "
+                        "processed in order, and the first column of each must "
+                        "belong to %s or to a previously joined table)"
+                        % (col1, tname1, self.search_table)
+                    )
+            else:
+                tname1, cname1, table1 = self.search_table, col1, self
+            for table, cname in [(table1, cname1), (table2, cname2)]:
+                if cname != "id" and cname not in table.search_cols:
+                    raise ValueError("%s is not a column of %s" % (cname, table.search_table))
+            joined[tname2] = table2
+            # jointype was validated against a whitelist above, so this string
+            # interpolation cannot inject SQL
+            frm += SQL(" %s JOIN {0} ON {1} = {2}" % jointype.upper()).format(
+                Identifier(tname2),
+                Identifier(tname1, cname1),
+                Identifier(tname2, cname2),
+            )
+        return joined, frm
+
+    def _split_join_query(self, query, joined):
+        """
+        Splits a query dictionary into per-table query dictionaries.
+
+        Keys whose prefix (the part before the first period) names a joined
+        table are assigned to that table, with the prefix stripped; all other
+        keys, including the top-level $or/$and/$not, belong to this table.
+
+        OUTPUT:
+
+        A dictionary mapping table names to query dictionaries; only tables
+        with at least one constraint appear.
+        """
+        def check_special(clause, special):
+            # Each table's constraints are parsed separately and combined with
+            # AND, so a clause combining constraints in any other way cannot
+            # span several tables.
+            if isinstance(clause, (list, tuple)):
+                for part in clause:
+                    check_special(part, special)
+            elif isinstance(clause, dict):
+                for k, v in clause.items():
+                    if isinstance(k, str) and not k.startswith("$") and k.partition(".")[0] in joined:
+                        raise ValueError(
+                            "%s: constraints on joined tables cannot appear inside %s" % (k, special)
+                        )
+                    check_special(v, special)
+
+        split = {}
+        for key, value in query.items():
+            if key.startswith("$"):
+                check_special(value, key)
+                tname, subkey = self.search_table, key
+            else:
+                prefix, dot, rest = key.partition(".")
+                if dot and prefix in joined:
+                    tname, subkey = prefix, rest
+                else:
+                    tname, subkey = self.search_table, key
+            split.setdefault(tname, {})[subkey] = value
+        return split
+
+    def _join_where(self, split, joined):
+        """
+        Builds the WHERE clause of a joined query from the output of
+        ``_split_join_query``, qualifying each table's constraints.
+
+        OUTPUT:
+
+        - an SQL Composable giving the WHERE clause (empty if no constraints)
+        - a list of values to substitute for the %s entries
+        """
+        where, values = [], []
+        for tname, Q in split.items():
+            table = self if tname == self.search_table else joined[tname]
+            qstr, vals = table._parse_dict(Q)
+            if qstr is not None:
+                where.append(SQL("({0})").format(_qualify(qstr, tname)))
+                values.extend(vals)
+        if where:
+            return SQL(" WHERE {0}").format(SQL(" AND ").join(where)), values
+        return SQL(""), values
+
+    def _parse_join_projection(self, projection, joined):
+        """
+        The analogue of ``_parse_projection`` for joined queries: entries may
+        be qualified as "table.column" to refer to columns of joined tables.
+        Dictionary projections are not supported.
+
+        OUTPUT:
+
+        - a tuple of strings, the keys used in the result dictionaries (the
+          projection entries as given; integer projections refer to this
+          table's columns only)
+        - a list of SQL Composables, the corresponding table-qualified columns
+        """
+        if isinstance(projection, dict):
+            raise ValueError("dictionary projections are not supported with join")
+        if projection == 0:
+            if self._label_col is None:
+                raise RuntimeError("No label column for %s" % (self.search_table,))
+            keys = [self._label_col]
+        elif not projection:
+            raise ValueError("You must specify at least one key.")
+        elif projection == 1 or projection == 2:
+            keys = list(self.search_cols)
+        elif projection == 3:
+            keys = ["id"] + list(self.search_cols)
+        elif isinstance(projection, str):
+            keys = [projection]
+        else:
+            keys = list(projection)
+        cols = []
+        for key in keys:
+            if not isinstance(key, str):
+                raise ValueError(
+                    "projection entries must be strings, with columns of "
+                    "joined tables qualified as 'table.column', not %r" % (key,)
+                )
+            prefix, dot, rest = key.partition(".")
+            if dot and prefix in joined:
+                table, colspec = joined[prefix], rest
+            else:
+                table, colspec = self, key
+            if colspec != "id" and colspec.split("[", 1)[0] not in table.search_cols:
+                raise ValueError("%s is not a column of %s" % (colspec, table.search_table))
+            cols.append(_qualify(IdentifierWrapper(colspec), table.search_table))
+        return tuple(keys), cols
+
+    def _join_sort(self, thisquery, limit, offset, sort, joined):
+        """
+        Processes the sort order for a joined query, returning the ORDER BY
+        clause.  Sorting is by columns of this table only.
+        """
+        if sort:
+            for s in sort:
+                name = s if isinstance(s, str) else s[0]
+                if name.partition(".")[0] in joined:
+                    raise ValueError("%s: sorting by columns of joined tables is not supported" % (name,))
+        sort_composed, has_sort, _ = self._process_sort(thisquery, limit, offset, sort)
+        if has_sort:
+            return SQL(" ORDER BY {0}").format(_qualify(sort_composed, self.search_table))
+        return SQL("")
+
+    def _join_search(self, query, projection, join, limit=None, offset=0, sort=None, info=None, silent=False):
+        """
+        The implementation of ``search`` when ``join`` is provided; see the
+        documentation there.  Counts are never cached for joined queries.
         """
         if offset < 0:
             raise ValueError("Offset cannot be negative")
-        alltables = set()
-
-        # Create the WHERE clause part of the query
-        orig_query = query
-        if isinstance(query, dict):
-            query = [(self, query)]
-        def qualify(qstr, tbl, op=False):
-            # Have to fully qualify the identifiers by adding table name
-            if isinstance(qstr, Composed):
-                # iterate rather than access .seq: Composed is iterable in
-                # both drivers, while .seq was psycopg2-only
-                return Composed([qualify(part, tbl, op=op) for part in qstr])
-            elif isinstance(qstr, Identifier):
-                # psycopg3's Identifier has no public accessor for its name
-                # (psycopg2 had .string); _obj is its stable internal tuple
-                colname = qstr._obj[-1]
-                if colname in tbl.search_cols:
-                    tbl = tbl.search_table
-                else:
-                    raise ValueError("%s not column of %s" % (colname, tbl.search_table))
-                alltables.add(tbl)
-                if op:
-                    return Identifier(f"{tbl}.{colname}")
-                else:
-                    return Identifier(tbl) + SQL(".") + qstr
-            else:
-                return qstr
-        def qualify_col(col, op=False):
-            if isinstance(col, str):
-                tbl = self
-            else:
-                col, tbl = col
-                if isinstance(tbl, str):
-                    tbl = self._db[tbl]
-            return qualify(Identifier(col), tbl, op=op)
-        thisquery = {}
-        otherqueries = []
-        where, vals = [], []
-        for table, Q in query:
-            if isinstance(table, str):
-                table = self._db[table]
-            if table is self:
-                thisquery = Q
-            else:
-                otherqueries.append(Q)
-            qstr, values = table._parse_dict(Q)
-            if qstr is not None:
-                qstr = qualify(qstr, table)
-                where.append(qstr)
-                vals += values
-        if where:
-            where = SQL(" WHERE {0}").format(SQL("AND").join(where))
-        else:
-            where = SQL("")
-
-        # Create the JOIN clause part of the query
-        frm = Identifier(self.search_table)
-        for tbl1, col1, tbl2, col2 in join:
-            if isinstance(tbl1, str):
-                tbl1 = self._db[tbl1]
-            if isinstance(tbl2, str):
-                tbl2 = self._db[tbl2]
-            frm += SQL(" JOIN {0} ON {1} = {2}").format(
-                Identifier(tbl2.search_table),
-                qualify(Identifier(col1), tbl1),
-                qualify(Identifier(col2), tbl2))
-
-        # Create the ORDER BY, LIMIT, OFFSET section of the query
-        sort, has_sort, raw_sort = self._process_sort(thisquery, limit, offset, sort)
-        missing_sort_cols = [(c if isinstance(c, str) else c[0]) for c in raw_sort]
-        if has_sort:
-            sort = qualify(sort, self, op=bool(one_per))
-            olo = SQL(" ORDER BY {0}").format(sort)
-        else:
-            olo = SQL("")
-
-        # Determine the columns to project onto
-        orig_proj = projection
-        if isinstance(projection, str):
-            projection = [projection]
-        elif projection in [0,1,2,3]:
-            projection = self._parse_projection(projection)
-        cols = []
-        opcols = [] # for one_per
-        for pair in projection:
-            if isinstance(pair, str):
-                table, col = self, pair
-            else:
-                table, col = pair
-                if isinstance(table, str):
-                    table = self._db[table]
-            if table is self and col in missing_sort_cols:
-                missing_sort_cols.remove(col)
-            if col in table.search_cols:
-                table = table.search_table
-            else:
-                raise ValueError("%s not column of %s" % (col, table.search_table))
-            alltables.add(table)
-            cols.append(Identifier(table) + SQL(".") + Identifier(col))
-            opcols.append(Identifier(f"{table}.{col}"))
-
-        nres = None if (one_per or limit is None or otherqueries) else self.stats.quick_count(thisquery)
-        if nres is not None or limit is None:
-            prelimit = limit
+        joined, frm = self._parse_join(join)
+        split = self._split_join_query(query, joined)
+        search_cols, cols = self._parse_join_projection(projection, joined)
+        where, values = self._join_where(split, joined)
+        olo = self._join_sort(split.get(self.search_table, {}), limit, offset, sort, joined)
+        if limit is None:
+            prelimit = None
         else:
             prelimit = max(limit, self._count_cutoff - offset)
-        if prelimit is not None:
             olo = SQL("{0} LIMIT %s").format(olo)
-            vals.append(prelimit)
+            values.append(prelimit)
             if offset != 0:
                 olo = SQL("{0} OFFSET %s").format(olo)
-                vals.append(offset)
-
-        if one_per:
-            op = SQL(", ").join(qualify_col(col) for col in one_per)
-            opmissing_sort_cols = [qualify_col(col, op=True) for col in missing_sort_cols]
-            missing_sort_cols = [qualify_col(col) for col in missing_sort_cols]
-            inner_cols = SQL(", ").join([SQL("{0} AS {1}").format(a, b) for (a, b) in zip(cols + missing_sort_cols, opcols + opmissing_sort_cols)])
-            selecter = SQL("SELECT {0} FROM (SELECT DISTINCT ON ({1}) {2} FROM {3}{4}) temp {5}").format(opcols, op, inner_cols, frm, where, olo)
-        else:
-            cols = SQL(", ").join(cols)
-            selecter = SQL("SELECT {0} FROM {1}{2}{3}").format(cols, frm, where, olo)
-
-        cur = self._execute(selecter,
-                            vals,
-                            silent=silent,
-                            buffered=(prelimit is None),
-                            slow_note=(self.search_table, "analyze", orig_query, repr(orig_proj), prelimit, offset))
-        # _search_iterator only cares about the column list, so we just use the original projection
+                values.append(offset)
+        selecter = SQL("SELECT {0} FROM {1}{2}{3}").format(SQL(", ").join(cols), frm, where, olo)
+        cur = self._execute(
+            selecter,
+            values,
+            silent=silent,
+            buffered=(prelimit is None),
+            slow_note=(self.search_table, "analyze", query, repr(projection), prelimit, offset),
+        )
         if limit is None:
             if info is not None:
-                info["number"] = self.count(thisquery) # NOT RIGHT IN PRESENCE OF CONSTRAINTS ON OTHER TABLES
-            return self._search_iterator(cur, projection, orig_proj, query=orig_query)
-        if nres is None:
-            exact_count = cur.rowcount < prelimit
-            nres = offset + cur.rowcount
-        else:
-            exact_count = True
+                info["number"] = self._join_count(query, join)
+            return self._search_iterator(cur, search_cols, projection, query=query, silent=silent)
+        exact_count = cur.rowcount < prelimit and (offset == 0 or cur.rowcount > 0)
+        nres = offset + cur.rowcount
         results = cur.fetchmany(limit)
-        results = list(self._search_iterator(results, projection, orig_proj, query=orig_query))
+        results = list(self._search_iterator(results, search_cols, projection, query=query, silent=silent))
         if info is not None:
             if offset >= nres > 0:
-                offset -= (1 + (offset - nres) / limit) * limit
-                if offset < 0:
-                    offset = 0
-                return self.join_search(
-                    orig_query,
-                    orig_proj,
-                    limit=limit,
-                    offset=offset,
-                    sort=raw_sort,
-                    info=info,
-                    silent=silent,
-                    one_per=one_per,
+                # The caller requested a start location past the last result;
+                # adjust to the last page instead, as search does.
+                if not exact_count:
+                    nres = self._join_count(query, join)
+                offset = max(nres - limit, 0)
+                return self._join_search(
+                    query, projection, join,
+                    limit=limit, offset=offset, sort=sort, info=info, silent=silent,
                 )
-            info["query"] = orig_query # This is probably broken....
+            info["query"] = dict(query)
             info["number"] = nres
             info["count"] = limit
             info["start"] = offset
             info["exact_count"] = exact_count
         return results
 
-    def lookup(self, label, projection=2, label_col=None):
+    def _join_lucky(self, query, projection, join, offset=0, sort=[]):
+        """
+        The implementation of ``lucky`` when ``join`` is provided; see the
+        documentation there.
+        """
+        joined, frm = self._parse_join(join)
+        split = self._split_join_query(query, joined)
+        search_cols, cols = self._parse_join_projection(projection, joined)
+        where, values = self._join_where(split, joined)
+        olo = self._join_sort(split.get(self.search_table, {}), 1, offset, sort, joined)
+        olo = SQL("{0} LIMIT %s").format(olo)
+        values.append(1)
+        if offset != 0:
+            olo = SQL("{0} OFFSET %s").format(olo)
+            values.append(offset)
+        selecter = SQL("SELECT {0} FROM {1}{2}{3}").format(SQL(", ").join(cols), frm, where, olo)
+        cur = self._execute(selecter, values)
+        if cur.rowcount > 0:
+            rec = cur.fetchone()
+            if projection == 0 or isinstance(projection, str):
+                return rec[0]
+            else:
+                return {
+                    k: v
+                    for k, v in zip(search_cols, rec)
+                    if (self._include_nones or v is not None)
+                }
+
+    def _join_count(self, query, join):
+        """
+        The implementation of ``count`` when ``join`` is provided; see the
+        documentation there.  The count is computed directly and never cached.
+        """
+        joined, frm = self._parse_join(join)
+        split = self._split_join_query(query, joined)
+        where, values = self._join_where(split, joined)
+        selecter = SQL("SELECT COUNT(*) FROM {0}{1}").format(frm, where)
+        cur = self._execute(selecter, values)
+        return cur.fetchone()[0]
+
+    def lookup(self, label, projection=2, label_col=None, join=None):
         """
         Look up a record by its label.
 
@@ -1169,6 +1347,8 @@ class PostgresSearchTable(PostgresTable):
         - ``projection`` -- which columns are requested (default 2, meaning all columns).
                             See ``_parse_projection`` for more details.
         - ``label_col`` -- which column holds the label.  Most tables store a default.
+        - ``join`` -- a list of tuples describing other search tables to join
+          to this one, as for ``search``.
 
         OUTPUT:
 
@@ -1187,7 +1367,7 @@ class PostgresSearchTable(PostgresTable):
             label_col = self._label_col
             if label_col is None:
                 raise ValueError("Lookup method not supported for tables with no label column")
-        return self.lucky({label_col: label}, projection=projection, sort=[])
+        return self.lucky({label_col: label}, projection=projection, sort=[], join=join)
 
     def exists(self, query):
         """
@@ -1458,7 +1638,7 @@ class PostgresSearchTable(PostgresTable):
         cur = self._execute(selecter, values)
         return [res[0] for res in cur]
 
-    def count(self, query={}, groupby=None, record=True):
+    def count(self, query={}, groupby=None, record=True, join=None):
         """
         Count the number of results for a given query.
 
@@ -1467,6 +1647,10 @@ class PostgresSearchTable(PostgresTable):
         - ``query`` -- a mongo-style dictionary, as in the ``search`` method.
         - ``groupby`` -- (default None) a list of columns
         - ``record`` -- (default True) whether to record the number of results in the counts table.
+        - ``join`` -- a list of tuples describing other search tables to join
+          to this one, as for ``search``.  Counts of joined queries are
+          computed directly and never cached, so ``record`` is ignored;
+          ``groupby`` is not supported with ``join``.
 
         OUTPUT:
 
@@ -1481,6 +1665,10 @@ class PostgresSearchTable(PostgresTable):
             sage: nf.count({'degree':int(6),'galt':int(7)})
             244006
         """
+        if join is not None:
+            if groupby is not None:
+                raise ValueError("groupby is not supported with join")
+            return self._join_count(query, join)
         return self.stats.count(query, groupby=groupby, record=record)
 
     def count_distinct(self, col, query={}, record=True):
