@@ -2414,127 +2414,140 @@ class PostgresTable(PostgresBase):
         try:
             if self.extra_table is not None:
                 raise ValueError("Extra table already exists")
-            with DelayCommit(self, silence=True):
-                if ordered and not self._id_ordered:
-                    updater = SQL("UPDATE meta_tables SET (id_ordered, out_of_order, has_extras) = (%s, %s, %s) WHERE name = %s")
-                    self._execute(updater, [True, True, True, self.search_table])
-                    self._id_ordered = True
-                    self._out_of_order = True
-                    self.resort()
-                else:
-                    # Not the parenthesized form: for a single column,
-                    # PostgreSQL 10+ requires a sub-SELECT or ROW() there.
-                    updater = SQL("UPDATE meta_tables SET has_extras = %s WHERE name = %s")
-                    self._execute(updater, [True, self.search_table])
-                self.extra_table = self.search_table + "_extras"
-                col_type = [("id", self.col_type["id"])]
-                cur = self._indexes_touching(columns)
-                if cur.rowcount > 0:
+            # Every validation happens before anything is touched -- Python
+            # attribute or database row -- so an expected rejection (a bad
+            # column, a dependent index) leaves the object exactly as it was
+            # and the call can simply be retried on the same handle.
+            col_type = [("id", self.col_type["id"])]
+            for col in columns:
+                if col not in self.col_type:
+                    raise ValueError("%s is not a column of %s" % (col, self.search_table))
+                if col == self._label_col:
                     raise ValueError(
-                        "Indexes (%s) depend on extra columns"
-                        % (", ".join(rec[0] for rec in cur))
+                        "Cannot move the label column %s to the extra table: "
+                        "lookup and label projections read it from the search table"
+                        % (col,)
                     )
-                if columns:
-                    selecter = SQL(
-                        "SELECT columns, constraint_name "
-                        "FROM meta_constraints WHERE table_name = %s AND ({0})"
-                    ).format(SQL(" OR ").join(SQL("columns @> %s") * len(columns)))
-                    cur = self._execute(
-                        selecter,
-                        [self.search_table] + [Json(col) for col in columns],
-                        silent=True,
+                if col in self._sort_keys:
+                    raise ValueError(
+                        "Sorting for %s depends on %s; change default sort order "
+                        "with set_sort() before moving column to extra table"
+                        % (self.search_table, col)
                     )
-                    for rec in cur:
-                        if not all(col in columns for col in rec[0]):
-                            raise ValueError(
-                                "Constraint %s (columns %s) split between search and extra table"
-                                % (rec[1], ", ".join(rec[0]))
-                            )
-                for col in columns:
-                    if col not in self.col_type:
-                        raise ValueError("%s is not a column of %s" % (col, self.search_table))
-                    if col in self._sort_keys:
-                        raise ValueError(
-                            "Sorting for %s depends on %s; change default sort order "
-                            "with set_sort() before moving column to extra table"
-                            % (self.search_table, col)
-                        )
-                    typ = self.col_type[col]
-                    self._check_col_datatype(typ)
-                    col_type.append((col, typ))
-                col_type_SQL = SQL(", ").join(
-                    SQL("{0} %s" % typ).format(Identifier(col)) for col, typ in col_type
+                typ = self.col_type[col]
+                self._check_col_datatype(typ)
+                col_type.append((col, typ))
+            cur = self._indexes_touching(columns)
+            if cur.rowcount > 0:
+                raise ValueError(
+                    "Indexes (%s) depend on extra columns"
+                    % (", ".join(rec[0] for rec in cur))
                 )
-                creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(self.extra_table), col_type_SQL, self._tablespace_clause())
-                self._execute(creator)
-                moved_constraints = []
-                if columns:
-                    # Remember the constraints touching the moved columns so
-                    # that they can be recreated on the extras table once the
-                    # move is complete (the split check above guarantees all
-                    # their columns are moving).
-                    selecter = SQL(
-                        "SELECT constraint_name, type, columns, check_func "
-                        "FROM meta_constraints WHERE table_name = %s AND ({0})"
-                    ).format(SQL(" OR ").join(SQL("columns @> %s") * len(columns)))
-                    moved_constraints = list(self._execute(
-                        selecter,
-                        [self.search_table] + [Json(col) for col in columns],
-                        silent=True,
-                    ))
-                    # Indexes referencing the moved columns cannot survive at
-                    # all, and dropping through psycodict keeps meta_indexes
-                    # and meta_constraints in sync where the DROP COLUMN below
-                    # would remove things behind our back.  This must happen
-                    # while search_cols still lists the moved columns, since
-                    # that is how constraints are classified onto the search
-                    # table.  (This used to call drop_constraints and
-                    # restore_constraints, methods that have never existed.)
-                    self.drop_indexes(columns)
-                    try:
-                        try:
-                            transfer_file = tempfile.NamedTemporaryFile("w", delete=False)
-                            cur = self._db.cursor()
-                            with transfer_file:
-                                cur.copy_to(
-                                    transfer_file,
-                                    self.search_table,
-                                    columns=["id"] + columns,
-                                    sep=sep,
-                                )
-                            with open(transfer_file.name) as F:
-                                cur.copy_from(F, self.extra_table, columns=["id"] + columns, sep=sep)
-                        finally:
-                            os.unlink(transfer_file.name)
-                    except Exception:
-                        self.conn.rollback()
-                        raise
-                    for col in columns:
-                        modifier = SQL("ALTER TABLE {0} DROP COLUMN {1}").format(
-                            Identifier(self.search_table), Identifier(col)
-                        )
-                        self._execute(modifier)
-                else:
-                    sequencer = SQL("CREATE TEMPORARY SEQUENCE tmp_id")
-                    self._execute(sequencer)
-                    updater = SQL("UPDATE {0} SET id = nextval('tmp_id')").format(Identifier(self.extra_table))
-                    self._execute(updater)
-                # Only the new extras table needs a primary key; restore_pkeys
-                # would try to add one to the search table too, which still
-                # has its own.
-                self._execute(SQL("ALTER TABLE {0} ADD CONSTRAINT {1} PRIMARY KEY (id)").format(
-                    Identifier(self.extra_table),
-                    Identifier(self.extra_table + "_pkey"),
+            moved_constraints = []
+            if columns:
+                # One query both validates that no constraint straddles the
+                # split and remembers the touched ones, so that they can be
+                # recreated on the extras table once the move is complete.
+                selecter = SQL(
+                    "SELECT constraint_name, type, columns, check_func "
+                    "FROM meta_constraints WHERE table_name = %s AND ({0})"
+                ).format(SQL(" OR ").join(SQL("columns @> %s") * len(columns)))
+                moved_constraints = list(self._execute(
+                    selecter,
+                    [self.search_table] + [Json(col) for col in columns],
+                    silent=True,
                 ))
-                # Update the object's bookkeeping only now that the physical
-                # move is done: constraint classification keys off search_cols,
-                # so changing it earlier would misdirect the drops above.
-                self.extra_cols = [col for col, typ in col_type[1:]]
-                self.search_cols = [col for col in self.search_cols if col not in columns]
-                # With the bookkeeping updated, recreation lands the saved
-                # constraints on the extras table.
-                for cname, ctype, ccols, cfunc in moved_constraints:
-                    self.create_constraint(ccols, ctype, name=cname, check_func=cfunc)
+                for rec in moved_constraints:
+                    if not all(col in columns for col in rec[2]):
+                        raise ValueError(
+                            "Constraint %s (columns %s) split between search and extra table"
+                            % (rec[0], ", ".join(rec[2]))
+                        )
+            saved_state = (self._id_ordered, self._out_of_order,
+                           list(self.search_cols), list(self.extra_cols))
+            try:
+                with DelayCommit(self, silence=True):
+                    if ordered and not self._id_ordered:
+                        updater = SQL("UPDATE meta_tables SET (id_ordered, out_of_order, has_extras) = (%s, %s, %s) WHERE name = %s")
+                        self._execute(updater, [True, True, True, self.search_table])
+                        self._id_ordered = True
+                        self._out_of_order = True
+                        self.resort()
+                    else:
+                        # Not the parenthesized form: for a single column,
+                        # PostgreSQL 10+ requires a sub-SELECT or ROW() there.
+                        updater = SQL("UPDATE meta_tables SET has_extras = %s WHERE name = %s")
+                        self._execute(updater, [True, self.search_table])
+                    self.extra_table = self.search_table + "_extras"
+                    col_type_SQL = SQL(", ").join(
+                        SQL("{0} %s" % typ).format(Identifier(col)) for col, typ in col_type
+                    )
+                    creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(self.extra_table), col_type_SQL, self._tablespace_clause())
+                    self._execute(creator)
+                    if columns:
+                        # Indexes and constraints referencing the moved columns
+                        # cannot survive on the search table, and dropping them
+                        # through psycodict keeps meta_indexes/meta_constraints
+                        # in sync where the DROP COLUMN below would remove
+                        # things behind our back.  This must happen while
+                        # search_cols still lists the moved columns, since that
+                        # is how constraints are classified onto the search
+                        # table.  (This used to call drop_constraints and
+                        # restore_constraints, methods that have never
+                        # existed.)
+                        self.drop_indexes(columns)
+                        try:
+                            try:
+                                transfer_file = tempfile.NamedTemporaryFile("w", delete=False)
+                                cur = self._db.cursor()
+                                with transfer_file:
+                                    cur.copy_to(
+                                        transfer_file,
+                                        self.search_table,
+                                        columns=["id"] + columns,
+                                        sep=sep,
+                                    )
+                                with open(transfer_file.name) as F:
+                                    cur.copy_from(F, self.extra_table, columns=["id"] + columns, sep=sep)
+                            finally:
+                                os.unlink(transfer_file.name)
+                        except Exception:
+                            self.conn.rollback()
+                            raise
+                        for col in columns:
+                            modifier = SQL("ALTER TABLE {0} DROP COLUMN {1}").format(
+                                Identifier(self.search_table), Identifier(col)
+                            )
+                            self._execute(modifier)
+                    else:
+                        sequencer = SQL("CREATE TEMPORARY SEQUENCE tmp_id")
+                        self._execute(sequencer)
+                        updater = SQL("UPDATE {0} SET id = nextval('tmp_id')").format(Identifier(self.extra_table))
+                        self._execute(updater)
+                    # Only the new extras table needs a primary key;
+                    # restore_pkeys would try to add one to the search table
+                    # too, which still has its own.
+                    self._execute(SQL("ALTER TABLE {0} ADD CONSTRAINT {1} PRIMARY KEY (id)").format(
+                        Identifier(self.extra_table),
+                        Identifier(self.extra_table + "_pkey"),
+                    ))
+                    # Update the object's bookkeeping only now that the
+                    # physical move is done: constraint classification keys
+                    # off search_cols, so changing it earlier would misdirect
+                    # the drops above.
+                    self.extra_cols = [col for col, typ in col_type[1:]]
+                    self.search_cols = [col for col in self.search_cols if col not in columns]
+                    # With the bookkeeping updated, recreation lands the saved
+                    # constraints on the extras table.
+                    for cname, ctype, ccols, cfunc in moved_constraints:
+                        self.create_constraint(ccols, ctype, name=cname, check_func=cfunc)
+            except Exception:
+                # The DelayCommit rolled the database back; put the Python
+                # object back too, so the handle stays usable.
+                (self._id_ordered, self._out_of_order,
+                 self.search_cols, self.extra_cols) = saved_state
+                self.extra_table = None
+                raise
             aborted = False
         finally:
             self.log_db_change("create_extra_table", logid=logid, aborted=aborted, columns=columns)

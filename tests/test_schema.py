@@ -628,6 +628,29 @@ def test_create_extra_table_splits_off_an_extra_table(db, empty_table):
     assert meta_tables_row(db, empty_table.search_table)["has_extras"] is True
 
 
+def test_create_extra_table_rejects_the_label_column(empty_table):
+    # lookup and the label projections read the label from the search table,
+    # an invariant create_table enforces; the split must not break it.
+    with pytest.raises(ValueError, match="label column"):
+        empty_table.create_extra_table(["label"])
+    assert empty_table.extra_table is None
+    assert "label" in empty_table.search_cols
+
+
+def test_create_extra_table_failure_leaves_the_object_usable(empty_table):
+    # A rejected split must not corrupt the handle: validation runs before
+    # any Python attribute or database row changes, so the same object can
+    # retry immediately.
+    empty_table.create_index(["x"])
+    with pytest.raises(ValueError, match="depend on extra columns"):
+        empty_table.create_extra_table(["x"])
+    assert empty_table.extra_table is None
+    assert "x" in empty_table.search_cols
+    empty_table.drop_index(empty_table.search_table + "_x")
+    empty_table.create_extra_table(["x"])
+    assert empty_table.extra_cols == ["x"]
+
+
 def test_create_extra_table_migrates_constraints(db, empty_table):
     # A constraint on a moved column must be dropped from the search table
     # (whose classification depends on search_cols, so ordering matters) and
