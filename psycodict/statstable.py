@@ -415,7 +415,6 @@ class PostgresStatsTable(PostgresBase):
                 Identifier(self.search_table),
                 qstr,
             )
-            print(selecter)
             cur = self._execute(selecter, values)
             return {tuple(rec[1:]): int(rec[0]) for rec in cur}
 
