@@ -693,11 +693,6 @@ def test_create_index_rejects_a_name_already_in_use(empty_table):
         empty_table.create_index(["n"], name=empty_table.search_table + "_label")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_check_restricted_suffix uses re.match instead of re.search, so the "
-           "_tmp/_oldN/_pkey suffix check never fires",
-)
 def test_create_index_rejects_restricted_suffixes(empty_table):
     with pytest.raises(ValueError):
         empty_table.create_index(["label"], name=empty_table.search_table + "_lbl_tmp")
