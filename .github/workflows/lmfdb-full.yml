@@ -37,9 +37,7 @@ on:
       lmfdb-ref:
         description: LMFDB ref to test against
         required: false
-        # TRANSITION (remove-extras): default pinned to LMFDB/lmfdb#7070
-        # until it merges; revert to main afterwards.
-        default: refs/pull/7070/head
+        default: main
 
 concurrency:
   # Deliberately no cancel-in-progress: a release run should be allowed to
@@ -66,7 +64,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: LMFDB/lmfdb
-          ref: ${{ inputs.lmfdb-ref || 'refs/pull/7070/head' }}
+          ref: ${{ inputs.lmfdb-ref || 'main' }}
           path: lmfdb
 
       # Groups come from LMFDB's own matrix_includes.json, read at run time so
@@ -119,7 +117,7 @@ jobs:
       - name: Set up LMFDB against devmirror
         uses: ./psycodict/.github/actions/lmfdb-env
         with:
-          lmfdb-ref: ${{ inputs.lmfdb-ref || 'refs/pull/7070/head' }}
+          lmfdb-ref: ${{ inputs.lmfdb-ref || 'main' }}
 
       - name: Run ${{ matrix.label }}
         working-directory: lmfdb
