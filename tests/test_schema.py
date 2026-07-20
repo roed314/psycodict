@@ -800,3 +800,46 @@ def test_description_hooks_are_no_ops_by_default(empty_table):
     assert empty_table.column_description() is None
     assert empty_table.column_description("label", "a column") is None
     assert empty_table.column_description(description={"label": "a column"}) is None
+
+
+def test_meta_version_is_stamped(db):
+    from psycodict.base import META_VERSION
+
+    cur = db._execute(SQL("SELECT version FROM meta_version"))
+    assert cur.fetchone()[0] == META_VERSION
+
+
+def test_meta_version_mismatch_refuses_connection(db, config):
+    from psycodict.base import META_VERSION
+    from psycodict.database import PostgresDatabase
+
+    try:
+        db._execute(SQL("UPDATE meta_version SET version = %s"), [META_VERSION + 1])
+        with pytest.raises(RuntimeError, match="newer"):
+            PostgresDatabase(config=config)
+        db._execute(SQL("UPDATE meta_version SET version = %s"), [META_VERSION - 1])
+        with pytest.raises(RuntimeError, match="older"):
+            PostgresDatabase(config=config)
+        db._execute(SQL("DELETE FROM meta_version"))
+        with pytest.raises(RuntimeError, match="empty"):
+            PostgresDatabase(config=config)
+    finally:
+        db._execute(SQL("DELETE FROM meta_version"))
+        db._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"), [META_VERSION])
+
+
+def test_missing_meta_version_tolerated_and_stamped_by_create(db, config):
+    from psycodict.base import META_VERSION
+    from psycodict.database import PostgresDatabase
+
+    try:
+        db._execute(SQL("DROP TABLE meta_version"))
+        # a database from before the stamp existed connects fine
+        other = PostgresDatabase(config=config)
+        other.conn.close()
+    finally:
+        # and connecting with create=True adds the stamp back
+        other = PostgresDatabase(config=config, create=True)
+        other.conn.close()
+    cur = db._execute(SQL("SELECT version FROM meta_version"))
+    assert cur.fetchone()[0] == META_VERSION

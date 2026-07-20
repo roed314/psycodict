@@ -22,6 +22,7 @@ from .encoding import (
 )
 from .base import (
     PostgresBase,
+    META_VERSION,
     _meta_tables_cols,
     _meta_tables_defaults,
     _meta_cols_types_jsonb_idx,
@@ -252,6 +253,30 @@ class PostgresDatabase(PostgresBase):
                     "longer supported by psycodict: %s.  Merge each extras table "
                     "into its search table before upgrading psycodict."
                     % (", ".join(rec[0] for rec in cur))
+                )
+
+        # Refuse to run when the database declares a metadata format that this
+        # version of psycodict does not understand.  Databases created before
+        # the stamp existed have no meta_version table; they are accepted as
+        # is, and connecting with create=True adds the stamp.
+        if self._table_exists("meta_version"):
+            row = self._execute(SQL("SELECT version FROM meta_version")).fetchone()
+            stored = None if row is None else row[0]
+            if stored != META_VERSION:
+                if stored is None:
+                    hint = ("its meta_version table is empty; insert the "
+                            "correct version to assert compatibility")
+                elif stored > META_VERSION:
+                    hint = ("it uses metadata format %s, which is newer; "
+                            "upgrade psycodict" % stored)
+                else:
+                    hint = ("it uses metadata format %s, which is older; "
+                            "migrate the meta_* tables and update meta_version"
+                            % stored)
+                raise RuntimeError(
+                    "This database is not compatible with this version of "
+                    "psycodict (which expects metadata format %s): %s."
+                    % (META_VERSION, hint)
                 )
 
         try:
@@ -500,6 +525,13 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         self._execute(SQL("CREATE TABLE {0} ({1})").format(Identifier(tbl), SQL(", ").join(parts)))
         self.grant_select(tbl)
 
+    def _create_meta_version(self):
+        with DelayCommit(self, silence=True):
+            self._execute(SQL("CREATE TABLE meta_version (version integer NOT NULL)"))
+            self._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"), [META_VERSION])
+            self.grant_select("meta_version")
+        print("Table meta_version created")
+
     def _create_meta_tables(self):
         with DelayCommit(self, silence=True):
             self._meta_creator("meta_tables")
@@ -543,8 +575,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
     def _bootstrap_meta(self):
         """
         Create any missing psycodict metadata tables (meta_tables, meta_indexes,
-        meta_constraints and their _hist counterparts), for use on a fresh
-        database.  Called from the constructor when ``create=True`` is passed.
+        meta_constraints, their _hist counterparts, and the meta_version format
+        stamp), for use on a fresh database.  Called from the constructor when
+        ``create=True`` is passed.
         """
         existing = {
             rec[0] for rec in self._execute(SQL(
@@ -560,6 +593,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             ("meta_tables_hist", self._create_meta_tables_hist),
             ("meta_indexes_hist", self._create_meta_indexes_hist),
             ("meta_constraints_hist", self._create_meta_constraints_hist),
+            ("meta_version", self._create_meta_version),
         ]:
             if name not in existing:
                 creator()
