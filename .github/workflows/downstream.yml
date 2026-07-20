@@ -73,7 +73,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: LMFDB/lmfdb
-          ref: main
+          # TRANSITION (remove-extras): see the lmfdb job below.
+          ref: refs/pull/7070/head
           path: lmfdb
       - id: resolve
         run: |
@@ -101,8 +102,14 @@ jobs:
         with:
           path: psycodict
 
+      # TRANSITION (remove-extras): pinned to LMFDB/lmfdb#7070, the paired
+      # PR that stops LMFDB reading the removed extras attributes; lmfdb main
+      # fails against this branch until it merges.  Revert this `with:` block
+      # to track main once #7070 is in.
       - name: Set up LMFDB against devmirror
         uses: ./psycodict/.github/actions/lmfdb-env
+        with:
+          lmfdb-ref: refs/pull/7070/head
 
       # The unit jobs run these same files without Sage; this is the only job
       # with Sage on the path, so it is where the SAGE_MODE half of the
@@ -164,7 +171,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: roed314/seminars
-          ref: master
+          # TRANSITION (remove-extras): pinned to roed314/seminars#974, the
+          # paired PR that stops seminars selecting the removed has_extras
+          # column; seminars master fails against this branch until it
+          # merges.  Revert to master once #974 is in.
+          ref: refs/pull/974/head
           path: seminars
 
       # seminars/users/__init__.py imports distutils, which was removed in
