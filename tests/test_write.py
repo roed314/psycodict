@@ -113,11 +113,6 @@ def test_insert_many_explicit_none_becomes_null(empty_table):
     assert empty_table.count({"flag": None}) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="insert_many wraps None in Json, storing jsonb 'null' rather than SQL NULL, "
-           "so the row cannot be found again with the documented {col: None} query",
-)
 def test_insert_many_none_in_jsonb_column_is_sql_null(empty_table):
     empty_table.insert_many([{"n": 1, "label": "a", "data": None}])
     assert empty_table.count({"data": None}) == 1

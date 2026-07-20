@@ -329,7 +329,13 @@ class PostgresSearchTable(PostgresTable):
             [3]
         """
 
-        return [Json(val) if self.col_type[key] == "jsonb" else val for key, val in D.items()]
+        # None stays None even for jsonb columns, so that it is stored as SQL
+        # NULL rather than the jsonb value 'null' (matching insert_many and
+        # copy_dumps, and making the documented {col: None} query work).
+        return [
+            Json(val) if self.col_type[key] == "jsonb" and val is not None else val
+            for key, val in D.items()
+        ]
 
     def _parse_dict(self, D, outer=None, outer_type=None):
         """
