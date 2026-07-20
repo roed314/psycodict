@@ -453,10 +453,6 @@ def test_query_raw(filled_table):
     assert filled_table.search({}, "n", raw="label = %s", raw_values=["l4"], limit=5) == [4]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a nested $raw passes the {'$raw': ...} dict to filter_sql_injection instead of its value",
-)
 def test_query_raw_nested_in_comparison(filled_table):
     # num = 10 * n + 7 < 11 * n exactly when n > 7
     assert filled_table.count({"num": {"$lt": {"$raw": "n*11"}}}) == 192
