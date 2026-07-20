@@ -241,10 +241,6 @@ def test_search_split_ors(filled_table):
         filled_table.search({"$or": [{"n": 1}]}, "n", split_ors=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_split_ors sorts the split queries by the raw clause value, which fails when a branch is a range dict",
-)
 def test_search_split_ors_with_range_clauses(filled_table):
     assert filled_table.search(
         {"$or": [{"n": {"$lt": 3}}, {"n": {"$gt": 197}}]}, "n", limit=10, split_ors=True

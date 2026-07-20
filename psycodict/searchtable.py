@@ -645,7 +645,13 @@ class PostgresSearchTable(PostgresTable):
                 asc = 1
             else:
                 col, asc = col
-            queries.sort(key=lambda Q: Q[col], reverse=(asc != 1))
+            try:
+                queries.sort(key=lambda Q: Q[col], reverse=(asc != 1))
+            except (KeyError, TypeError):
+                # A branch whose value for the sort column is a range clause
+                # (a dict) or absent has no natural position among the
+                # scalars, so settle for a deterministic order instead.
+                queries.sort(key=lambda Q: str(Q.get(col)), reverse=(asc != 1))
         return queries
 
     def _get_table_clause(self, extra_cols):
