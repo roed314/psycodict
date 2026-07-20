@@ -147,6 +147,22 @@ def test_count_with_record_false_does_not_cache(saving_table):
     assert saving_table.stats.quick_count({"n": {"$lt": 60}}) is None
 
 
+def test_count_does_not_record_by_default(saving_table):
+    # LMFDB/lmfdb#6355: recording is opt-in, so one-off counts from scripts
+    # do not clutter the counts table
+    assert saving_table.count({"n": {"$lt": 70}}) == 70
+    assert saving_table.stats.quick_count({"n": {"$lt": 70}}) is None
+
+
+def test_search_with_info_still_records_its_count(saving_table):
+    # search-page counts are the ones the cache exists for, so search's own
+    # count call opts in
+    info = {}
+    saving_table.search({"n": {"$lt": 80}}, "n", info=info)
+    assert info["number"] == 80
+    assert saving_table.stats.quick_count({"n": {"$lt": 80}}) == 80
+
+
 def test_null_counts_ignores_columns_without_nulls(filled_table):
     # Every column of every sample row is populated.
     assert filled_table.stats.null_counts() == {}
