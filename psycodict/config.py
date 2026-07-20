@@ -115,7 +115,7 @@ class Configuration():
                 dest="postgresql_password",
                 metavar="PASS",
                 help="PostgreSQL password [default: %(default)s]",
-                default=defaults.get("postgres_password", ""),
+                default=defaults.get("postgresql_password", ""),
             )
 
             postgresqlgroup.add_argument(
