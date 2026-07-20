@@ -317,6 +317,45 @@ def test_create_table_registers_the_table_on_the_database(db, empty_table):
     assert getattr(db, name) is empty_table
 
 
+def test_create_table_validates_columns_label_and_sort(db, empty_table):
+    with pytest.raises(ValueError):
+        db.create_table(empty_table.search_table, conftest.COLUMNS, label_col="label")
+    with pytest.raises(ValueError):
+        db.create_table(fresh_name(), conftest.COLUMNS, label_col="nonexistent")
+    with pytest.raises(ValueError):
+        db.create_table(fresh_name(), conftest.COLUMNS, label_col="label", sort=["nonexistent"])
+    with pytest.raises(ValueError):
+        db.create_table(fresh_name(), [("n", "integer"), ("n", "text")], label_col="n")
+    with pytest.raises(RuntimeError):
+        db.create_table(fresh_name(), [("n", "no_such_type")], label_col="n")
+
+
+def test_create_table_force_description(db, transient):
+    name = fresh_name()
+    with pytest.raises(ValueError):
+        db.create_table(name, [("n", "integer")], label_col="n", force_description=True)
+    with pytest.raises(ValueError):
+        db.create_table(
+            name,
+            [("n", "integer"), ("label", "text")],
+            label_col="n",
+            table_description="things",
+            col_description={"n": "a number"},
+            force_description=True,
+        )
+    assert name not in db.tablenames
+    db.create_table(
+        name,
+        [("n", "integer")],
+        label_col="n",
+        table_description="things",
+        col_description={"n": "a number"},
+        force_description=True,
+    )
+    transient.append(name)
+    assert name in db.tablenames
+
+
 def test_create_table_like_copies_the_schema(db, transient):
     source = fresh_name()
     db.create_table(

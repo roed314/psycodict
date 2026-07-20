@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 import time
 import traceback
-import itertools
 from collections import defaultdict, Counter
 
 from psycopg2 import connect, DatabaseError
@@ -706,7 +705,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         # Check that descriptions are provided if required
         description_columns = []
-        for col in itertools.chain(search_columns.values()):
+        for col in search_columns.values():
             if col == 'id':
                 continue
             if isinstance(col, str):
