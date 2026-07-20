@@ -415,10 +415,25 @@ def copy_dumps(inp, typ, recursing=False):
     - ``typ`` -- the Postgres type of the column in which this data is being stored.
     """
     if inp is None:
-        return "\\N"
+        # inside an array the null marker is the array literal NULL, since
+        # COPY's field-level unescaping would turn \N into the letter N
+        return "NULL" if recursing else "\\N"
     elif typ in ("text", "char", "varchar"):
         if not isinstance(inp, str):
             inp = str(inp)
+        # As an array element, quote anything the array parser would misread:
+        # array syntax, whitespace (trimmed when unquoted), the empty string
+        # and the literal NULL.  The array-level escaping of backslashes and
+        # double quotes must happen before the COPY field-level escaping below,
+        # while the enclosing quotes are added after it, so that they reach
+        # the array parser unescaped.
+        quote = recursing and (
+            not inp
+            or inp.upper() == "NULL"
+            or any(c in '{},"\\' or c.isspace() for c in inp)
+        )
+        if quote:
+            inp = inp.replace("\\", "\\\\").replace('"', '\\"')
         inp = (
             inp.replace("\\", "\\\\")
             .replace("\r", r"\r")
@@ -426,7 +441,7 @@ def copy_dumps(inp, typ, recursing=False):
             .replace("\t", r"\t")
             .replace('"', r"\"")
         )
-        if recursing and ("{" in inp or "}" in inp):
+        if quote:
             inp = '"' + inp + '"'
         return inp
     elif typ in ("json", "jsonb"):
