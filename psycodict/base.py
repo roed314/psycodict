@@ -120,7 +120,6 @@ _meta_tables_cols = (
     "count_cutoff",
     "id_ordered",
     "out_of_order",
-    "has_extras",
     "stats_valid",
     "label_col",
     "total",
@@ -146,7 +145,6 @@ _meta_tables_types = dict(zip(_meta_tables_cols, (
     "text",
     "jsonb",
     "smallint",
-    "boolean",
     "boolean",
     "boolean",
     "boolean",
@@ -875,7 +873,7 @@ class PostgresBase():
         - ``columns`` -- a list of columns to load (the file may contain them in
             a different order, specified by a header row)
         - ``header`` -- whether the file has header rows ordering the columns.
-            This should be True for search and extra tables, False for counts and stats.
+            This should be True for search tables, False for counts and stats.
         - ``kwds`` -- passed on to psycopg2's copy_from
         """
         kwds = dict(kwds)  # to not modify the dict kwds, with the pop
@@ -967,7 +965,7 @@ class PostgresBase():
 
     def _pairs_to_dict(self, L):
         """
-        Standardize input format for search_columns and extra_columns
+        Standardize input format for search_columns
         """
         if L is None:
             return L

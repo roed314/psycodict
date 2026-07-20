@@ -17,19 +17,6 @@ from conftest import sample_row
 
 
 @pytest.fixture
-def extras_table(table_factory):
-    """
-    A table split into a search table and an extras table.
-    """
-    table = table_factory(
-        columns=[("n", "integer"), ("label", "text")],
-        extra_columns=[("note", "text")],
-    )
-    table.insert_many([{"n": i, "label": "e%d" % i, "note": "N%d" % i} for i in range(5)])
-    return table
-
-
-@pytest.fixture
 def unlabelled_table(table_factory):
     """
     A table without a label column, for the error paths of label lookups.
@@ -75,12 +62,14 @@ def test_search_projection_scalar_forms(filled_table):
     assert filled_table.search({"n": {"$lt": 3}}, "num", limit=3) == [7, 17, 27]
 
 
-def test_search_projection_integer_forms(extras_table):
-    assert extras_table.search({"n": 1}, 1, limit=1) == [{"n": 1, "label": "e1"}]
-    assert extras_table.search({"n": 1}, 2, limit=1) == [{"n": 1, "label": "e1", "note": "N1"}]
-    assert extras_table.search({"n": 1}, 3, limit=1) == [
-        {"id": 1, "n": 1, "label": "e1", "note": "N1"}
-    ]
+def test_search_projection_integer_forms(table_factory):
+    table = table_factory(columns=[("n", "integer"), ("label", "text")])
+    table.insert_many([{"n": i, "label": "e%d" % i} for i in range(5)])
+    assert table.search({"n": 1}, 1, limit=1) == [{"n": 1, "label": "e1"}]
+    # 2 is a historical alias for 1, from when tables could be split into
+    # a search table and an extras table
+    assert table.search({"n": 1}, 2, limit=1) == [{"n": 1, "label": "e1"}]
+    assert table.search({"n": 1}, 3, limit=1) == [{"id": 1, "n": 1, "label": "e1"}]
 
 
 def test_search_projection_list(filled_table):

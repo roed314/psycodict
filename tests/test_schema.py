@@ -297,7 +297,6 @@ def test_create_table_records_row_in_meta_tables(db, empty_table):
     assert row["label_col"] == "label"
     assert row["id_ordered"] is True
     assert row["out_of_order"] is False
-    assert row["has_extras"] is False
 
 
 def test_create_table_without_sort_is_not_id_ordered(db, transient):
@@ -316,30 +315,6 @@ def test_create_table_registers_the_table_on_the_database(db, empty_table):
     assert db.tablenames == sorted(db.tablenames)
     assert db[name] is empty_table
     assert getattr(db, name) is empty_table
-
-
-def test_create_table_with_extra_columns(db, transient):
-    name = fresh_name()
-    db.create_table(
-        name,
-        conftest.COLUMNS,
-        label_col="label",
-        sort=["n"],
-        extra_columns={"text": ["notes"], "jsonb": ["blob"]},
-    )
-    transient.append(name)
-    table = db[name]
-    assert table.extra_table == name + "_extras"
-    assert table.extra_cols == ["blob", "notes"]
-    assert "notes" not in table.search_cols
-    assert table.col_type["notes"] == "text"
-    assert dict(pg_columns(db, table.extra_table)) == {
-        "id": "bigint",
-        "notes": "text",
-        "blob": "jsonb",
-    }
-    assert pkey_columns(db, table.extra_table) == ["id"]
-    assert meta_tables_row(db, name)["has_extras"] is True
 
 
 def test_create_table_validates_columns_label_and_sort(db, empty_table):
@@ -381,11 +356,6 @@ def test_create_table_force_description(db, transient):
     assert name in db.tablenames
 
 
-##################################################################
-# create_table_like                                              #
-##################################################################
-
-
 def test_create_table_like_copies_the_schema(db, transient):
     source = fresh_name()
     db.create_table(
@@ -393,7 +363,6 @@ def test_create_table_like_copies_the_schema(db, transient):
         conftest.COLUMNS,
         label_col="label",
         sort=["n"],
-        extra_columns={"text": ["notes"]},
     )
     transient.append(source)
     target = fresh_name()
@@ -401,14 +370,12 @@ def test_create_table_like_copies_the_schema(db, transient):
     transient.append(target)
     copy = db[target]
     assert copy.search_cols == db[source].search_cols
-    assert copy.extra_cols == db[source].extra_cols
     assert {col: copy.col_type[col] for col in copy.search_cols} == {
         col: db[source].col_type[col] for col in copy.search_cols
     }
     row = meta_tables_row(db, target)
     assert row["sort"] == ["n"]
     assert row["label_col"] == "label"
-    assert row["has_extras"] is True
 
 
 def test_create_table_like_can_copy_data_and_indexes(db, transient):
@@ -445,9 +412,9 @@ def test_create_table_like_preserves_id_type(db, transient):
 
 
 def test_drop_table_drops_the_table_and_its_companions(db, table_factory):
-    table = table_factory(extra_columns={"text": ["notes"]})
+    table = table_factory()
     name = table.search_table
-    companions = [name, name + "_extras", name + "_counts", name + "_stats"]
+    companions = [name, name + "_counts", name + "_stats"]
     assert set(companions) <= set(db._all_tablenames())
     db.drop_table(name, force=True)
     assert not (set(companions) & set(db._all_tablenames()))
@@ -545,14 +512,6 @@ def test_add_column_adds_a_search_column(db, empty_table):
     assert dict(pg_columns(db, empty_table.search_table))["extra_int"] == "smallint"
 
 
-def test_add_column_adds_an_extra_column(db, table_factory):
-    table = table_factory(extra_columns={"text": ["notes"]})
-    table.add_column("more_notes", "text", extra=True)
-    assert table.extra_cols == ["more_notes", "notes"]
-    assert "more_notes" not in table.search_cols
-    assert dict(pg_columns(db, table.extra_table))["more_notes"] == "text"
-
-
 def test_add_column_can_set_the_label_column(db, empty_table):
     empty_table.add_column("new_label", "text", label=True)
     assert empty_table.get_label() == "new_label"
@@ -565,12 +524,9 @@ def test_add_column_validates_its_arguments(empty_table):
     with pytest.raises(RuntimeError):
         empty_table.add_column("bad", "no_such_type")
     with pytest.raises(ValueError):
-        empty_table.add_column("both", "text", extra=True, label=True)
-    with pytest.raises(ValueError):
         empty_table.add_column("undocumented", "text", force_description=True)
-    with pytest.raises(ValueError):
-        empty_table.add_column("no_extras_table", "text", extra=True)
-    assert empty_table.extra_cols == []
+    with pytest.raises(TypeError):
+        empty_table.add_column("legacy", "text", extra=True)
 
 
 def test_drop_column_removes_the_column(db, empty_table):
@@ -608,19 +564,6 @@ def test_set_label_and_get_label(db, empty_table):
     assert meta_tables_row(db, empty_table.search_table)["label_col"] is None
     with pytest.raises(ValueError):
         empty_table.set_label("no_such_column")
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="create_extra_table issues UPDATE meta_tables SET (has_extras) = (%s), "
-           "which postgres 10+ rejects for a single column",
-)
-def test_create_extra_table_splits_off_an_extra_table(db, empty_table):
-    empty_table.create_extra_table(["data"])
-    assert empty_table.extra_table == empty_table.search_table + "_extras"
-    assert empty_table.extra_cols == ["data"]
-    assert "data" not in empty_table.search_cols
-    assert meta_tables_row(db, empty_table.search_table)["has_extras"] is True
 
 
 ##################################################################
@@ -788,12 +731,6 @@ def test_create_constraint_validates_its_arguments(empty_table):
     assert empty_table.list_constraints() == {}
 
 
-def test_create_constraint_refuses_to_mix_search_and_extra_columns(table_factory):
-    table = table_factory(extra_columns={"text": ["notes"]})
-    with pytest.raises(ValueError):
-        table.create_constraint(["label", "notes"], "unique")
-
-
 def test_create_constraint_not_null(db, empty_table):
     empty_table.create_constraint(["n"], "not null")
     cur = db._execute(
@@ -852,8 +789,6 @@ def test_db_getitem_rejects_an_unknown_table(db):
 
 def test_table_columns_and_types(db, empty_table):
     assert empty_table.search_cols == sorted(col for col, _ in conftest.COLUMNS)
-    assert empty_table.extra_cols == []
-    assert empty_table.extra_table is None
     expected = dict(conftest.COLUMNS)
     expected["id"] = "bigint"
     assert empty_table.col_type == expected

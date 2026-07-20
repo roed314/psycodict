@@ -183,20 +183,6 @@ class QueryLogFilter():
             return 0
 
 
-class EmptyContext():
-    """
-    Used to simplify code in cases where we may or may not want to open an extras file.
-    """
-
-    name = None
-
-    def __enter__(self):
-        pass
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        pass
-
-
 class DelayCommit():
     """
     Used to set default behavior for whether to commit changes to the database connection.

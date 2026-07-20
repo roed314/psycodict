@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 import time
 import traceback
-import itertools
 from collections import defaultdict, Counter
 
 from psycopg2 import connect, DatabaseError
@@ -231,10 +230,26 @@ class PostgresDatabase(PostgresBase):
                 data_types[table_name] = []
             data_types[table_name].append((column_name, regtype))
 
+        # Refuse to run against a database that still uses the removed
+        # search/extras table split
+        legacy = self._execute(SQL(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' "
+            "AND table_name = 'meta_tables' AND column_name = 'has_extras'"
+        ))
+        if legacy.rowcount:
+            cur = self._execute(SQL("SELECT name FROM meta_tables WHERE has_extras"))
+            if cur.rowcount:
+                raise RuntimeError(
+                    "The following tables still use an extras table, which is no "
+                    "longer supported by psycodict: %s.  Merge each extras table "
+                    "into its search table before upgrading psycodict."
+                    % (", ".join(rec[0] for rec in cur))
+                )
+
         try:
             cur = self._execute(SQL(
                 "SELECT name, label_col, sort, count_cutoff, id_ordered, out_of_order, "
-                "has_extras, stats_valid, total, include_nones FROM meta_tables"
+                "stats_valid, total, include_nones FROM meta_tables"
             ))
         except UndefinedTable:
             raise ValueError(
@@ -396,11 +411,10 @@ class PostgresDatabase(PostgresBase):
         - ``nrows`` -- an estimate for the number of rows in the table
         - ``nstats`` -- an estimate for the number of rows in the stats table
         - ``ncounts`` -- an estimate for the number of rows in the counts table
-        - ``total_bytes`` -- the total number of bytes used by the main table, as well as stats, counts, extras, indexes, ancillary storage....
+        - ``total_bytes`` -- the total number of bytes used by the main table, as well as stats, counts, indexes, ancillary storage....
         - ``index_bytes`` -- the number of bytes used for indexes on the main table
         - ``toast_bytes`` -- the number of bytes used for storage of variable length data types, such as strings and jsonb
         - ``table_bytes`` -- the number of bytes used for fixed length storage on the main table
-        - ``extra_bytes`` -- the number of bytes used by the extras table (including the index on id, toast, etc)
         - ``counts_bytes`` -- the number of bytes used by the counts table
         - ``stats_bytes`` -- the number of bytes used by the stats table
         """
@@ -434,9 +448,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 name = table_name[:-7]
                 sizes[name]["ncounts"] = int(row_estimate)
                 sizes[name]["counts_bytes"] = total_bytes
-            elif table_name.endswith("_extras"):
-                name = table_name[:-7]
-                sizes[name]["extras_bytes"] = total_bytes
             else:
                 name = table_name
                 sizes[name]["nrows"] = int(row_estimate)
@@ -567,17 +578,10 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             typ: [col for col in table.search_cols if table.col_type[col] == typ]
             for typ in set(table.col_type.values())
         }
-        extra_columns = {
-            typ: [col for col in table.extra_cols if table.col_type[col] == typ]
-            for typ in set(table.col_type.values())
-        }
         # Remove empty lists
-        for D in [search_columns, extra_columns]:
-            for typ, cols in list(D.items()):
-                if not cols:
-                    D.pop(typ)
-        if not extra_columns:
-            extra_columns = None
+        for typ, cols in list(search_columns.items()):
+            if not cols:
+                search_columns.pop(typ)
         label_col = table._label_col
         table_description = table.description()
         col_description = table.column_description()
@@ -591,7 +595,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             col_description,
             sort,
             id_ordered,
-            extra_columns,
             tablespace=tablespace,
             # Without this an integer id would silently widen to the
             # default bigint in the copy.
@@ -607,14 +610,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                         Identifier(new_name), cols, Identifier(table.search_table)
                     ),
                 )
-                if extra_columns:
-                    extra_cols = SQL(", ").join(map(Identifier, ["id"] + table.extra_cols))
-                    self._execute(
-                        SQL("INSERT INTO {0} ( {1} ) SELECT {1} FROM {2}").format(
-                            Identifier(new_name + "_extras"), extra_cols,
-                            Identifier(table.extra_table)
-                        ),
-                    )
                 aborted = False
             finally:
                 table.log_db_change("create_table_like", logid=logid, aborted=aborted, new_name=new_name)
@@ -633,7 +628,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         col_description=None,
         sort=None,
         id_ordered=None,
-        extra_columns=None,
         tablespace=None,
         force_description=False,
         id_type="bigint",
@@ -651,16 +645,12 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         - ``label_col`` -- the column holding the LMFDB label.  This will be used in the ``lookup`` method
             and in the display of results on the API.  Use None if there is no appropriate column.
         - ``table_description`` -- a text description of this table
-        - ``col_description`` -- a dictionary giving descriptions for the columns (both search and extra)
+        - ``col_description`` -- a dictionary giving descriptions for the columns
         - ``sort`` -- If not None, provides a default sort order for the table, in formats accepted by
             the ``_sort_str`` method.
         - ``id_ordered`` -- boolean (default None).  If set, the table will be sorted by id when
             pushed to production, speeding up some kinds of search queries.  Defaults to True
             when sort is not None.
-        - ``extra_columns`` -- a dictionary in the same format as the search_columns dictionary.
-            If present, will create a second table (the name with "_extras" appended), linked by
-            an id column.  Data in this table cannot be searched on, but will also not appear
-            in the search table, speeding up scans.
         - ``tablespace`` -- (optional) a postgres tablespace to use for the new table
         - ``force_description`` -- whether to require descriptions
         - ``id_type`` -- what postgres type to use for the id column
@@ -688,8 +678,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         if not isinstance(search_columns, dict):
             search_columns = self._pairs_to_dict(search_columns)
-        if not isinstance(extra_columns, dict):
-            extra_columns = self._pairs_to_dict(extra_columns)
         for typ, L in list(search_columns.items()):
             if isinstance(L, str):
                 search_columns[typ] = [L]
@@ -716,15 +704,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     raise ValueError("Column %s does not exist" % (col))
 
         # Check that descriptions are provided if required
-        if extra_columns is not None:
-            valid_extra_list = sum(extra_columns.values(), [])
-            valid_extra_set = set(valid_extra_list)
-            # Check that columns aren't listed twice
-            if len(valid_extra_list) != len(valid_extra_set):
-                C = Counter(valid_extra_list)
-                raise ValueError("Column %s repeated" % (C.most_common(1)[0][0]))
         description_columns = []
-        for col in itertools.chain(search_columns.values(), [] if extra_columns is None else extra_columns.values()):
+        for col in search_columns.values():
             if col == 'id':
                 continue
             if isinstance(col, str):
@@ -745,9 +726,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         with DelayCommit(self, silence=True):
             self._create_table(name, search_columns, addid=id_type, tablespace=tablespace)
             self.grant_select(name)
-            if extra_columns is not None:
-                self._create_table(name + "_extras", extra_columns, addid=id_type, tablespace=tablespace)
-                self.grant_select(name + "_extras")
             tablespace = self._tablespace_clause(tablespace)
             creator = SQL(
                 "CREATE TABLE {0} "
@@ -770,8 +748,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             # FIXME use global constants ?
             inserter = SQL(
                 "INSERT INTO meta_tables "
-                "(name, sort, id_ordered, out_of_order, has_extras, label_col) "
-                "VALUES (%s, %s, %s, %s, %s, %s)"
+                "(name, sort, id_ordered, out_of_order, label_col) "
+                "VALUES (%s, %s, %s, %s, %s)"
             )
             self._execute(
                 inserter,
@@ -780,7 +758,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     Json(sort),
                     id_ordered,
                     not id_ordered,
-                    extra_columns is not None,
                     label_col,
                 ],
             )
@@ -791,7 +768,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             sort=sort,
             id_ordered=id_ordered,
             out_of_order=(not id_ordered),
-            has_extras=(extra_columns is not None),
             total=0,
         )
         # Add the primary key on id, so that methods like drop_pkeys (used by
@@ -810,7 +786,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             label_col=label_col,
             sort=sort,
             id_ordered=id_ordered,
-            extra_columns=extra_columns,
         )
         print("Table %s created in %.3f secs" % (name, time.time() - now))
 
@@ -852,9 +827,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 self._execute(SQL("DELETE FROM meta_constraints WHERE table_name = %s"), [name])
                 print("Deleted constraints {0}".format(", ".join(constraint[0] for constraint in constraints)))
             self._execute(SQL("DELETE FROM meta_tables WHERE name = %s"), [name])
-            if table.extra_table is not None:
-                self._execute(SQL("DROP TABLE {0}").format(Identifier(table.extra_table)))
-                print("Dropped {0}".format(table.extra_table))
             for tbl in [name, name + "_counts", name + "_stats"]:
                 self._execute(SQL("DROP TABLE {0}").format(Identifier(tbl)))
                 print("Dropped {0}".format(tbl))
@@ -926,26 +898,19 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 print("Renamed all entries meta_tables(_hist)")
 
             rename = SQL("ALTER TABLE {0} RENAME TO {1}")
-            # rename extra table
-            if table.extra_table is not None:
-                old_extra = table.extra_table
-                assert old_extra == old_name + "_extras"
-                new_extra = new_name + "_extras"
-                self._execute(rename.format(Identifier(old_extra), Identifier(new_extra)))
-                print("Renamed {0} to {1}".format(old_extra, new_extra))
             for suffix in ["", "_counts", "_stats"]:
                 self._execute(rename.format(Identifier(old_name + suffix), Identifier(new_name + suffix)))
                 print("Renamed {0} to {1}".format(old_name + suffix, new_name + suffix))
 
             # rename oldN tables
             for backup_number in range(table._next_backup_number()):
-                for ext in ["", "_extras", "_counts", "_stats"]:
+                for ext in ["", "_counts", "_stats"]:
                     old_name_old = "{0}{1}_old{2}".format(old_name, ext, backup_number)
                     new_name_old = "{0}{1}_old{2}".format(new_name, ext, backup_number)
                     if self._table_exists(old_name_old):
                         self._execute(rename.format(Identifier(old_name_old), Identifier(new_name_old)))
                         print("Renamed {0} to {1}".format(old_name_old, new_name_old))
-            for ext in ["", "_extras", "_counts", "_stats"]:
+            for ext in ["", "_counts", "_stats"]:
                 old_name_tmp = "{0}{1}_tmp".format(old_name, ext)
                 new_name_tmp = "{0}{1}_tmp".format(new_name, ext)
                 if self._table_exists(old_name_tmp):
@@ -956,7 +921,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             tabledata = self._execute(
                 SQL(
                     "SELECT name, label_col, sort, count_cutoff, id_ordered, "
-                    "out_of_order, has_extras, stats_valid, total, include_nones "
+                    "out_of_order, stats_valid, total, include_nones "
                     "FROM meta_tables WHERE name = %s"
                 ),
                 [new_name],
@@ -998,15 +963,11 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 searchfile = data_folder / (tablename + ".txt")
                 statsfile = data_folder / (tablename + "_stats.txt")
                 countsfile = data_folder / (tablename + "_counts.txt")
-                extrafile = data_folder / (tablename + "_extras.txt")
-                if table.extra_table is None:
-                    extrafile = None
                 indexesfile = data_folder / (tablename + "_indexes.txt")
                 constraintsfile = data_folder / (tablename + "_constraints.txt")
                 metafile = data_folder / (tablename + "_meta.txt")
                 table.copy_to(
                     searchfile=searchfile,
-                    extrafile=extrafile,
                     countsfile=countsfile,
                     statsfile=statsfile,
                     indexesfile=indexesfile,
@@ -1051,7 +1012,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
     ):
         """
         Reloads all tables from files in a given folder.  The filenames must match
-        the names of the tables, with `_extras`, `_counts` and `_stats` appended as appropriate.
+        the names of the tables, with `_counts` and `_stats` appended as appropriate.
 
         INPUT:
 
@@ -1080,7 +1041,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             tablenames = []
             non_existent_tables = []
             possible_endings = [
-                "_extras.txt",
                 "_counts.txt",
                 "_stats.txt",
                 "_indexes.txt",
@@ -1104,7 +1064,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 print("Creating tables: {0}".format(", ".join(non_existent_tables)))
                 for tablename in non_existent_tables:
                     search_table_file = data_folder / (tablename + ".txt")
-                    extras_file = data_folder / (tablename + "_extras.txt")
                     metafile = data_folder / (tablename + "_meta.txt")
                     if not metafile.exists():
                         raise ValueError("meta file missing for {0}".format(tablename))
@@ -1124,19 +1083,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                         if name != "id":
                             search_columns[typ].append(name)
 
-                    extra_columns = None
-                    if meta["has_extras"] == "t":
-                        if not extras_file.exists():
-                            raise ValueError("extras file missing for {0}".format(tablename))
-                        with extras_file.open("r") as F:
-                            extras_columns_pairs = self._read_header_lines(F, sep=sep)
-                        extra_columns = defaultdict(list)
-                        for name, typ in extras_columns_pairs:
-                            if name != "id":
-                                extra_columns[typ].append(name)
                     # the rest of the meta arguments will be replaced on the reload_all
                     # We use force_description=False so that beta and prod can be out-of-sync with respect to columns and/or descriptions
-                    self.create_table(tablename, search_columns, None, extra_columns=extra_columns, force_description=False)
+                    self.create_table(tablename, search_columns, None, force_description=False)
 
             for tablename in self.tablenames:
                 included = []
@@ -1150,13 +1099,10 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
                 extrafile = data_folder / (tablename + "_extras.txt")
                 if extrafile.exists():
-                    if table.extra_table is None:
-                        raise ValueError("Unexpected file %s" % extrafile)
-                    included.append(tablename + "_extras")
-                elif table.extra_table is None:
-                    extrafile = None
-                else:
-                    raise ValueError("Missing file %s" % extrafile)
+                    raise ValueError(
+                        "Unexpected file %s: extras tables are no longer supported; "
+                        "merge the extras columns into the search table file" % extrafile
+                    )
 
                 countsfile = data_folder / (tablename + "_counts.txt")
                 if countsfile.exists():
@@ -1187,7 +1133,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                         table,
                         (
                             searchfile,
-                            extrafile,
                             countsfile,
                             statsfile,
                             indexesfile,
