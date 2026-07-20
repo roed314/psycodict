@@ -69,7 +69,10 @@ def filter_sql_injection(clause, col, col_type, op, table):
     # since there's no way to distinguish them from integers
     # We also want to include periods as part of the word/number character set, since they can appear in floats
     FLOAT_RE = r"^((\d+([.]\d*)?)|([.]\d+))([eE][-+]?\d+)?$"
-    ARITH_RE = r"^[+*-/^()]+$"
+    # The hyphen must come first: written as [+*-/^()] the "*-/" is a
+    # character range covering * + , - . / , which let commas and periods
+    # through a whitelist that is applied to untrusted input from the UI.
+    ARITH_RE = r"^[-+*/^()]+$"
     processed = []
     values = []
     pieces = re.split(r"([A-Za-z_.0-9]+)", clause)

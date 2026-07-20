@@ -1,0 +1,107 @@
+# Shared setup for the jobs that run LMFDB's tests against this psycodict.
+#
+# Both the per-pull-request subset and the full release run need exactly the
+# same environment, and the thing most worth not duplicating is the devmirror
+# connection block: two copies of it would drift, and the failure mode of a
+# stale copy is a job that silently tests the wrong database.
+#
+# Expects psycodict to already be checked out at ./psycodict, and to be
+# running in a container that provides SageMath.
+
+name: Set up LMFDB against devmirror
+description: Check out LMFDB, install it, force in this psycodict, point it at the public mirror.
+
+inputs:
+  lmfdb-ref:
+    description: The LMFDB ref to test against.
+    required: false
+    default: main
+
+runs:
+  using: composite
+  steps:
+    - name: Check out LMFDB
+      uses: actions/checkout@v7
+      with:
+        repository: LMFDB/lmfdb
+        ref: ${{ inputs.lmfdb-ref }}
+        path: lmfdb
+
+    # LMFDB pins psycodict as `git+https://...`, which pip cannot fetch here:
+    # the SageMath image ships no git.  (actions/checkout papers over that by
+    # falling back to a tarball download, so the failure surfaces later, at
+    # pip.)  Dropping the line is the right fix rather than installing git,
+    # since the next step replaces that psycodict anyway -- this just stops us
+    # downloading a copy in order to throw it away.  It is the only git+
+    # requirement; LMFDB's own runtime use of git, in app.py's git_infos(),
+    # already degrades to "-" when the command is missing.
+    - name: Install LMFDB's dependencies
+      shell: bash
+      working-directory: lmfdb
+      run: |
+        if ! grep -q psycodict requirements.txt; then
+          echo "::error::LMFDB's requirements.txt no longer names psycodict; this step needs rewriting"
+          exit 1
+        fi
+        grep -v psycodict requirements.txt > ci-requirements.txt
+        sage -pip install -r ci-requirements.txt
+
+    # Editable, so that the next step can prove which psycodict is loaded by
+    # looking at the import path.  --no-deps because psycopg2 arrived with
+    # LMFDB's requirements and psycodict's own dependencies are all extras.
+    - name: Install psycodict from this checkout
+      shell: bash
+      run: sage -pip install --no-deps --force-reinstall -e ./psycodict
+
+    # Run from the LMFDB checkout, not the workspace root: the root holds a
+    # directory named psycodict/, which Python imports as a namespace package
+    # (__file__ is None) in preference to the installed one.  Checking from
+    # where the tests actually run is the honest check anyway.
+    - name: Verify the swap took effect
+      shell: bash
+      working-directory: lmfdb
+      run: |
+        sage -python - <<'PY'
+        import os
+        import psycodict
+        path = psycodict.__file__
+        print("psycodict imported from", path)
+        expected = os.path.realpath(os.path.join("..", "psycodict"))
+        assert path and os.path.realpath(path).startswith(expected + os.sep), (
+            "LMFDB is running some other psycodict than this checkout's: %r" % (path,)
+        )
+        PY
+
+    # These are LMFDB's own defaults, written explicitly so that the job does
+    # not depend on the default surviving.  The keepalives are there because
+    # devmirror is reached over the open internet and a dropped connection is
+    # otherwise a spurious failure.
+    - name: Point LMFDB at the public mirror
+      shell: bash
+      working-directory: lmfdb
+      run: |
+        cat > config.ini <<'EOF'
+        [core]
+        debug = False
+        restart = False
+        color = 19
+        [web]
+        port = 37777
+        bindip = 127.0.0.1
+        [logging]
+        logfile = flasklog
+        loglevel = 20
+        slowcutoff = 10.0
+        slowlogfile = slow_queries.log
+        editor =
+        [postgresql]
+        host = devmirror.lmfdb.xyz
+        port = 5432
+        user = lmfdb
+        password = lmfdb
+        dbname = lmfdb
+        keepalives = 1
+        keepalives_idle = 30
+        keepalives_interval = 10
+        keepalives_count = 5
+        EOF

@@ -1,0 +1,249 @@
+# Downstream regression tests.
+#
+# psycodict's own suite only exercises tables it creates itself, which cannot
+# catch a change that is fine in isolation but breaks the projects built on
+# it.  These jobs run psycodict from the pull request against real consumers:
+#
+#   devmirror  psycodict alone against LMFDB's public database -- 190-odd
+#              tables of real data, no SageMath, about a minute
+#   lmfdb      a subset of LMFDB's own test suite, run under SageMath against
+#              the same mirror
+#   seminars   the researchseminars.org test suite against a local PostgreSQL
+#
+# devmirror.lmfdb.xyz is a public read-only replica (see LMFDB's
+# GettingStarted.md); the credentials below are documented, not secrets, so
+# these jobs work on forks and from pull requests.  Nothing here writes to it.
+
+name: Downstream
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # Monday 06:00 UTC, so that breakage caused by a downstream project
+    # changing under us is noticed even when psycodict is quiet.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  # devmirror is a shared community resource; never leave superseded runs
+  # hammering it.
+  group: downstream-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  devmirror:
+    name: LMFDB devmirror (no sage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e ".[pgbinary,test]"
+
+      - name: Query the LMFDB mirror
+        env:
+          PSYCODICT_TEST_DEVMIRROR: "1"
+        run: pytest tests/test_devmirror.py -v --durations=10
+
+  # Which SageMath to run LMFDB under is LMFDB's decision, not ours: their
+  # .environment.yml pins the version their own CI validates against.  Reading
+  # it here rather than pinning a number keeps us testing the configuration
+  # they support, and stays right when they bump it.  Testing against
+  # sagemath:latest instead means testing whether LMFDB works on unreleased
+  # Sage, which fails for reasons no psycodict change can cause -- as it did:
+  # latest currently tracks 10.10 betas, where LMFDB's hypergeometric motive
+  # code hits 'GaloisGroup_v2_with_category' object has no attribute 'group'.
+  lmfdb-sage:
+    name: Resolve SageMath version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: LMFDB/lmfdb
+          ref: main
+          path: lmfdb
+      - id: resolve
+        run: |
+          version=$(grep -oE 'sage=[0-9.]+' lmfdb/.environment.yml | head -1 | cut -d= -f2)
+          if [ -z "$version" ]; then
+            echo "::error::could not read the sage pin from LMFDB's .environment.yml"
+            exit 1
+          fi
+          echo "LMFDB pins SageMath $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  lmfdb:
+    name: LMFDB test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: lmfdb-sage
+    # LMFDB requires SageMath, which is far too slow to build and awkward to
+    # install from conda here; the upstream image is the cheap way in.
+    container:
+      image: sagemath/sagemath:${{ needs.lmfdb-sage.outputs.version }}
+      options: --user root
+    steps:
+      - name: Check out psycodict
+        uses: actions/checkout@v7
+        with:
+          path: psycodict
+
+      - name: Set up LMFDB against devmirror
+        uses: ./psycodict/.github/actions/lmfdb-env
+
+      # The unit jobs run these same files without Sage; this is the only job
+      # with Sage on the path, so it is where the SAGE_MODE half of the
+      # encoding layer -- sage Integers, LmfdbRealLiteral round-trips -- gets
+      # exercised.  Database-free, a few seconds.
+      - name: Run psycodict's database-free tests under Sage
+        working-directory: psycodict
+        run: sage -python -m pytest tests/test_encoding.py tests/test_utils.py tests/test_config.py -v
+
+      # A subset chosen for psycodict signal per second rather than coverage
+      # of LMFDB: test_utils fires ~80 queries across ~20 tables and calls
+      # stats.numstats; test_api walks /api/<table> for 21 tables across every
+      # database; test_random_redirects hits PostgresSearchTable.random on 28
+      # tables; the last two render raw database rows through psycodict's type
+      # conversion.  Measured against the live mirror: 51 passed, 2 skipped,
+      # about four and a half minutes.
+      #
+      # This is the cheap check that belongs in a pull request's feedback
+      # loop.  The whole suite runs in lmfdb-full.yml, which gates releases.
+      #
+      # Deliberately excluded: test_homepage.py and test_workshoplinks.py make
+      # real outbound HTTP requests to third-party sites.
+      - name: Run the LMFDB subset
+        working-directory: lmfdb
+        run: |
+          sage -python -m pytest -v --durations=20 \
+            lmfdb/api/test_api.py \
+            lmfdb/tests/test_utils.py \
+            lmfdb/tests/test_root.py \
+            lmfdb/tests/test_random_redirects.py \
+            lmfdb/local_fields/test_localfields.py \
+            lmfdb/galois_groups/test_galoisgroup.py
+
+  seminars:
+    name: seminars (researchseminars.org)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: seminars_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out psycodict
+        uses: actions/checkout@v7
+        with:
+          path: psycodict
+
+      - name: Check out seminars
+        uses: actions/checkout@v7
+        with:
+          repository: roed314/seminars
+          ref: master
+          path: seminars
+
+      # seminars/users/__init__.py imports distutils, which was removed in
+      # 3.12; setuptools' shim covers it, but 3.11 avoids the question.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # seminars pins psycodict by git URL; drop that line so pip cannot
+      # reinstall it over the copy under test.
+      - name: Install seminars' dependencies
+        working-directory: seminars
+        # pygments is imported by seminars/api/main.py but missing from its
+        # requirements.txt, so seminars.website will not import without it.
+        # setuptools supplies the distutils shim that seminars/users needs on
+        # Python 3.12+, and costs nothing on 3.11.
+        run: |
+          if ! grep -q psycodict requirements.txt; then
+            echo "::error::seminars' requirements.txt no longer names psycodict; this step needs rewriting"
+            exit 1
+          fi
+          grep -v psycodict requirements.txt > ci-requirements.txt
+          python -m pip install -r ci-requirements.txt pygments setuptools
+
+      - name: Install psycodict from this pull request
+        # Quoted: the brackets are a glob pattern to the shell otherwise.
+        run: python -m pip install -e "./psycodict[pgbinary]"
+
+      # From the seminars checkout, for the same reason as the LMFDB job: the
+      # workspace root holds a psycodict/ directory that would shadow the
+      # installed package as a namespace package.
+      - name: Verify the swap took effect
+        working-directory: seminars
+        run: |
+          python - <<'PY'
+          import os
+          import psycodict
+          path = psycodict.__file__
+          print("psycodict imported from", path)
+          expected = os.path.realpath(os.path.join("..", "psycodict"))
+          assert path and os.path.realpath(path).startswith(expected + os.sep), (
+              "seminars is running some other psycodict than this pull request's: %r" % (path,)
+          )
+          PY
+
+      - name: Configure seminars
+        working-directory: seminars
+        run: |
+          python seminars/config.py \
+            --postgresql-host 127.0.0.1 --postgresql-port 5432 \
+            --postgresql-user postgres --postgresql-pass postgres \
+            --postgresql-dbname seminars_ci
+
+      # seminars connects with a plain PostgresDatabase(), which requires the
+      # meta tables to exist already; create=True is psycodict's own
+      # bootstrap, so this doubles as a test of it.
+      - name: Bootstrap the meta tables
+        working-directory: seminars
+        run: |
+          python - <<'PY'
+          from psycodict.config import Configuration
+          from psycodict.database import PostgresDatabase
+          config = Configuration(defaults={"config_file": "config.ini"}, readargs=False)
+          PostgresDatabase(config=config, create=True)
+          print("meta tables ready")
+          PY
+
+      - name: Bootstrap the seminars schema
+        working-directory: seminars
+        run: python ../psycodict/.github/downstream/seminars_schema.py
+
+      - name: Exercise seminars against psycodict
+        working-directory: seminars
+        run: python ../psycodict/.github/downstream/seminars_check.py
+
+      # This is the whole of seminars' own CI, kept because it is cheap.
+      - name: pyflakes
+        working-directory: seminars
+        run: |
+          python -m pip install pyflakes
+          pyflakes .
