@@ -1315,7 +1315,10 @@ class PostgresSearchTable(PostgresTable):
             # a temporary hack FIXME
             # maxid = self.max('id')
             maxid = self.max_id()
-            if maxid == 0:
+            # max_id returns -1 on an empty table (MAX(id) is NULL), so
+            # testing for 0 sent an empty table into randint(0, -1);
+            # anything below 1 means there are no rows.
+            if maxid < 1:
                 return None
             # a temporary hack FIXME
             minid = self.min_id()
