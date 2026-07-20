@@ -814,11 +814,6 @@ def test_create_constraint_refuses_to_mix_search_and_extra_columns(table_factory
         table.create_constraint(["label", "notes"], "unique")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='create_constraint accepts type "NOT NULL" but the statement builders '
-           'only recognise the misspelled "NON NULL", so no SQL is generated',
-)
 def test_create_constraint_not_null(db, empty_table):
     empty_table.create_constraint(["n"], "not null")
     cur = db._execute(
