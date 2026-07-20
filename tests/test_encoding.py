@@ -346,24 +346,25 @@ def test_copy_dumps_rejects_unsupported_types():
     assert "Invalid input" in message and "set" in message and "integer" in message
 
 
-@pytest.mark.xfail(strict=True, reason="array elements are quoted only when they "
-                                       "contain braces, so commas, empty strings, "
-                                       "leading spaces and the literal NULL are "
-                                       "misparsed by Postgres")
 @pytest.mark.parametrize("value,expected", [
-    (["a,b"], '{"a,b"}'),       # currently {a,b}: two elements
-    ([""], '{""}'),             # currently {}: the empty array
-    ([" a"], '{" a"}'),         # currently { a}: Postgres trims the space
-    (["NULL"], '{"NULL"}'),     # currently {NULL}: an SQL NULL
+    (["a,b"], '{"a,b"}'),       # unquoted, the comma would split the element
+    ([""], '{""}'),             # unquoted, this would be the empty array
+    ([" a"], '{" a"}'),         # unquoted, Postgres would trim the space
+    (["NULL"], '{"NULL"}'),     # unquoted, this would be an SQL NULL
+    # backslashes and double quotes are escaped once for the array parser and
+    # once more for COPY's field-level unescaping, while a tab is a plain
+    # character to the array parser and escaped only at the field level
+    (['he said "hi"'], r'{"he said \\\"hi\\\""}'),
+    (["back\\slash"], r'{"back\\\\slash"}'),
+    (["tab\there"], r'{"tab\there"}'),
 ])
 def test_copy_dumps_quotes_array_elements_that_need_it(value, expected):
     assert copy_dumps(value, "text[]") == expected
 
 
-@pytest.mark.xfail(strict=True, reason="a None inside an array is written as the "
-                                       "field-level marker \\N, which COPY "
-                                       "unescapes to the letter N, not NULL")
 def test_copy_dumps_writes_null_array_elements_as_null():
+    # the field-level marker \N would be unescaped by COPY to the letter N,
+    # so inside an array a None must become the array literal NULL
     assert copy_dumps([None, 1], "integer[]") == "{NULL,1}"
 
 
