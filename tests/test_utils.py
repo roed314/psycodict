@@ -266,23 +266,15 @@ def test_identifier_wrapper_rejects_unbalanced_brackets():
     "name[1:10]; --",
 ])
 def test_identifier_wrapper_rejects_non_numeric_slicers(name):
-    # The exact type is wrong (see the xfail below), but nothing gets through.
-    with pytest.raises((ValueError, TypeError)):
+    with pytest.raises(ValueError):
         IdentifierWrapper(name)
 
 
-@pytest.mark.xfail(strict=True, reason="the rejection branch raises TypeError, not "
-                                       "ValueError: its message '% is must be "
-                                       "numeric...' contains a '% i' conversion "
-                                       "that chokes on the string argument")
 def test_identifier_wrapper_rejects_non_numeric_slicers_with_value_error():
     with pytest.raises(ValueError):
         IdentifierWrapper("name[1];DROP TABLE x]")
 
 
-@pytest.mark.xfail(strict=True, reason="empty slice bounds are documented in the "
-                                       "docstring but rejected, because ''.isdigit() "
-                                       "is False")
 @pytest.mark.parametrize("name,slicer", [
     ("name[:10]", "[:10]"),
     ("name[1:10:3][0::1]", "[2:10:3][1::1]"),
