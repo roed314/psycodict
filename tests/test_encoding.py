@@ -257,6 +257,22 @@ def test_json_roundtrips_times_without_microseconds():
     assert Json.loads(Json.dumps(noon)) == noon
 
 
+@pytest.mark.parametrize("value", [
+    datetime.datetime(2020, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc),
+    datetime.datetime(2020, 1, 2, 3, 4, 5, 6,
+                      tzinfo=datetime.timezone(datetime.timedelta(hours=5, minutes=30))),
+    datetime.time(12, 30, tzinfo=datetime.timezone.utc),
+    datetime.time(23, 59, 59, 999999,
+                  tzinfo=datetime.timezone(datetime.timedelta(hours=-8))),
+])
+def test_json_roundtrips_timezone_aware_values(value):
+    # prep serializes aware values with their UTC offset (str() keeps it);
+    # extract must parse that too, offset preserved, not just the naive forms
+    decoded = Json.loads(Json.dumps(value))
+    assert decoded == value
+    assert decoded.utcoffset() == value.utcoffset()
+
+
 # ---------------------------------------------------------------------------
 # copy_dumps
 # ---------------------------------------------------------------------------

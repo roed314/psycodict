@@ -392,14 +392,14 @@ class Json(pgJson):
                 prec = infinity if obj["prec"] == "inf" else int(obj["prec"])
                 return base[[obj["vname"]]]([cls._extract(base, c) for c in obj["data"]], prec=prec)
             elif len(obj) == 2 and "__date__" in obj:
-                return datetime.datetime.strptime(obj["data"], "%Y-%m-%d").date()
+                return datetime.date.fromisoformat(obj["data"])
             elif len(obj) == 2 and "__time__" in obj:
-                # prep omits the microseconds when they are zero
-                fmt = "%H:%M:%S.%f" if "." in obj["data"] else "%H:%M:%S"
-                return datetime.datetime.strptime(obj["data"], fmt).time()
+                # prep writes str(obj), which is isoformat with the space
+                # separator; fromisoformat parses every shape that produces --
+                # with or without microseconds, naive or timezone-aware.
+                return datetime.time.fromisoformat(obj["data"])
             elif len(obj) == 2 and "__datetime__" in obj:
-                fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in obj["data"] else "%Y-%m-%d %H:%M:%S"
-                return datetime.datetime.strptime(obj["data"], fmt)
+                return datetime.datetime.fromisoformat(obj["data"])
         if isinstance(obj, dict):
             return {k: cls.extract(v) for k, v in obj.items()}
         return obj
