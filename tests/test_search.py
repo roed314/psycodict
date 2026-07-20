@@ -598,13 +598,17 @@ def test_numeric_and_float_roundtrip(filled_table, nullable_table):
     # int/float without Sage, Integer/LmfdbRealLiteral with it, and never
     # Decimal in either mode.
     if SAGE_MODE:
+        from sage.rings.integer import Integer
+
         from psycodict.encoding import LmfdbRealLiteral
 
         assert isinstance(fractional["num"], LmfdbRealLiteral)
+        assert isinstance(integral["num"], Integer)
+        assert isinstance(fractional["mat"][1], Integer)
     else:
         assert isinstance(integral["num"], int)
         assert isinstance(fractional["num"], float)
-    assert not isinstance(fractional["mat"][1], float)
+        assert isinstance(fractional["mat"][1], int)
 
 
 def test_nulls_are_omitted_from_results(nullable_table, monkeypatch):
