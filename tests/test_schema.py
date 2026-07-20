@@ -849,11 +849,6 @@ def test_reload_indexes_records_a_new_history_version(empty_table, tmp_path, his
     assert list(empty_table.list_indexes()) == [empty_table.search_table + "_label"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_revert_meta passes the table and column arguments to format() in the "
-           "wrong order, producing SELECT <hist table> FROM <column list>",
-)
 def test_revert_indexes_restores_the_previous_version(empty_table, tmp_path, hist_cleanup):
     hist_cleanup.append(empty_table.search_table)
     empty_table.create_index(["label"])
