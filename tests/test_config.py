@@ -148,8 +148,6 @@ def test_the_config_file_wins_over_defaults(paths):
     assert config.options["postgresql"]["host"] == "filehost"
 
 
-@pytest.mark.xfail(strict=True, reason="config.py reads defaults['postgres_password'], "
-                                       "not 'postgresql_password'")
 def test_postgresql_password_default_is_honoured(paths):
     config = Configuration(
         defaults=dict(paths, postgresql_password="hunter2"), readargs=False
