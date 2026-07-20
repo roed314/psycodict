@@ -245,7 +245,7 @@ class PostgresSearchTable(PostgresTable):
         elif isinstance(value, dict) and len(value) == 1 and "$raw" in value:
             # We support queries like {'abvar_count':{'$lte':{'$raw':'q^g'}}}
             if key in postgres_infix_ops:
-                cmd, value = filter_sql_injection(value, col, col_type, postgres_infix_ops[key], self)
+                cmd, value = filter_sql_injection(value["$raw"], col, col_type, postgres_infix_ops[key], self)
             else:
                 raise ValueError("Error building query: {0} (in $raw)".format(key))
         elif key in ["$in", "$nin"] and col_type == "jsonb" and any(isinstance(v, (dict, list)) for v in value):
