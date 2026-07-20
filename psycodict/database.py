@@ -1221,6 +1221,71 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 table = self[tablename]
                 table.cleanup_from_reload()
 
+    def _get_queries(self):
+        """
+        The queries currently running in this database, excluding this
+        connection's own, as (pid, duration, username, query) tuples in
+        starting order (oldest first).
+        """
+        return list(self._execute(SQL(
+            "SELECT pid, age(clock_timestamp(), query_start), usename, query "
+            "FROM pg_stat_activity "
+            "WHERE state = 'active' AND datname = current_database() "
+            "AND pid != pg_backend_pid() ORDER BY query_start"
+        ), silent=True))
+
+    def show_queries(self):
+        """
+        Prints the queries currently running in this database (which may be
+        holding the locks shown by ``show_locks``; see ``show_blocked`` for
+        statements that are stuck behind them).
+        """
+        for pid, duration, user, query in self._get_queries():
+            print("pid %s  %s  %s  %s" % (pid, duration, user, " ".join(query.split())))
+
+    def _get_blocked(self):
+        """
+        Statements waiting on locks held by other sessions, as tuples
+        (blocked_pid, blocked_user, blocking_pid, blocking_user,
+        blocked_statement, blocking_statement).
+        """
+        return list(self._execute(SQL(
+            "SELECT blocked_locks.pid AS blocked_pid, "
+            "blocked_activity.usename AS blocked_user, "
+            "blocking_locks.pid AS blocking_pid, "
+            "blocking_activity.usename AS blocking_user, "
+            "blocked_activity.query AS blocked_statement, "
+            "blocking_activity.query AS current_statement_in_blocking_process "
+            "FROM pg_catalog.pg_locks blocked_locks "
+            "JOIN pg_catalog.pg_stat_activity blocked_activity "
+            "ON blocked_activity.pid = blocked_locks.pid "
+            "JOIN pg_catalog.pg_locks blocking_locks "
+            "ON blocking_locks.locktype = blocked_locks.locktype "
+            "AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database "
+            "AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation "
+            "AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page "
+            "AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple "
+            "AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid "
+            "AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid "
+            "AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid "
+            "AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid "
+            "AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid "
+            "AND blocking_locks.pid != blocked_locks.pid "
+            "JOIN pg_catalog.pg_stat_activity blocking_activity "
+            "ON blocking_activity.pid = blocking_locks.pid "
+            "WHERE NOT blocked_locks.granted"
+        ), silent=True))
+
+    def show_blocked(self):
+        """
+        Prints the statements that are waiting on locks held by other
+        sessions, together with the sessions holding them.
+        """
+        for bpid, buser, gpid, guser, bquery, gquery in self._get_blocked():
+            print("pid %s (%s) blocked on pid %s (%s)" % (bpid, buser, gpid, guser))
+            print("  waiting: %s" % " ".join(bquery.split()))
+            print("  blocker: %s" % " ".join(gquery.split()))
+
     def show_locks(self):
         """
         Prints information on all locks currently held on any table.
