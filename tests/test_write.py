@@ -12,7 +12,7 @@ no write path updates unless ``stats.saving`` is on; see
 ``test_count_with_empty_query_matches_number_of_rows`` for that bug.
 """
 import pytest
-from psycopg2 import IntegrityError
+from psycopg import IntegrityError
 
 from conftest import sample_row
 from psycodict.utils import DelayCommit

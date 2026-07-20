@@ -3,14 +3,17 @@ import random
 import time
 from itertools import islice
 
-from psycopg2.extensions import cursor as pg_cursor
-
-from psycopg2.sql import SQL, Identifier, Literal, Composed
+from psycopg import Cursor, ServerCursor
+from psycopg.sql import SQL, Identifier, Literal, Composed
 
 from .base import number_types
 from .table import PostgresTable
 from .encoding import Json
 from .utils import IdentifierWrapper, DelayCommit, filter_sql_injection, postgres_infix_ops
+
+# psycopg3 splits plain and server-side cursors into two classes
+# (psycopg2 had a single cursor class, which this name used to alias)
+pg_cursor = (Cursor, ServerCursor)
 
 
 class PostgresSearchTable(PostgresTable):
@@ -111,13 +114,23 @@ class PostgresSearchTable(PostgresTable):
         if col_type == "smallint[]" and key in ["$contains", "$containedin"]:
             # smallint[] requires a typecast to test containment
             return "::int[]"
-        if col_type.endswith("[]") and key in ["$eq", "$ne", "$contains", "$containedin"]:
+        if col_type.endswith("[]") and key in ["$eq", "$ne", "$contains", "$containedin", "$overlaps"]:
             if isinstance(col, Identifier):
                 return "::" + col_type
             else:
                 # Selected a path
                 return "::" + col_type[:-2]
         return ""
+
+    def _any_cast(self, col_type):
+        """
+        A placeholder for an array parameter in an ANY(...) clause, cast to
+        the column's array type when the type name is known and safe to
+        interpolate.  See the comment at the $in branch of _parse_special.
+        """
+        if col_type and col_type.replace(" ", "").isalnum():
+            return "%s::" + col_type + "[]"
+        return "%s"
 
     def _parse_special(self, key, value, col, col_type):
         """
@@ -263,13 +276,17 @@ class PostgresSearchTable(PostgresTable):
                     # jsonb_path_ops modifiers for the GIN index doesn't support this query
                     cmd = SQL("{0} <@ %s")
                 else: # Note that array types are handled at the beginning of the function
-                    cmd = SQL("{0} = ANY(%s)")
+                    # We cast the array parameter to the column's type: psycopg3
+                    # picks the smallest integer type for the parameter array,
+                    # and comparing e.g. an integer column against ANY(smallint[])
+                    # is several times slower than the same-type comparison.
+                    cmd = SQL("{0} = ANY(" + self._any_cast(col_type) + ")")
             elif key == "$nin":
                 if col_type == "jsonb":
                     # jsonb_path_ops modifiers for the GIN index doesn't support this query
                     cmd = SQL("NOT ({0} <@ %s)")
                 else:
-                    cmd = SQL("NOT ({0} = ANY(%s))")
+                    cmd = SQL("NOT ({0} = ANY(" + self._any_cast(col_type) + "))")
             elif key == "$contains":
                 cmd = SQL("{0} @> %s")
                 if col_type != "jsonb":
@@ -362,7 +379,11 @@ class PostgresSearchTable(PostgresTable):
         if outer is not None and not isinstance(D, dict):
             if outer_type == "jsonb":
                 D = Json(D)
-            return SQL("{0} = %s").format(outer), [D]
+            # The typecast matters for array columns: psycopg3 picks its own
+            # element type for a list parameter (e.g. smallint[]), and there
+            # is no equality operator between arrays of different types.
+            cmd = "{0} = %s" + self._create_typecast("$eq", D, outer, outer_type)
+            return SQL(cmd).format(outer), [D]
         if len(D) == 0:
             return None, None
         else:
@@ -547,7 +568,7 @@ class PostgresSearchTable(PostgresTable):
 
         INPUT:
 
-        - ``cur`` -- a psycopg2 cursor
+        - ``cur`` -- a psycopg cursor
         - ``search_cols`` -- the columns in the results
         - ``projection`` -- the projection requested.
         - ``query`` -- the dictionary specifying the query (optional, only used for slow query print statements)
@@ -579,7 +600,7 @@ class PostgresSearchTable(PostgresTable):
             if isinstance(cur, pg_cursor):
                 cur.close()
                 if (
-                    cur.withhold # to assure that it is a buffered cursor
+                    getattr(cur, "withhold", False) # to assure that it is a buffered (server side) cursor
                     and self._db._nocommit_stack == 0 # and there is nothing to commit
                 ):
                     cur.connection.commit()
@@ -985,15 +1006,20 @@ class PostgresSearchTable(PostgresTable):
         def qualify(qstr, tbl, op=False):
             # Have to fully qualify the identifiers by adding table name
             if isinstance(qstr, Composed):
-                return Composed([qualify(part, tbl, op=op) for part in qstr.seq])
+                # iterate rather than access .seq: Composed is iterable in
+                # both drivers, while .seq was psycopg2-only
+                return Composed([qualify(part, tbl, op=op) for part in qstr])
             elif isinstance(qstr, Identifier):
-                if qstr.string in tbl.search_cols:
+                # psycopg3's Identifier has no public accessor for its name
+                # (psycopg2 had .string); _obj is its stable internal tuple
+                colname = qstr._obj[-1]
+                if colname in tbl.search_cols:
                     tbl = tbl.search_table
                 else:
-                    raise ValueError("%s not column of %s" % (qstr.string, tbl.search_table))
+                    raise ValueError("%s not column of %s" % (colname, tbl.search_table))
                 alltables.add(tbl)
                 if op:
-                    return Identifier(f"{tbl}.{qstr.string}")
+                    return Identifier(f"{tbl}.{colname}")
                 else:
                     return Identifier(tbl) + SQL(".") + qstr
             else:

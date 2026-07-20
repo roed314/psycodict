@@ -6,8 +6,7 @@ and decoding the results.
 import binascii
 import json
 import datetime
-from psycopg2.extras import Json as pgJson
-from psycopg2.extensions import adapt, ISQLQuote
+from psycopg.adapt import Dumper
 try:
     from sage.all import ceil
     try:
@@ -65,6 +64,24 @@ else:
         def __str__(self):
             return self.getquoted()
 
+    class RealLiteralDumper(Dumper):
+        """
+        Dumps a Sage RealNumber/RealLiteral as its literal text, leaving the
+        type unknown (oid 0) so that the server infers it from context,
+        as psycopg2's client-side interpolation did.
+        """
+        def dump(self, obj):
+            if isinstance(obj, RealLiteral):
+                return obj.literal.encode()
+            return str(obj).encode()
+
+    class SageIntegerDumper(Dumper):
+        """
+        Dumps a Sage Integer as its decimal text (replacing psycopg2's AsIs).
+        """
+        def dump(self, obj):
+            return str(obj).encode()
+
 
 def numeric_converter(value, cur=None):
     """
@@ -106,33 +123,62 @@ class Array():
 
     def __init__(self, seq):
         self._seq = seq
-        self._conn = None
-
-    def __conform__(self, protocol):
-        if protocol == ISQLQuote:
-            return self
-        else:
-            raise NotImplementedError
-
-    def prepare(self, conn):
-        self._conn = conn
 
     def getquoted(self):
-        # this is the important line: note how every object in the
-        # list is adapted and then how getquoted() is called on it
-        pobjs = [adapt(o) for o in self._seq]
-        if self._conn is not None:
-            for obj in pobjs:
-                if hasattr(obj, "prepare"):
-                    obj.prepare(self._conn)
-        qobjs = [o.getquoted() for o in pobjs]
-        return b"ARRAY[" + b", ".join(qobjs) + b"]"
+        return _pg_array_literal(self._seq).encode()
 
     def __str__(self):
         return str(self.getquoted())
 
 
-class Json(pgJson):
+def _pg_array_literal(seq):
+    """
+    Render a (possibly nested) Python sequence as a Postgres array literal,
+    e.g. ``{1,2,{"a","b"}}``.  Sent with unknown oid so that the server
+    infers the array type from context.
+    """
+    parts = []
+    for x in seq:
+        if x is None:
+            parts.append("NULL")
+        elif isinstance(x, (list, tuple)):
+            parts.append(_pg_array_literal(x))
+        elif isinstance(x, bool):
+            parts.append("t" if x else "f")
+        elif isinstance(x, (int, float)):
+            parts.append(str(x))
+        else:
+            s = str(x).replace("\\", "\\\\").replace('"', '\\"')
+            parts.append('"' + s + '"')
+    return "{" + ",".join(parts) + "}"
+
+
+class ArrayDumper(Dumper):
+    """
+    Dumps an Array wrapper as a Postgres array literal with unknown oid.
+    """
+    def dump(self, obj):
+        return _pg_array_literal(obj._seq).encode()
+
+
+class Json():
+    """
+    A wrapper marking a value for storage as json/jsonb, encoded with
+    psycodict's extended encoding (Sage types etc.).
+
+    With psycopg2 this subclassed ``psycopg2.extras.Json``; with psycopg3
+    adaptation happens through ``JsonWrapperDumper`` below instead.  The
+    wrapped value is available as both ``.obj`` (psycopg3 convention) and
+    ``.adapted`` (psycopg2 convention, kept for backward compatibility).
+    """
+
+    def __init__(self, obj):
+        self.obj = obj
+        self.adapted = obj
+
+    def __repr__(self):
+        return "%s(%r)" % (type(self).__name__, self.obj)
+
     @classmethod
     def dumps(cls, obj):
         return json.dumps(cls.prep(obj))
@@ -403,6 +449,26 @@ class Json(pgJson):
         if isinstance(obj, dict):
             return {k: cls.extract(v) for k, v in obj.items()}
         return obj
+
+
+class JsonWrapperDumper(Dumper):
+    """
+    Dumps a ``Json`` wrapper as its json text.  We leave the oid unknown
+    (0) rather than declaring json/jsonb, matching psycopg2's behavior of
+    interpolating an untyped quoted literal so that the server casts by
+    context (this works for both json and jsonb columns).
+    """
+    def dump(self, obj):
+        return Json.dumps(obj.obj).encode()
+
+
+class DictJsonDumper(Dumper):
+    """
+    Dumps a plain dict as json text with unknown oid (psycopg2 behavior via
+    ``register_adapter(dict, Json)``).
+    """
+    def dump(self, obj):
+        return Json.dumps(obj).encode()
 
 
 def copy_dumps(inp, typ, recursing=False):

@@ -13,7 +13,7 @@ import uuid
 
 import pytest
 
-from psycopg2.sql import SQL, Identifier
+from psycopg.sql import SQL, Identifier
 
 from psycodict.base import (
     _meta_tables_cols,
