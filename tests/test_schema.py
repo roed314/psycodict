@@ -427,11 +427,6 @@ def test_create_table_like_can_copy_data_and_indexes(db, transient):
     assert target + "_label" in copy._list_built_indexes()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="create_table_like does not pass the source id_type on to create_table, "
-           "so an integer id is silently widened to bigint",
-)
 def test_create_table_like_preserves_id_type(db, transient):
     source = fresh_name()
     db.create_table(
