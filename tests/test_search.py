@@ -652,10 +652,6 @@ def test_random_sample_ratio_bounds(filled_table):
         filled_table.random_sample(1.5, projection="n")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="random_sample rebinds `repeatable` to an SQL object before calling int(repeatable)",
-)
 def test_random_sample_repeatable(filled_table):
     first = list(filled_table.random_sample(0.5, projection="n", mode="bernoulli", repeatable=42))
     second = list(filled_table.random_sample(0.5, projection="n", mode="bernoulli", repeatable=42))

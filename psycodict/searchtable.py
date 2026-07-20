@@ -1385,8 +1385,11 @@ class PostgresSearchTable(PostgresTable):
                 repeatable = SQL("")
                 values = [100 * ratio]
             else:
-                repeatable = SQL(" REPEATABLE %s")
+                # The seed must be read before repeatable is rebound to the
+                # SQL fragment (int() of an SQL object was a TypeError), and
+                # the grammar requires parentheses: REPEATABLE (seed).
                 values = [100 * ratio, int(repeatable)]
+                repeatable = SQL(" REPEATABLE (%s)")
             qstr, qvalues = self._parse_dict(query)
             if qstr is None:
                 qstr = SQL("")
