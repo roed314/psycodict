@@ -736,11 +736,6 @@ def test_drop_pkeys_and_restore_pkeys_round_trip(db, empty_table):
     assert db._constraint_exists(name + "_pkey", name)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="drop_indexes calls drop_index on the constraints it finds instead of "
-           "drop_constraint, which postgres refuses for a constraint's own index",
-)
 def test_drop_indexes_drops_indexes_and_constraints(empty_table):
     empty_table.create_index(["label"])
     empty_table.create_constraint(["n"], "unique")

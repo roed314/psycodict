@@ -566,7 +566,11 @@ class PostgresTable(PostgresBase):
             for res in self._indexes_touching(columns):
                 self.drop_index(res[0], suffix, permanent=permanent)
             for res in self._constraints_touching(columns):
-                self.drop_index(res[0], suffix, permanent=permanent)
+                # These are constraints, so dropping them as indexes fails:
+                # Postgres refuses to drop an index that implements a
+                # constraint.  Compare restore_indexes, which restores the
+                # two kinds separately.
+                self.drop_constraint(res[0], suffix, permanent=permanent)
 
     def restore_indexes(self, columns=[], suffix=""):
         """
