@@ -98,10 +98,6 @@ def test_search_projection_dict(filled_table):
     assert sorted(excluded[0]) == ["flag", "label", "n", "num", "x"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_parse_projection pops entries out of the caller's projection dict, so it cannot be reused",
-)
 def test_search_projection_dict_is_not_mutated(filled_table):
     projection = {"label": True, "n": True}
     filled_table.search({"n": 3}, projection, limit=1)
