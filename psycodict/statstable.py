@@ -305,6 +305,24 @@ class PostgresStatsTable(PostgresBase):
         for col in self.table.search_cols:
             self._slow_count({col: None}, suffix=suffix, extra=False)
 
+    def _set_total(self, total, suffix=""):
+        """
+        Set the total number of rows in the search table, both on this object
+        and in meta_tables.
+
+        Unlike the statistics and counts tables, the total is maintained on
+        every write path regardless of ``saving``, since ``count()`` with an
+        empty query is answered from it; ``saving`` only controls whether the
+        total is *also* recorded in the counts table.  Compare ``_break_stats``,
+        which likewise writes meta_tables unconditionally.
+        """
+        total = max(0, total)
+        self.total = total
+        updater = SQL("UPDATE meta_tables SET total = %s WHERE name = %s")
+        self._execute(updater, [total, self.search_table], silent=True)
+        if self.saving:
+            self._record_count({}, total, suffix=suffix)
+
     def _slow_count(self, query, split_list=False, record=True, suffix="", extra=True):
         """
         No shortcuts: actually count the rows in the search table.
@@ -415,7 +433,6 @@ class PostgresStatsTable(PostgresBase):
                 Identifier(self.search_table),
                 qstr,
             )
-            print(selecter)
             cur = self._execute(selecter, values)
             return {tuple(rec[1:]): int(rec[0]) for rec in cur}
 
@@ -664,13 +681,17 @@ class PostgresStatsTable(PostgresBase):
         )
         selecter = base_selecter + SQL("LIMIT 1")
         cur = self._execute(selecter, values)
-        m = cur.fetchone()[0]
+        # With no matching rows there is no row to fetch at all (fetchone()
+        # returns None), and the statistic is None.
+        row = cur.fetchone()
+        m = None if row is None else row[0]
         if m is None and kind == "max":
             # the default order ends with NULLs, so we now have to use NULLS LAST,
             # preventing the use of indexes.
             selecter = base_selecter + SQL("NULLS LAST LIMIT 1")
             cur = self._execute(selecter, values)
-            m = cur.fetchone()[0]
+            row = cur.fetchone()
+            m = None if row is None else row[0]
         return m
 
     def _record_statistic(self, col, ccols, cvals, m, kind="max"):
@@ -726,6 +747,10 @@ class PostgresStatsTable(PostgresBase):
         m = self._quick_statistic(col, ccols, cvals, kind="max")
         if m is None:
             m = self._slow_statistic(col, constraint, kind="max")
+            if m is None:
+                # The docstring's promised error, deliberately, rather than
+                # the TypeError that used to escape from fetchone().
+                raise ValueError("no non-null values of %s in %s" % (col, self.search_table))
             if record and self.saving:
                 self._record_statistic(col, ccols, cvals, m, kind="max")
         return m
@@ -755,6 +780,10 @@ class PostgresStatsTable(PostgresBase):
         m = self._quick_statistic(col, ccols, cvals, kind="min")
         if m is None:
             m = self._slow_statistic(col, constraint, kind="min")
+            if m is None:
+                # The docstring's promised error, deliberately, rather than
+                # the TypeError that used to escape from fetchone().
+                raise ValueError("no non-null values of %s in %s" % (col, self.search_table))
             if record and self.saving:
                 self._record_statistic(col, ccols, cvals, m, kind="min")
         return m
@@ -1583,7 +1612,7 @@ ORDER BY v.ord LIMIT %s"""
 
             if total:
                 # Refresh total in meta_tables
-                self.total = self._slow_count({}, suffix=suffix, extra=False)
+                self._set_total(self._slow_count({}, suffix=suffix, extra=False), suffix=suffix)
             self.refresh_null_counts(suffix=suffix)
             self.logger.info("Refreshed statistics in %.3f secs" % (time.time() - t0))
 

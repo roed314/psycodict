@@ -113,11 +113,6 @@ def test_insert_many_explicit_none_becomes_null(empty_table):
     assert empty_table.count({"flag": None}) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="insert_many wraps None in Json, storing jsonb 'null' rather than SQL NULL, "
-           "so the row cannot be found again with the documented {col: None} query",
-)
 def test_insert_many_none_in_jsonb_column_is_sql_null(empty_table):
     empty_table.insert_many([{"n": 1, "label": "a", "data": None}])
     assert empty_table.count({"data": None}) == 1
@@ -152,11 +147,6 @@ def test_insert_many_flags_do_not_change_the_result(empty_table):
     assert empty_table.search_table + "_pkey" in set(empty_table._list_built_indexes())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="insert_many replaces the jsonb values in the caller's dictionaries with "
-           "psycodict.encoding.Json wrappers, so the same list cannot be inserted twice",
-)
 def test_insert_many_does_not_wrap_the_callers_jsonb_values(empty_table):
     rows = [sample_row(0)]
     original = dict(rows[0]["data"])
@@ -525,11 +515,6 @@ def test_resort_is_a_disabled_noop(filled_table):
     assert [rec["n"] for rec in _all_rows(filled_table)][:5] == [0, 1, 2, 3, 4]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="rewrite() calls update_from_file(), which validates its label column by "
-           "comparing count_distinct(col) against the stale count(), and so rejects it",
-)
 def test_rewrite_applies_the_function_to_every_row(filled_table):
     def bump(record):
         record["num"] = record["n"] + 1
@@ -539,11 +524,7 @@ def test_rewrite_applies_the_function_to_every_row(filled_table):
     assert filled_table.lucky({"n": 5}, projection="num") == 6
 
 
-def test_rewrite_applies_the_function_when_the_total_is_accurate(filled_table):
-    # Repair the cached total first so that rewrite gets past the label check
-    # exercised by the xfail above; everything after that check works.
-    filled_table.stats.total = 200
-
+def test_rewrite_preserves_labels_and_row_count(filled_table):
     def bump(record):
         record["num"] = record["n"] + 1
         return record
@@ -555,8 +536,6 @@ def test_rewrite_applies_the_function_when_the_total_is_accurate(filled_table):
 
 
 def test_rewrite_can_restrict_to_a_query(filled_table):
-    filled_table.stats.total = 200
-
     def relabel(record):
         record["label"] = "picked"
         return record
@@ -663,10 +642,5 @@ def test_nested_delaycommit_only_commits_at_the_outermost_exit(db, empty_table):
 ##################################################################
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="every write path guards the total update behind `if self.stats.saving`, which "
-           "defaults to False, so count({}) keeps returning the stale meta_tables.total",
-)
 def test_count_with_empty_query_matches_number_of_rows(filled_table):
     assert filled_table.count({}) == 200

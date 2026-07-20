@@ -14,11 +14,10 @@ Second, ``add_stats`` and friends run entirely in Python and SQL; the sage
 imports that psycodict makes elsewhere are not needed, so these tests must
 pass in a plain (sage-free) interpreter -- which is also how CI runs them.
 """
-from decimal import Decimal
-
 import pytest
 
 from conftest import sample_row
+from psycodict.encoding import SAGE_MODE
 
 
 @pytest.fixture
@@ -54,21 +53,17 @@ def test_min_with_constraint(filled_table):
     assert filled_table.stats.min("n", constraint={"n": {"$gte": 50}}) == 50
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="max()/min() on an empty table raise TypeError: _aggregate does "
-           "`cur.fetchone()[0]` and fetchone() is None when nothing matched",
-)
-def test_max_on_empty_table(empty_table):
-    assert empty_table.stats.max("n") is None
+def test_max_on_empty_table_raises(empty_table):
+    # The docstring promises an error when there are no non-null values; it
+    # is now a deliberate ValueError rather than a TypeError escaping from
+    # fetchone() on an empty cursor.
+    with pytest.raises(ValueError, match="no non-null values"):
+        empty_table.stats.max("n")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="see test_max_on_empty_table; min() crashes the same way",
-)
-def test_min_on_empty_table(empty_table):
-    assert empty_table.stats.min("n") is None
+def test_min_on_empty_table_raises(empty_table):
+    with pytest.raises(ValueError, match="no non-null values"):
+        empty_table.stats.min("n")
 
 
 def test_sum_on_empty_table(empty_table):
@@ -87,10 +82,10 @@ def test_sum_with_constraint(filled_table):
 
 
 def test_sum_of_numeric_column_is_exact(filled_table):
-    # `num` is a numeric column, so the sum must come back as an exact
-    # Decimal rather than a float.
+    # `num` is a numeric column with integral values, so the sum must come
+    # back exactly (int without Sage, Integer with it) -- never as a float.
     total = filled_table.stats.sum("num")
-    assert total == Decimal(sum(i * 10 + 7 for i in range(200)))
+    assert total == sum(i * 10 + 7 for i in range(200))
     assert not isinstance(total, float)
 
 
@@ -122,12 +117,6 @@ def test_slow_count_sees_every_row(filled_table):
     assert filled_table.stats._slow_count({}, extra=False) == 200
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="count() returns the stale meta_tables.total: every write path "
-           "guards the total update behind `if self.stats.saving:`, which is "
-           "False by default, so a table filled through psycodict reports 0",
-)
 def test_count_unfiltered_reflects_inserted_rows(filled_table):
     assert filled_table.count() == 200
 
@@ -178,6 +167,7 @@ def test_add_stats_returns_true(filled_table):
     assert filled_table.stats.add_stats(["flag"]) is True
 
 
+@pytest.mark.skipif(SAGE_MODE, reason="asserts the sage-free code path")
 def test_add_stats_without_sage(filled_table):
     # add_stats used to import sage.all unconditionally, which made the whole
     # code path unusable in a plain interpreter.  Keep it honest.

@@ -566,7 +566,11 @@ class PostgresTable(PostgresBase):
             for res in self._indexes_touching(columns):
                 self.drop_index(res[0], suffix, permanent=permanent)
             for res in self._constraints_touching(columns):
-                self.drop_index(res[0], suffix, permanent=permanent)
+                # These are constraints, so dropping them as indexes fails:
+                # Postgres refuses to drop an index that implements a
+                # constraint.  Compare restore_indexes, which restores the
+                # two kinds separately.
+                self.drop_constraint(res[0], suffix, permanent=permanent)
 
     def restore_indexes(self, columns=[], suffix=""):
         """
@@ -680,7 +684,7 @@ class PostgresTable(PostgresBase):
         # We whitelisted the type and check function so the following is safe
         cols = SQL(", ").join(Identifier(col) for col in columns)
         # from SQL injection
-        if type == "NON NULL":
+        if type == "NOT NULL":
             return SQL("ALTER TABLE {0} ALTER COLUMN {1} SET NOT NULL").format(Identifier(table), cols)
         elif type == "UNIQUE":
             return SQL(
@@ -696,7 +700,7 @@ class PostgresTable(PostgresBase):
         """
         Utility function for making the drop constraint SQL statement.
         """
-        if type == "NON NULL":
+        if type == "NOT NULL":
             return SQL("ALTER TABLE {0} ALTER COLUMN {1} DROP NOT NULL").format(
                 Identifier(table), Identifier(columns[0])
             )
@@ -736,8 +740,8 @@ class PostgresTable(PostgresBase):
             raise ValueError("%s not in list of approved check functions (edit db_backend to add)")
         if (check_func is None) == (type == "CHECK"):
             raise ValueError("check_func should specified just for CHECK constraints")
-        if type == "NON NULL" and len(columns) != 1:
-            raise ValueError("NON NULL only supports one column")
+        if type == "NOT NULL" and len(columns) != 1:
+            raise ValueError("NOT NULL only supports one column")
         search = None
         for col in columns:
             if col == "id":
@@ -1243,11 +1247,9 @@ class PostgresTable(PostgresBase):
                 #self._break_order()
                 self._break_stats()
                 nrows = cur.rowcount
-                if self.stats.saving:
-                    self.stats.total -= nrows
-                    self.stats._record_count({}, self.stats.total)
-                    if restat:
-                        self.stats.refresh_stats(total=False)
+                self.stats._set_total(self.stats.total - nrows)
+                if self.stats.saving and restat:
+                    self.stats.refresh_stats(total=False)
             aborted = False
         finally:
             self.log_db_change("delete", aborted=aborted, logid=logid, query=query, nrows=nrows)
@@ -1408,8 +1410,7 @@ class PostgresTable(PostgresBase):
                         )
                         self._execute(inserter, self._parse_values(dat))
                     self._break_order()
-                    if self.stats.saving:
-                        self.stats.total += 1
+                    self.stats._set_total(self.stats.total + 1)
                 self._break_stats()
             aborted = False
             return new_row, row_id
@@ -1456,8 +1457,10 @@ class PostgresTable(PostgresBase):
                 search_cols = set(search_cols)
                 extra_cols = set(extra_cols)
             else:
-                # we don't want to alter the input
-                search_data = data[:]
+                # We don't want to alter the input: the loop below adds an id
+                # and wraps jsonb values, so each row dict must be a copy, not
+                # a reference (a shallow copy of the list is not enough).
+                search_data = [dict(D) for D in data]
                 search_cols = set(data[0])
             with DelayCommit(self):
                 jsonb_cols = [col for col, typ in self.col_type.items() if typ == "jsonb"]
@@ -1466,7 +1469,10 @@ class PostgresTable(PostgresBase):
                         raise ValueError("All dictionaries must have the same set of keys")
                     SD["id"] = self.max_id() + i + 1
                     for col in jsonb_cols:
-                        if col in SD:
+                        # None must stay None: wrapping it in Json would store
+                        # the jsonb value 'null' rather than SQL NULL, and the
+                        # documented {col: None} query could never match it.
+                        if col in SD and SD[col] is not None:
                             SD[col] = Json(SD[col])
                 cases = [(self.search_table, search_data)]
                 if self.extra_table is not None:
@@ -1475,7 +1481,7 @@ class PostgresTable(PostgresBase):
                             raise ValueError("All dictionaries must have the same set of keys")
                         ED["id"] = self.max_id() + i + 1
                         for col in jsonb_cols:
-                            if col in ED:
+                            if col in ED and ED[col] is not None:
                                 ED[col] = Json(ED[col])
                     cases.append((self.extra_table, extra_data))
                 now = time.time()
@@ -1498,11 +1504,9 @@ class PostgresTable(PostgresBase):
                 if reindex:
                     self.restore_pkeys()
                     self.restore_indexes(search_cols)
-                if self.stats.saving:
-                    self.stats.total += len(search_data)
-                    self.stats._record_count({}, self.stats.total)
-                    if restat:
-                        self.stats.refresh_stats(total=False)
+                self.stats._set_total(self.stats.total + len(search_data))
+                if self.stats.saving and restat:
+                    self.stats.refresh_stats(total=False)
             aborted = False
         finally:
             self.log_db_change("insert_many", aborted=aborted, logid=logid, nrows=len(search_data))
@@ -1880,6 +1884,10 @@ class PostgresTable(PostgresBase):
                 self.reload_meta(metafile, sep=sep)
             if ordered:
                 self._set_ordered()
+            # The swapped-in table's row count bears no relation to the old
+            # total, so recount and store it before the reinitialization
+            # below reads meta_tables.
+            self.stats._set_total(self.stats._slow_count({}, record=False))
 
         # Reinitialize object
         tabledata = self._execute(
@@ -2072,11 +2080,9 @@ class PostgresTable(PostgresBase):
                 if reindex:
                     self.restore_indexes()
                 self._break_stats()
-                if self.stats.saving:
-                    if restat:
-                        self.stats.refresh_stats(total=False)
-                    self.stats.total += search_count
-                    self.stats._record_count({}, self.stats.total)
+                if self.stats.saving and restat:
+                    self.stats.refresh_stats(total=False)
+                self.stats._set_total(self.stats.total + search_count)
             aborted = False
         finally:
             self.log_db_change("copy_from", logid=logid, aborted=aborted, nrows=search_count)
@@ -2418,7 +2424,9 @@ class PostgresTable(PostgresBase):
                     self._out_of_order = True
                     self.resort()
                 else:
-                    updater = SQL("UPDATE meta_tables SET (has_extras) = (%s) WHERE name = %s")
+                    # Not the parenthesized form: for a single column,
+                    # PostgreSQL 10+ requires a sub-SELECT or ROW() there.
+                    updater = SQL("UPDATE meta_tables SET has_extras = %s WHERE name = %s")
                     self._execute(updater, [True, self.search_table])
                 self.extra_table = self.search_table + "_extras"
                 col_type = [("id", self.col_type["id"])]
@@ -2456,14 +2464,25 @@ class PostgresTable(PostgresBase):
                     typ = self.col_type[col]
                     self._check_col_datatype(typ)
                     col_type.append((col, typ))
-                self.extra_cols = []
+                # Keep the object's own bookkeeping in step with the schema
+                # change: the moved columns are now extra columns, not search
+                # columns.  (extra_cols used to be left empty here.)
+                self.extra_cols = [col for col, typ in col_type[1:]]
+                self.search_cols = [col for col in self.search_cols if col not in columns]
                 col_type_SQL = SQL(", ").join(
                     SQL("{0} %s" % typ).format(Identifier(col)) for col, typ in col_type
                 )
                 creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(self.extra_table), col_type_SQL, self._tablespace_clause())
                 self._execute(creator)
                 if columns:
-                    self.drop_constraints(columns)
+                    # The moved columns are dropped from the search table
+                    # below, so indexes and constraints referencing them
+                    # cannot survive; dropping them through psycodict keeps
+                    # meta_indexes/meta_constraints in sync, where the DROP
+                    # COLUMN would remove them behind our back.  (This used
+                    # to call drop_constraints/restore_constraints, methods
+                    # that have never existed.)
+                    self.drop_indexes(columns)
                     try:
                         try:
                             transfer_file = tempfile.NamedTemporaryFile("w", delete=False)
@@ -2478,11 +2497,10 @@ class PostgresTable(PostgresBase):
                             with open(transfer_file.name) as F:
                                 cur.copy_from(F, self.extra_table, columns=["id"] + columns, sep=sep)
                         finally:
-                            transfer_file.unlink(transfer_file.name)
+                            os.unlink(transfer_file.name)
                     except Exception:
                         self.conn.rollback()
                         raise
-                    self.restore_constraints(columns)
                     for col in columns:
                         modifier = SQL("ALTER TABLE {0} DROP COLUMN {1}").format(
                             Identifier(self.search_table), Identifier(col)
@@ -2493,7 +2511,13 @@ class PostgresTable(PostgresBase):
                     self._execute(sequencer)
                     updater = SQL("UPDATE {0} SET id = nextval('tmp_id')").format(Identifier(self.extra_table))
                     self._execute(updater)
-                self.restore_pkeys()
+                # Only the new extras table needs a primary key; restore_pkeys
+                # would try to add one to the search table too, which still
+                # has its own.
+                self._execute(SQL("ALTER TABLE {0} ADD CONSTRAINT {1} PRIMARY KEY (id)").format(
+                    Identifier(self.extra_table),
+                    Identifier(self.extra_table + "_pkey"),
+                ))
             aborted = False
         finally:
             self.log_db_change("create_extra_table", logid=logid, aborted=aborted, columns=columns)
