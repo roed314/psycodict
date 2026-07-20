@@ -310,9 +310,6 @@ def test_query_log_filter_only_passes_records_from_base(pathname, expected):
     assert QueryLogFilter().filter(log_record(pathname)) == expected
 
 
-@pytest.mark.xfail(strict=True, reason="the filter tests pathname.endswith('base.py'), "
-                                       "which is also true of psycodict's own "
-                                       "database.py")
 def test_query_log_filter_does_not_match_database_py():
     assert QueryLogFilter().filter(log_record("/opt/psycodict/database.py")) == 0
 

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import os.path
 import sys
 import re
 from collections import defaultdict
@@ -174,7 +175,7 @@ class QueryLogFilter():
     """
 
     def filter(self, record):
-        if record.pathname.endswith("base.py"):
+        if os.path.basename(record.pathname) == "base.py":
             return 1
         else:
             return 0
