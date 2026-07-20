@@ -222,29 +222,55 @@ def test_json_prep_escape_backslashes():
     assert Json.prep(original, escape_backslashes=True) == r'a\tb\\c\"d\ne\rf'
 
 
-@pytest.mark.xfail(strict=True, reason="Json.prep recurses but Json.extract only "
-                                       "decodes the top level, so nested special "
-                                       "types do not survive a round trip")
 @pytest.mark.parametrize("obj", [{"a": 1 + 2j}, [[1 + 2j]]])
 def test_json_roundtrips_nested_special_types(obj):
+    # extract recurses into lists and dicts just as prep does
     assert Json.loads(Json.dumps(obj)) == obj
 
 
-@pytest.mark.xfail(strict=True, reason="datetime.datetime is a subclass of "
-                                       "datetime.date and prep tests for date "
-                                       "first, so datetimes are tagged __date__ "
-                                       "and then fail to parse back")
+@pytest.mark.skipif(not SAGE_MODE, reason="needs SageMath")
+def test_with_sage_json_roundtrips_nested_sage_types():
+    from sage.all import QQ, RealField, vector
+
+    for obj in [
+        # a top-level Rational exercises the extract branch that must not
+        # pass the denominator to Rational as its base argument
+        QQ(3) / 7,
+        {"r": QQ(3) / 7},
+        {"v": vector(QQ, [1, QQ(1) / 2])},
+        {"outer": [{"deep": RealField(100)("1.5")}]},
+    ]:
+        assert Json.loads(Json.dumps(obj)) == obj
+
+
 def test_json_roundtrips_datetimes():
+    # datetime.datetime is a subclass of datetime.date, so prep has to
+    # dispatch on datetime first for the __datetime__ tag to be reachable
     stamp = datetime.datetime(2020, 1, 2, 3, 4, 5, 6)
     assert Json.loads(Json.dumps(stamp)) == stamp
 
 
-@pytest.mark.xfail(strict=True, reason="extract parses __time__ with '%H:%M:%S.%f', "
-                                       "which rejects the microsecond-free string "
-                                       "that prep writes")
 def test_json_roundtrips_times_without_microseconds():
+    # prep writes no fractional part when the microseconds are zero, and
+    # extract accepts both spellings
     noon = datetime.time(12, 30)
     assert Json.loads(Json.dumps(noon)) == noon
+
+
+@pytest.mark.parametrize("value", [
+    datetime.datetime(2020, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc),
+    datetime.datetime(2020, 1, 2, 3, 4, 5, 6,
+                      tzinfo=datetime.timezone(datetime.timedelta(hours=5, minutes=30))),
+    datetime.time(12, 30, tzinfo=datetime.timezone.utc),
+    datetime.time(23, 59, 59, 999999,
+                  tzinfo=datetime.timezone(datetime.timedelta(hours=-8))),
+])
+def test_json_roundtrips_timezone_aware_values(value):
+    # prep serializes aware values with their UTC offset (str() keeps it);
+    # extract must parse that too, offset preserved, not just the naive forms
+    decoded = Json.loads(Json.dumps(value))
+    assert decoded == value
+    assert decoded.utcoffset() == value.utcoffset()
 
 
 # ---------------------------------------------------------------------------

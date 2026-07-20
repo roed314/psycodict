@@ -287,12 +287,13 @@ class Json(pgJson):
             )
         elif obj is None:
             return None
+        elif isinstance(obj, datetime.datetime):
+            # must come before the date branch, since datetime is a subclass of date
+            return {"__datetime__": 0, "data": "%s" % (obj)}
         elif isinstance(obj, datetime.date):
             return {"__date__": 0, "data": "%s" % (obj)}
         elif isinstance(obj, datetime.time):
             return {"__time__": 0, "data": "%s" % (obj)}
-        elif isinstance(obj, datetime.datetime):
-            return {"__datetime__": 0, "data": "%s" % (obj)}
         elif isinstance(obj, (str, bool, float, int)):
             return obj
         else:
@@ -317,6 +318,9 @@ class Json(pgJson):
         Takes an object extracted by the json parser and decodes the
         special-formating dictionaries used to store special types.
         """
+        # prep recurses into lists and dicts, so extract must too
+        if isinstance(obj, list):
+            return [cls.extract(x) for x in obj]
         if isinstance(obj, dict) and "data" in obj:
             if len(obj) == 2 and "__ComplexList__" in obj:
                 return [complex(*v) for v in obj["data"]]
@@ -338,7 +342,9 @@ class Json(pgJson):
                 return vector([cls._extract(base, v) for v in obj["data"]])
             elif len(obj) == 2 and "__Rational__" in obj:
                 assert SAGE_MODE
-                return Rational(*obj["data"])
+                # Rational's second positional argument is the base, so the
+                # [numerator, denominator] pair must be passed as one tuple
+                return Rational(tuple(obj["data"]))
             elif len(obj) == 3 and "__RealLiteral__" in obj and "prec" in obj:
                 assert SAGE_MODE
                 return LmfdbRealLiteral(RealField(obj["prec"]), obj["data"])
@@ -386,11 +392,16 @@ class Json(pgJson):
                 prec = infinity if obj["prec"] == "inf" else int(obj["prec"])
                 return base[[obj["vname"]]]([cls._extract(base, c) for c in obj["data"]], prec=prec)
             elif len(obj) == 2 and "__date__" in obj:
-                return datetime.datetime.strptime(obj["data"], "%Y-%m-%d").date()
+                return datetime.date.fromisoformat(obj["data"])
             elif len(obj) == 2 and "__time__" in obj:
-                return datetime.datetime.strptime(obj["data"], "%H:%M:%S.%f").time()
+                # prep writes str(obj), which is isoformat with the space
+                # separator; fromisoformat parses every shape that produces --
+                # with or without microseconds, naive or timezone-aware.
+                return datetime.time.fromisoformat(obj["data"])
             elif len(obj) == 2 and "__datetime__" in obj:
-                return datetime.datetime.strptime(obj["data"], "%Y-%m-%d %H:%M:%S.%f")
+                return datetime.datetime.fromisoformat(obj["data"])
+        if isinstance(obj, dict):
+            return {k: cls.extract(v) for k, v in obj.items()}
         return obj
 
 
