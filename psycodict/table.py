@@ -680,7 +680,7 @@ class PostgresTable(PostgresBase):
         # We whitelisted the type and check function so the following is safe
         cols = SQL(", ").join(Identifier(col) for col in columns)
         # from SQL injection
-        if type == "NON NULL":
+        if type == "NOT NULL":
             return SQL("ALTER TABLE {0} ALTER COLUMN {1} SET NOT NULL").format(Identifier(table), cols)
         elif type == "UNIQUE":
             return SQL(
@@ -696,7 +696,7 @@ class PostgresTable(PostgresBase):
         """
         Utility function for making the drop constraint SQL statement.
         """
-        if type == "NON NULL":
+        if type == "NOT NULL":
             return SQL("ALTER TABLE {0} ALTER COLUMN {1} DROP NOT NULL").format(
                 Identifier(table), Identifier(columns[0])
             )
@@ -736,8 +736,8 @@ class PostgresTable(PostgresBase):
             raise ValueError("%s not in list of approved check functions (edit db_backend to add)")
         if (check_func is None) == (type == "CHECK"):
             raise ValueError("check_func should specified just for CHECK constraints")
-        if type == "NON NULL" and len(columns) != 1:
-            raise ValueError("NON NULL only supports one column")
+        if type == "NOT NULL" and len(columns) != 1:
+            raise ValueError("NOT NULL only supports one column")
         search = None
         for col in columns:
             if col == "id":
