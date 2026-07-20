@@ -145,8 +145,8 @@ class PostgresTable(PostgresBase):
         self._include_nones = include_nones
         PostgresBase.__init__(self, search_table, db)
         self.col_type = {}
-        self.has_id = False
-        self.search_cols, self.col_type, self.has_id = self._column_types(search_table, data_types=data_types)
+        self._has_id = False
+        self.search_cols, self.col_type, self._has_id = self._column_types(search_table, data_types=data_types)
         self._set_sort(sort)
         self.stats = self._stats_table_class_(self, total)
 
@@ -879,7 +879,7 @@ class PostgresTable(PostgresBase):
         """
         This function can be overridden to support additional checks before changing data.
         To this end, it has a return value (defaulting to None) that is passed into the eventual
-        log_db_change in the functions that call this, and it takes a datafile as input to
+        _log_db_change in the functions that call this, and it takes a datafile as input to
         support checking the size on disk (nothing is done with this datafile by default).
         """
         if changetype in ["upsert", "update"]:
@@ -1085,7 +1085,7 @@ class PostgresTable(PostgresBase):
         - ``resort`` -- whether this table should be resorted after updating (default is to resort when the sort columns intersect the updated columns)
         - ``reindex`` -- only meaningful when ``inplace`` is set: whether to drop the indexes touching the updated columns before the update and recreate them afterward, which is faster when many rows change (by default this is done when more than 1000 rows are updated).  Without ``inplace``, all indexes are necessarily recreated on the replacement table, so ``reindex=True`` is redundant and ``reindex=False`` raises an error.
         - ``restat`` -- whether to recompute stats for the table
-        - ``logging`` -- a dictionary of keyword arguments for log_db_change
+        - ``logging`` -- a dictionary of keyword arguments for _log_db_change
         - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
         """
         self._forbid_reindex_false(reindex, inplace)
@@ -1197,7 +1197,7 @@ class PostgresTable(PostgresBase):
                 logging["aborted"] = False
                 print("Updated %s in %.3f secs" % (self.search_table, time.time() - now))
         finally:
-            self.log_db_change(**logging)
+            self._log_db_change(**logging)
 
     def delete(self, query, restat=True):
         """
@@ -1228,7 +1228,7 @@ class PostgresTable(PostgresBase):
                     self.stats.refresh_stats(total=False)
             aborted = False
         finally:
-            self.log_db_change("delete", aborted=aborted, logid=logid, query=query, nrows=nrows)
+            self._log_db_change("delete", aborted=aborted, logid=logid, query=query, nrows=nrows)
 
     def update(self, query, changes, resort=False, restat=True):
         """
@@ -1271,7 +1271,7 @@ class PostgresTable(PostgresBase):
                     self.stats.refresh_stats(total=False)
             aborted = False
         finally:
-            self.log_db_change("update", aborted=aborted, logid=logid, query=query, changes=changes)
+            self._log_db_change("update", aborted=aborted, logid=logid, query=query, changes=changes)
 
     def upsert(self, query, data):
         """
@@ -1371,7 +1371,7 @@ class PostgresTable(PostgresBase):
             aborted = False
             return new_row, row_id
         finally:
-            self.log_db_change("upsert", aborted=aborted, logid=logid, query=query, data=data)
+            self._log_db_change("upsert", aborted=aborted, logid=logid, query=query, data=data)
 
     def insert_many(self, data, resort=False, reindex=None, restat=True):
         """
@@ -1449,7 +1449,7 @@ class PostgresTable(PostgresBase):
                     self.stats.refresh_stats(total=False)
             aborted = False
         finally:
-            self.log_db_change("insert_many", aborted=aborted, logid=logid, nrows=len(search_data))
+            self._log_db_change("insert_many", aborted=aborted, logid=logid, nrows=len(search_data))
 
     def resort(self, suffix="", sort=None):
         """
@@ -1517,7 +1517,7 @@ class PostgresTable(PostgresBase):
             aborted = False
             return True
         finally:
-            self.log_db_change("resort", logid=logid, aborted=aborted, sort_order=sort_order)
+            self._log_db_change("resort", logid=logid, aborted=aborted, sort_order=sort_order)
 
     def _set_ordered(self):
         """
@@ -1779,7 +1779,7 @@ class PostgresTable(PostgresBase):
                 print("Reloaded %s in %.3f secs" % (self.search_table, time.time() - now_overall))
             aborted = False
         finally:
-            self.log_db_change(
+            self._log_db_change(
                 "reload",
                 logid=logid,
                 aborted=aborted,
@@ -1876,7 +1876,7 @@ class PostgresTable(PostgresBase):
             self._swap(tables, "", "_tmp")
             self._swap(tables, old, "")
             self._swap(tables, "_tmp", old)
-            self.log_db_change("reload_revert")
+            self._log_db_change("reload_revert")
         print(
             "Swapped backup %s with %s"
             % (self.search_table, "{0}_old{1}".format(self.search_table, backup_number))
@@ -1999,7 +1999,7 @@ class PostgresTable(PostgresBase):
                 self.stats._update_total(search_count)
             aborted = False
         finally:
-            self.log_db_change("copy_from", logid=logid, aborted=aborted, nrows=search_count)
+            self._log_db_change("copy_from", logid=logid, aborted=aborted, nrows=search_count)
 
     def copy_to(
         self,
@@ -2067,7 +2067,7 @@ class PostgresTable(PostgresBase):
                     cols = ["id"] + cols
                 if kwds:
                     raise TypeError("Unsupported copy_to options: %s" % ", ".join(kwds))
-                cur = self._db.cursor()
+                cur = self._db._cursor()
                 with open(filename, "w") as F:
                     try:
                         if write_header:
@@ -2161,7 +2161,7 @@ class PostgresTable(PostgresBase):
                     self.create_index(sort_index)
                 if self._id_ordered and resort:
                     self.resort()
-            self.log_db_change("set_sort", sort=sort)
+            self._log_db_change("set_sort", sort=sort)
 
     def set_label(self, label_col=None):
         """
@@ -2252,7 +2252,7 @@ class PostgresTable(PostgresBase):
                 self.column_description(name, description)
             aborted = False
         finally:
-            self.log_db_change("add_column", logid=logid, aborted=aborted, name=name, datatype=datatype)
+            self._log_db_change("add_column", logid=logid, aborted=aborted, name=name, datatype=datatype)
 
     def drop_column(self, name, force=False):
         """
@@ -2301,9 +2301,9 @@ class PostgresTable(PostgresBase):
             print("Column %s dropped" % (name))
             aborted = False
         finally:
-            self.log_db_change("drop_column", logid=logid, aborted=aborted, name=name)
+            self._log_db_change("drop_column", logid=logid, aborted=aborted, name=name)
 
-    def log_db_change(self, operation, logid=None, aborted=False, **data):
+    def _log_db_change(self, operation, logid=None, aborted=False, **data):
         """
         Log changes to search tables.
 
@@ -2312,7 +2312,7 @@ class PostgresTable(PostgresBase):
         - ``operation`` -- a string, explaining what operation was performed
         - ``**data`` -- any additional information to install in the logging table (will be stored as a json dictionary)
         """
-        self._db.log_db_change(operation, tablename=self.search_table, logid=logid, aborted=aborted, **data)
+        self._db._log_db_change(operation, tablename=self.search_table, logid=logid, aborted=aborted, **data)
 
     def set_importance(self, importance):
         """

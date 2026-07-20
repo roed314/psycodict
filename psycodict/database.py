@@ -139,7 +139,7 @@ class PostgresDatabase(PostgresBase):
         for obj in self._objects:
             obj.conn = conn
 
-    def register_object(self, obj):
+    def _register_object(self, obj):
         """
         The database holds references to tables, etc so that connections can be refreshed if they fail.
         """
@@ -309,7 +309,7 @@ class PostgresDatabase(PostgresBase):
     def __repr__(self):
         return "Interface to Postgres database"
 
-    def cursor(self, buffered=False):
+    def _cursor(self, buffered=False):
         """
         Returns a new cursor.
 
@@ -327,7 +327,7 @@ class PostgresDatabase(PostgresBase):
         else:
             return self.conn.cursor()
 
-    def log_db_change(self, operation, tablename=None, logid=None, aborted=False, **data):
+    def _log_db_change(self, operation, tablename=None, logid=None, aborted=False, **data):
         """
         By default we don't log changes (from updates, etc), but you can
         override this method if you want to do some logging.
@@ -405,25 +405,25 @@ class PostgresDatabase(PostgresBase):
         """
         self._grant("DELETE", table_name, users)
 
-    def is_read_only(self):
+    def _is_read_only(self):
         """
         Whether this instance of the database is read only.
         """
         return self._read_only
 
-    def can_read_write_knowls(self):
+    def _can_read_write_knowls(self):
         """
         Whether this instance of the database has permission to read and write to the knowl tables
         """
         return self._read_and_write_knowls
 
-    def can_read_write_userdb(self):
+    def _can_read_write_userdb(self):
         """
         Whether this instance of the database has permission to read and write to the user info tables.
         """
         return self._read_and_write_userdb
 
-    def is_alive(self):
+    def _is_alive(self):
         """
         Check that the connection to the database is active.
         """
@@ -674,7 +674,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 )
                 aborted = False
             finally:
-                table.log_db_change("create_table_like", logid=logid, aborted=aborted, new_name=new_name)
+                table._log_db_change("create_table_like", logid=logid, aborted=aborted, new_name=new_name)
         if indexes:
             for idata in table.list_indexes(verbose=False).values():
                 self[new_name].create_index(**idata)
@@ -840,7 +840,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         self.__dict__[name] = new_table
         self.tablenames.append(name)
         self.tablenames.sort()
-        self.log_db_change(
+        self._log_db_change(
             "create_table",
             tablename=name,
             name=name,

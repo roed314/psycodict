@@ -963,7 +963,7 @@ class PostgresStatsTable(PostgresBase):
         if threshold:
             msg += " (threshold=%s)" % threshold
         if tense == "now":
-            self.logger.info(msg)
+            self._logger.info(msg)
         else:
             print(msg)
 
@@ -1050,7 +1050,7 @@ class PostgresStatsTable(PostgresBase):
         jcol = Json([col])
         jcgcols = Json(sorted(ccols.adapted + grouping))
         if self._has_numstats(jcol, jcgcols, cvals, threshold, suffix=suffix):
-            self.logger.info("Numstats already exist")
+            self._logger.info("Numstats already exist")
             return
         now = time.time()
         with DelayCommit(self, silence=True):
@@ -1101,7 +1101,7 @@ class PostgresStatsTable(PostgresBase):
                 counts_to_add,
                 values_list=True,
             )
-        self.logger.info("Added numstats in %.3f secs" % (time.time() - now))
+        self._logger.info("Added numstats in %.3f secs" % (time.time() - now))
 
     def _has_numstats(self, jcol, cgcols, cvals, threshold, suffix=""):
         """
@@ -1166,7 +1166,7 @@ class PostgresStatsTable(PostgresBase):
         jcgcols = Json(sorted(ccols.adapted + grouping))
         jcol = Json([col])
         if not self._has_numstats(jcol, jcgcols, cvals, threshold):
-            self.logger.info("Missing numstats, adding them")
+            self._logger.info("Missing numstats, adding them")
             self.add_numstats(col, grouping, constraint, threshold)
             # raise ValueError("Missing numstats")
         values = [jcol, jcgcols]
@@ -1335,14 +1335,14 @@ class PostgresStatsTable(PostgresBase):
         Returns a boolean: whether any counts were stored.
         """
         if self._db._read_only:
-            self.logger.info("Read only mode, not recording stats")
+            self._logger.info("Read only mode, not recording stats")
             return
         if split_list and threshold is not None:
             raise ValueError("split_list and threshold not simultaneously supported")
         cols = sorted(cols)
         where, values, constraint, ccols, cvals, allcols = self._process_constraint(cols, constraint)
         if self._has_stats(Json(cols), ccols, cvals, threshold, split_list, suffix=suffix):
-            self.logger.info("Statistics already exist")
+            self._logger.info("Statistics already exist")
             return
         now = time.time()
         seen_one = False
@@ -1398,7 +1398,7 @@ class PostgresStatsTable(PostgresBase):
                         mx = val
 
             if not seen_one:
-                self.logger.info(
+                self._logger.info(
                     "No rows exceeded the threshold; returning after %.3f secs"
                     % (time.time() - now)
                 )
@@ -1442,7 +1442,7 @@ class PostgresStatsTable(PostgresBase):
                     + "db.{}.stats._clear_stats_counts()".format(self.search_table)
                     + " and rebuilding the stats more carefully."
                 )
-        self.logger.info("Added stats in %.3f secs" % (time.time() - now))
+        self._logger.info("Added stats in %.3f secs" % (time.time() - now))
         return True
 
     def _approx_most_common(self, col, n):
@@ -1616,7 +1616,7 @@ ORDER BY v.ord LIMIT %s"""
         - ``suffix`` -- appended to the table name when computing and storing stats.
             Used when reloading a table.
         """
-        self.logger.info("Refreshing statistics on %s" % self.search_table)
+        self._logger.info("Refreshing statistics on %s" % self.search_table)
         t0 = time.time()
         with DelayCommit(self, silence=True):
             # Determine the stats and counts currently recorded
@@ -1650,7 +1650,7 @@ ORDER BY v.ord LIMIT %s"""
                 # Refresh total in meta_tables
                 self._set_total(self._slow_count({}, suffix=suffix, extra=False), suffix=suffix)
             self.refresh_null_counts(suffix=suffix)
-            self.logger.info("Refreshed statistics in %.3f secs" % (time.time() - t0))
+            self._logger.info("Refreshed statistics in %.3f secs" % (time.time() - t0))
 
     def status(self, reset_None_to_1=False):
         """
