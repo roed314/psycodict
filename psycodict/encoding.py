@@ -468,15 +468,16 @@ def copy_dumps(inp, typ, recursing=False):
             elif subtyp != typ[:-2]:
                 raise ValueError("Array dimensions must be uniform")
         return "{" + ",".join(copy_dumps(x, subtyp, recursing=True) for x in inp) + "}"
+    elif typ == "boolean":
+        # must come before the numeric branch, since bool is a subclass of int
+        return "t" if inp else "f"
     elif SAGE_MODE and isinstance(inp, RealLiteral):
         return inp.literal
     elif isinstance(inp, (float, int)) or SAGE_MODE and isinstance(inp, (Integer, RealNumber)):
         return str(inp).replace("L", "")
-    elif typ == "boolean":
-        return "t" if inp else "f"
     elif isinstance(inp, (datetime.date, datetime.time, datetime.datetime)):
         return "%s" % (inp)
     elif typ == "bytea":
-        return r"\\x" + "".join(binascii.hexlify(c) for c in inp)
+        return r"\\x" + binascii.hexlify(inp).decode()
     else:
         raise TypeError("Invalid input %s (%s) for postgres type %s" % (inp, type(inp), typ))
