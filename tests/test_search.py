@@ -595,10 +595,6 @@ def test_random_with_query(filled_table):
     assert filled_table.random({"n": {"$lt": 5}}, pick_first="flag") in ["l0", "l1", "l2", "l3", "l4"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="random() on an empty table calls random.randint(0, -1) because max_id() returns -1 rather than 0",
-)
 def test_random_on_empty_table_returns_none(empty_table):
     assert empty_table.random() is None
 
