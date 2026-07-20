@@ -618,6 +618,26 @@ def test_create_extra_table_splits_off_an_extra_table(db, empty_table):
     assert meta_tables_row(db, empty_table.search_table)["has_extras"] is True
 
 
+def test_create_extra_table_migrates_constraints(db, empty_table):
+    # A constraint on a moved column must be dropped from the search table
+    # (whose classification depends on search_cols, so ordering matters) and
+    # recreated on the extras table.
+    from psycopg2.sql import SQL
+
+    empty_table.create_constraint(["x"], "unique", name="mig_c_x")
+    empty_table.create_extra_table(["x"])
+    (count,) = db._execute(
+        SQL(
+            "SELECT COUNT(*) FROM pg_constraint con "
+            "JOIN pg_class rel ON rel.oid = con.conrelid "
+            "WHERE con.conname = %s AND rel.relname = %s"
+        ),
+        ["mig_c_x", empty_table.extra_table],
+    ).fetchone()
+    assert count == 1
+    assert "mig_c_x" in empty_table.list_constraints()
+
+
 ##################################################################
 # Indexes                                                        #
 ##################################################################

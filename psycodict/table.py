@@ -1247,7 +1247,7 @@ class PostgresTable(PostgresBase):
                 #self._break_order()
                 self._break_stats()
                 nrows = cur.rowcount
-                self.stats._set_total(self.stats.total - nrows)
+                self.stats._update_total(-nrows)
                 if self.stats.saving and restat:
                     self.stats.refresh_stats(total=False)
             aborted = False
@@ -1410,7 +1410,7 @@ class PostgresTable(PostgresBase):
                         )
                         self._execute(inserter, self._parse_values(dat))
                     self._break_order()
-                    self.stats._set_total(self.stats.total + 1)
+                    self.stats._update_total(1)
                 self._break_stats()
             aborted = False
             return new_row, row_id
@@ -1457,9 +1457,10 @@ class PostgresTable(PostgresBase):
                 search_cols = set(search_cols)
                 extra_cols = set(extra_cols)
             else:
-                # We don't want to alter the input: the loop below adds an id
-                # and wraps jsonb values, so each row dict must be a copy, not
-                # a reference (a shallow copy of the list is not enough).
+                # The INSERT payload is a copy of each row: the documented
+                # API stamps the assigned id onto the caller's dictionaries
+                # (see the docstring), but the Json wrapping below is an
+                # implementation detail that must not leak into them.
                 search_data = [dict(D) for D in data]
                 search_cols = set(data[0])
             with DelayCommit(self):
@@ -1467,7 +1468,9 @@ class PostgresTable(PostgresBase):
                 for i, SD in enumerate(search_data):
                     if set(SD) != search_cols:
                         raise ValueError("All dictionaries must have the same set of keys")
-                    SD["id"] = self.max_id() + i + 1
+                    # Stamped on the caller's dictionary too -- the docstring
+                    # promises the input is updated with the assigned ids.
+                    SD["id"] = data[i]["id"] = self.max_id() + i + 1
                     for col in jsonb_cols:
                         # None must stay None: wrapping it in Json would store
                         # the jsonb value 'null' rather than SQL NULL, and the
@@ -1504,7 +1507,7 @@ class PostgresTable(PostgresBase):
                 if reindex:
                     self.restore_pkeys()
                     self.restore_indexes(search_cols)
-                self.stats._set_total(self.stats.total + len(search_data))
+                self.stats._update_total(len(search_data))
                 if self.stats.saving and restat:
                     self.stats.refresh_stats(total=False)
             aborted = False
@@ -2082,7 +2085,7 @@ class PostgresTable(PostgresBase):
                 self._break_stats()
                 if self.stats.saving and restat:
                     self.stats.refresh_stats(total=False)
-                self.stats._set_total(self.stats.total + search_count)
+                self.stats._update_total(search_count)
             aborted = False
         finally:
             self.log_db_change("copy_from", logid=logid, aborted=aborted, nrows=search_count)
@@ -2464,24 +2467,34 @@ class PostgresTable(PostgresBase):
                     typ = self.col_type[col]
                     self._check_col_datatype(typ)
                     col_type.append((col, typ))
-                # Keep the object's own bookkeeping in step with the schema
-                # change: the moved columns are now extra columns, not search
-                # columns.  (extra_cols used to be left empty here.)
-                self.extra_cols = [col for col, typ in col_type[1:]]
-                self.search_cols = [col for col in self.search_cols if col not in columns]
                 col_type_SQL = SQL(", ").join(
                     SQL("{0} %s" % typ).format(Identifier(col)) for col, typ in col_type
                 )
                 creator = SQL("CREATE TABLE {0} ({1}){2}").format(Identifier(self.extra_table), col_type_SQL, self._tablespace_clause())
                 self._execute(creator)
+                moved_constraints = []
                 if columns:
-                    # The moved columns are dropped from the search table
-                    # below, so indexes and constraints referencing them
-                    # cannot survive; dropping them through psycodict keeps
-                    # meta_indexes/meta_constraints in sync, where the DROP
-                    # COLUMN would remove them behind our back.  (This used
-                    # to call drop_constraints/restore_constraints, methods
-                    # that have never existed.)
+                    # Remember the constraints touching the moved columns so
+                    # that they can be recreated on the extras table once the
+                    # move is complete (the split check above guarantees all
+                    # their columns are moving).
+                    selecter = SQL(
+                        "SELECT constraint_name, type, columns, check_func "
+                        "FROM meta_constraints WHERE table_name = %s AND ({0})"
+                    ).format(SQL(" OR ").join(SQL("columns @> %s") * len(columns)))
+                    moved_constraints = list(self._execute(
+                        selecter,
+                        [self.search_table] + [Json(col) for col in columns],
+                        silent=True,
+                    ))
+                    # Indexes referencing the moved columns cannot survive at
+                    # all, and dropping through psycodict keeps meta_indexes
+                    # and meta_constraints in sync where the DROP COLUMN below
+                    # would remove things behind our back.  This must happen
+                    # while search_cols still lists the moved columns, since
+                    # that is how constraints are classified onto the search
+                    # table.  (This used to call drop_constraints and
+                    # restore_constraints, methods that have never existed.)
                     self.drop_indexes(columns)
                     try:
                         try:
@@ -2518,6 +2531,15 @@ class PostgresTable(PostgresBase):
                     Identifier(self.extra_table),
                     Identifier(self.extra_table + "_pkey"),
                 ))
+                # Update the object's bookkeeping only now that the physical
+                # move is done: constraint classification keys off search_cols,
+                # so changing it earlier would misdirect the drops above.
+                self.extra_cols = [col for col, typ in col_type[1:]]
+                self.search_cols = [col for col in self.search_cols if col not in columns]
+                # With the bookkeeping updated, recreation lands the saved
+                # constraints on the extras table.
+                for cname, ctype, ccols, cfunc in moved_constraints:
+                    self.create_constraint(ccols, ctype, name=cname, check_func=cfunc)
             aborted = False
         finally:
             self.log_db_change("create_extra_table", logid=logid, aborted=aborted, columns=columns)

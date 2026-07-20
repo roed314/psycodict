@@ -397,6 +397,17 @@ def test_delay_commit_silence_applies_to_the_database():
     owner = make_owner()
     with DelayCommit(owner, silence=True):
         assert owner._db._silenced is True
+    assert owner._db._silenced is False
+
+
+def test_delay_commit_inactive_does_not_silence():
+    # __exit__ only restores the flag when active, so an inactive DelayCommit
+    # must not set it either -- reload_all uses silence=True with active=False
+    # and used to leave the database silenced forever.
+    owner = make_owner()
+    with DelayCommit(owner, silence=True, active=False):
+        assert owner._db._silenced is False
+    assert owner._db._silenced is False
 
 
 # ---------------------------------------------------------------------------

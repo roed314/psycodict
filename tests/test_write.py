@@ -147,11 +147,16 @@ def test_insert_many_flags_do_not_change_the_result(empty_table):
     assert empty_table.search_table + "_pkey" in set(empty_table._list_built_indexes())
 
 
-def test_insert_many_does_not_wrap_the_callers_jsonb_values(empty_table):
-    rows = [sample_row(0)]
+def test_insert_many_updates_ids_but_not_values(empty_table):
+    # The documented contract, both halves: "the dictionaries will be updated
+    # with the ids of the inserted records" -- and with nothing else.  The
+    # jsonb values in particular must not come back wrapped in Json.
+    rows = [sample_row(0), sample_row(1)]
     original = dict(rows[0]["data"])
     empty_table.insert_many(rows)
     assert rows[0]["data"] == original
+    assert rows[1]["id"] == rows[0]["id"] + 1
+    assert empty_table.lucky({"id": rows[1]["id"]}, "n") == 1
 
 
 ##################################################################
