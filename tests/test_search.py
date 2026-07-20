@@ -312,10 +312,6 @@ def test_count_groupby(filled_table):
     assert filled_table.count({"n": {"$lt": 6}}, groupby=["flag"]) == {(True,): 2, (False,): 4}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="count(groupby=...) prints the SQL statement (debug print left in statstable.py)",
-)
 def test_count_groupby_does_not_print(filled_table, capsys):
     filled_table.count({"n": {"$lt": 6}}, groupby=["flag"])
     assert capsys.readouterr().out == ""
