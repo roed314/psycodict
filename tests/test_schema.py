@@ -522,11 +522,6 @@ def test_rename_table_renames_table_companions_and_meta(db, transient):
     assert db._index_exists(new + "_label", new)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="rename_table removes the old name from tablenames but leaves the stale "
-           "attribute on the database object (drop_table does delattr)",
-)
 def test_rename_table_removes_the_old_attribute(db, transient):
     old = fresh_name()
     db.create_table(old, conftest.COLUMNS, label_col="label", sort=["n"])
