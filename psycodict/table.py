@@ -1243,11 +1243,9 @@ class PostgresTable(PostgresBase):
                 #self._break_order()
                 self._break_stats()
                 nrows = cur.rowcount
-                if self.stats.saving:
-                    self.stats.total -= nrows
-                    self.stats._record_count({}, self.stats.total)
-                    if restat:
-                        self.stats.refresh_stats(total=False)
+                self.stats._update_total(-nrows)
+                if self.stats.saving and restat:
+                    self.stats.refresh_stats(total=False)
             aborted = False
         finally:
             self.log_db_change("delete", aborted=aborted, logid=logid, query=query, nrows=nrows)
@@ -1408,8 +1406,7 @@ class PostgresTable(PostgresBase):
                         )
                         self._execute(inserter, self._parse_values(dat))
                     self._break_order()
-                    if self.stats.saving:
-                        self.stats.total += 1
+                    self.stats._update_total(1)
                 self._break_stats()
             aborted = False
             return new_row, row_id
@@ -1498,11 +1495,9 @@ class PostgresTable(PostgresBase):
                 if reindex:
                     self.restore_pkeys()
                     self.restore_indexes(search_cols)
-                if self.stats.saving:
-                    self.stats.total += len(search_data)
-                    self.stats._record_count({}, self.stats.total)
-                    if restat:
-                        self.stats.refresh_stats(total=False)
+                self.stats._update_total(len(search_data))
+                if self.stats.saving and restat:
+                    self.stats.refresh_stats(total=False)
             aborted = False
         finally:
             self.log_db_change("insert_many", aborted=aborted, logid=logid, nrows=len(search_data))
@@ -1880,6 +1875,10 @@ class PostgresTable(PostgresBase):
                 self.reload_meta(metafile, sep=sep)
             if ordered:
                 self._set_ordered()
+            # The swapped-in table's row count bears no relation to the old
+            # total, so recount and store it before the reinitialization
+            # below reads meta_tables.
+            self.stats._set_total(self.stats._slow_count({}, record=False))
 
         # Reinitialize object
         tabledata = self._execute(
@@ -2072,11 +2071,9 @@ class PostgresTable(PostgresBase):
                 if reindex:
                     self.restore_indexes()
                 self._break_stats()
-                if self.stats.saving:
-                    if restat:
-                        self.stats.refresh_stats(total=False)
-                    self.stats.total += search_count
-                    self.stats._record_count({}, self.stats.total)
+                if self.stats.saving and restat:
+                    self.stats.refresh_stats(total=False)
+                self.stats._update_total(search_count)
             aborted = False
         finally:
             self.log_db_change("copy_from", logid=logid, aborted=aborted, nrows=search_count)
