@@ -143,8 +143,10 @@ def IdentifierWrapper(name, convert=True):
             raise ValueError("%s is not in the proper format" % knife)
         chunks = knife[1:-1].split("][")
         # Prevent SQL injection
-        if not all(all(x.isdigit() for x in chunk.split(":")) for chunk in chunks):
-            raise ValueError("% is must be numeric, brackets and colons" % knife)
+        # As in Python, an empty bound in a slice (e.g. [:10]) means open,
+        # but a bare index (no colon present) must be a number
+        if not all(all(x.isdigit() or (x == "" and ":" in chunk) for x in chunk.split(":")) for chunk in chunks):
+            raise ValueError("%s must be numeric, brackets and colons" % knife)
         if convert:
             for i, s in enumerate(chunks):
                 # each cut is of the format a:b:c
