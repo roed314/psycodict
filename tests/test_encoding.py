@@ -367,19 +367,13 @@ def test_copy_dumps_writes_null_array_elements_as_null():
     assert copy_dumps([None, 1], "integer[]") == "{NULL,1}"
 
 
-@pytest.mark.xfail(strict=True, reason="bool is a subclass of int, so booleans are "
-                                       "caught by the numeric branch and written as "
-                                       "True/False; the typ == 'boolean' branch is "
-                                       "unreachable for them (Postgres happens to "
-                                       "accept both spellings)")
 @pytest.mark.parametrize("value,expected", [(True, "t"), (False, "f")])
 def test_copy_dumps_booleans(value, expected):
+    # bool is a subclass of int, so the boolean branch has to come before
+    # the numeric one
     assert copy_dumps(value, "boolean") == expected
 
 
-@pytest.mark.xfail(strict=True, reason="the bytea branch calls binascii.hexlify on "
-                                       "each element of the input, which are ints "
-                                       "under Python 3, and joins bytes with str")
 def test_copy_dumps_bytea():
     assert copy_dumps(b"abc", "bytea") == r"\\x616263"
 
