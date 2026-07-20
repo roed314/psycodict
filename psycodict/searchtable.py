@@ -81,6 +81,9 @@ class PostgresSearchTable(PostgresTable):
         elif projection == 3:
             return tuple(["id"] + self.search_cols), tuple(self.extra_cols)
         elif isinstance(projection, dict):
+            # Work on a copy: the pops below would otherwise empty the
+            # caller's dictionary, making it single-use.
+            projection = dict(projection)
             projvals = {bool(val) for val in projection.values()}
             if len(projvals) > 1:
                 raise ValueError("You cannot both include and exclude.")
@@ -245,7 +248,7 @@ class PostgresSearchTable(PostgresTable):
         elif isinstance(value, dict) and len(value) == 1 and "$raw" in value:
             # We support queries like {'abvar_count':{'$lte':{'$raw':'q^g'}}}
             if key in postgres_infix_ops:
-                cmd, value = filter_sql_injection(value, col, col_type, postgres_infix_ops[key], self)
+                cmd, value = filter_sql_injection(value["$raw"], col, col_type, postgres_infix_ops[key], self)
             else:
                 raise ValueError("Error building query: {0} (in $raw)".format(key))
         elif key in ["$in", "$nin"] and col_type == "jsonb" and any(isinstance(v, (dict, list)) for v in value):
@@ -263,7 +266,11 @@ class PostgresSearchTable(PostgresTable):
                 cmd = SQL("{0} " + postgres_infix_ops[key] + " %s")
             # FIXME, we should do recursion with _parse_special
             elif key == "$maxgte":
-                cmd = SQL("array_max({0}) >= %s")
+                # Inline rather than array_max(): that function is a custom
+                # definition that exists on the LMFDB's servers but not on a
+                # stock PostgreSQL, and this subquery is exactly its body
+                # (which the planner inlines identically).
+                cmd = SQL("(SELECT max(unnested) FROM unnest({0}) AS unnested) >= %s")
             elif key == "$anylte":
                 cmd = SQL("%s >= ANY({0})")
             elif key == "$in": # This now handles scalar $in or jsonb $in
@@ -329,7 +336,13 @@ class PostgresSearchTable(PostgresTable):
             [3]
         """
 
-        return [Json(val) if self.col_type[key] == "jsonb" else val for key, val in D.items()]
+        # None stays None even for jsonb columns, so that it is stored as SQL
+        # NULL rather than the jsonb value 'null' (matching insert_many and
+        # copy_dumps, and making the documented {col: None} query work).
+        return [
+            Json(val) if self.col_type[key] == "jsonb" and val is not None else val
+            for key, val in D.items()
+        ]
 
     def _parse_dict(self, D, outer=None, outer_type=None):
         """
@@ -635,7 +648,13 @@ class PostgresSearchTable(PostgresTable):
                 asc = 1
             else:
                 col, asc = col
-            queries.sort(key=lambda Q: Q[col], reverse=(asc != 1))
+            try:
+                queries.sort(key=lambda Q: Q[col], reverse=(asc != 1))
+            except (KeyError, TypeError):
+                # A branch whose value for the sort column is a range clause
+                # (a dict) or absent has no natural position among the
+                # scalars, so settle for a deterministic order instead.
+                queries.sort(key=lambda Q: str(Q.get(col)), reverse=(asc != 1))
         return queries
 
     def _get_table_clause(self, extra_cols):
@@ -1315,7 +1334,10 @@ class PostgresSearchTable(PostgresTable):
             # a temporary hack FIXME
             # maxid = self.max('id')
             maxid = self.max_id()
-            if maxid == 0:
+            # max_id returns -1 on an empty table (MAX(id) is NULL), so
+            # testing for 0 sent an empty table into randint(0, -1);
+            # anything below 1 means there are no rows.
+            if maxid < 1:
                 return None
             # a temporary hack FIXME
             minid = self.min_id()
@@ -1385,8 +1407,11 @@ class PostgresSearchTable(PostgresTable):
                 repeatable = SQL("")
                 values = [100 * ratio]
             else:
-                repeatable = SQL(" REPEATABLE %s")
+                # The seed must be read before repeatable is rebound to the
+                # SQL fragment (int() of an SQL object was a TypeError), and
+                # the grammar requires parentheses: REPEATABLE (seed).
                 values = [100 * ratio, int(repeatable)]
+                repeatable = SQL(" REPEATABLE (%s)")
             qstr, qvalues = self._parse_dict(query)
             if qstr is None:
                 qstr = SQL("")

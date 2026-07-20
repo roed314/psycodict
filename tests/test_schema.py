@@ -427,11 +427,6 @@ def test_create_table_like_can_copy_data_and_indexes(db, transient):
     assert target + "_label" in copy._list_built_indexes()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="create_table_like does not pass the source id_type on to create_table, "
-           "so an integer id is silently widened to bigint",
-)
 def test_create_table_like_preserves_id_type(db, transient):
     source = fresh_name()
     db.create_table(
@@ -527,11 +522,6 @@ def test_rename_table_renames_table_companions_and_meta(db, transient):
     assert db._index_exists(new + "_label", new)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="rename_table removes the old name from tablenames but leaves the stale "
-           "attribute on the database object (drop_table does delattr)",
-)
 def test_rename_table_removes_the_old_attribute(db, transient):
     old = fresh_name()
     db.create_table(old, conftest.COLUMNS, label_col="label", sort=["n"])
@@ -620,11 +610,6 @@ def test_set_label_and_get_label(db, empty_table):
         empty_table.set_label("no_such_column")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="create_extra_table issues UPDATE meta_tables SET (has_extras) = (%s), "
-           "which postgres 10+ rejects for a single column",
-)
 def test_create_extra_table_splits_off_an_extra_table(db, empty_table):
     empty_table.create_extra_table(["data"])
     assert empty_table.extra_table == empty_table.search_table + "_extras"
@@ -693,11 +678,6 @@ def test_create_index_rejects_a_name_already_in_use(empty_table):
         empty_table.create_index(["n"], name=empty_table.search_table + "_label")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_check_restricted_suffix uses re.match instead of re.search, so the "
-           "_tmp/_oldN/_pkey suffix check never fires",
-)
 def test_create_index_rejects_restricted_suffixes(empty_table):
     with pytest.raises(ValueError):
         empty_table.create_index(["label"], name=empty_table.search_table + "_lbl_tmp")
@@ -736,11 +716,6 @@ def test_drop_pkeys_and_restore_pkeys_round_trip(db, empty_table):
     assert db._constraint_exists(name + "_pkey", name)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="drop_indexes calls drop_index on the constraints it finds instead of "
-           "drop_constraint, which postgres refuses for a constraint's own index",
-)
 def test_drop_indexes_drops_indexes_and_constraints(empty_table):
     empty_table.create_index(["label"])
     empty_table.create_constraint(["n"], "unique")
@@ -814,11 +789,6 @@ def test_create_constraint_refuses_to_mix_search_and_extra_columns(table_factory
         table.create_constraint(["label", "notes"], "unique")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='create_constraint accepts type "NOT NULL" but the statement builders '
-           'only recognise the misspelled "NON NULL", so no SQL is generated',
-)
 def test_create_constraint_not_null(db, empty_table):
     empty_table.create_constraint(["n"], "not null")
     cur = db._execute(
@@ -849,11 +819,6 @@ def test_reload_indexes_records_a_new_history_version(empty_table, tmp_path, his
     assert list(empty_table.list_indexes()) == [empty_table.search_table + "_label"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_revert_meta passes the table and column arguments to format() in the "
-           "wrong order, producing SELECT <hist table> FROM <column list>",
-)
 def test_revert_indexes_restores_the_previous_version(empty_table, tmp_path, hist_cleanup):
     hist_cleanup.append(empty_table.search_table)
     empty_table.create_index(["label"])

@@ -46,7 +46,5 @@ target-version = "py38"
 #   base.py:229      E741  logger alias named `l`
 #   base.py:1024     F841  `ordered` assigned from a call kept for its side
 #                          effect (_order_columns mutates its argument)
-#   database.py:586  F841  `search_order` assigned and never used
 "psycodict/base.py" = ["E741", "F841"]
-"psycodict/database.py" = ["F841"]
 

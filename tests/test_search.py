@@ -98,10 +98,6 @@ def test_search_projection_dict(filled_table):
     assert sorted(excluded[0]) == ["flag", "label", "n", "num", "x"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_parse_projection pops entries out of the caller's projection dict, so it cannot be reused",
-)
 def test_search_projection_dict_is_not_mutated(filled_table):
     projection = {"label": True, "n": True}
     filled_table.search({"n": 3}, projection, limit=1)
@@ -193,10 +189,6 @@ def test_search_info_inexact_count_above_cutoff(filled_table, monkeypatch):
     assert info["exact_count"] is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="info['number'] for the empty query is the stale meta_tables.total; see the stats.saving guard in table.py",
-)
 def test_search_info_number_for_empty_query(filled_table):
     info = {}
     filled_table.search({}, 0, limit=3, info=info)
@@ -245,10 +237,6 @@ def test_search_split_ors(filled_table):
         filled_table.search({"$or": [{"n": 1}]}, "n", split_ors=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_split_ors sorts the split queries by the raw clause value, which fails when a branch is a range dict",
-)
 def test_search_split_ors_with_range_clauses(filled_table):
     assert filled_table.search(
         {"$or": [{"n": {"$lt": 3}}, {"n": {"$gt": 197}}]}, "n", limit=10, split_ors=True
@@ -308,10 +296,6 @@ def test_count_with_query(filled_table):
     assert filled_table.count({"flag": True}) == 67
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="count() returns stale meta_tables.total; see the stats.saving guard in table.py",
-)
 def test_count_without_query(filled_table):
     assert filled_table.count({}) == 200
 
@@ -320,10 +304,6 @@ def test_count_groupby(filled_table):
     assert filled_table.count({"n": {"$lt": 6}}, groupby=["flag"]) == {(True,): 2, (False,): 4}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="count(groupby=...) prints the SQL statement (debug print left in statstable.py)",
-)
 def test_count_groupby_does_not_print(filled_table, capsys):
     filled_table.count({"n": {"$lt": 6}}, groupby=["flag"])
     assert capsys.readouterr().out == ""
@@ -362,8 +342,9 @@ def test_max_min_sum_with_constraint(filled_table):
 def test_max_error_cases(filled_table):
     with pytest.raises(ValueError):
         filled_table.max("not_a_column")
-    # documented: "Will raise an error if there are no non-null values"
-    with pytest.raises(TypeError):
+    # documented: "Will raise an error if there are no non-null values" --
+    # now a deliberate ValueError rather than an accidental TypeError.
+    with pytest.raises(ValueError, match="no non-null values"):
         filled_table.max("n", {"n": -1})
 
 
@@ -453,10 +434,6 @@ def test_query_raw(filled_table):
     assert filled_table.search({}, "n", raw="label = %s", raw_values=["l4"], limit=5) == [4]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a nested $raw passes the {'$raw': ...} dict to filter_sql_injection instead of its value",
-)
 def test_query_raw_nested_in_comparison(filled_table):
     # num = 10 * n + 7 < 11 * n exactly when n > 7
     assert filled_table.count({"num": {"$lt": {"$raw": "n*11"}}}) == 192
@@ -512,10 +489,6 @@ def test_array_anylte(filled_table):
     assert filled_table.count({"vec": {"$anylte": 0}}) == 40
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="$maxgte emits array_max(), a function that psycodict never creates",
-)
 def test_array_maxgte(filled_table):
     # max(vec) = n + 1
     assert filled_table.count({"vec": {"$maxgte": 200}}) == 1
@@ -569,10 +542,6 @@ def test_jsonb_exists(filled_table, nullable_table):
     assert nullable_table.count({"data": {"$exists": True}}) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="insert_many wraps jsonb values in Json unconditionally, so an explicit None is stored as the JSON value null rather than SQL NULL",
-)
 def test_jsonb_explicit_none_is_stored_as_sql_null(table_factory):
     table = table_factory()
     table.insert_many([{"n": 0, "label": "a", "data": None}])
@@ -587,15 +556,24 @@ def test_jsonb_explicit_none_is_stored_as_sql_null(table_factory):
 ##################################################################
 
 def test_numeric_and_float_roundtrip(filled_table, nullable_table):
+    from psycodict.encoding import SAGE_MODE
+
     integral = filled_table.lucky({"n": 3}, ["num", "mat", "x"])
     assert integral == {"num": 37, "mat": [3, 9], "x": 1.5}
-    assert isinstance(integral["num"], int)
     assert isinstance(integral["x"], float)
-    # numeric values are converted to int or float, never to Decimal
     fractional = nullable_table.lucky({"n": 0}, ["num", "mat", "x"])
     assert fractional == {"num": 1.25, "mat": [0.5, 2], "x": 0.5}
-    assert isinstance(fractional["num"], float)
-    assert isinstance(fractional["mat"][1], int)
+    # Integral numerics stay exact and fractional ones carry the digits --
+    # int/float without Sage, Integer/LmfdbRealLiteral with it, and never
+    # Decimal in either mode.
+    if SAGE_MODE:
+        from psycodict.encoding import LmfdbRealLiteral
+
+        assert isinstance(fractional["num"], LmfdbRealLiteral)
+    else:
+        assert isinstance(integral["num"], int)
+        assert isinstance(fractional["num"], float)
+    assert not isinstance(fractional["mat"][1], float)
 
 
 def test_nulls_are_omitted_from_results(nullable_table, monkeypatch):
@@ -626,10 +604,6 @@ def test_random_with_query(filled_table):
     assert filled_table.random({"n": {"$lt": 5}}, pick_first="flag") in ["l0", "l1", "l2", "l3", "l4"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="random() on an empty table calls random.randint(0, -1) because max_id() returns -1 rather than 0",
-)
 def test_random_on_empty_table_returns_none(empty_table):
     assert empty_table.random() is None
 
@@ -652,10 +626,6 @@ def test_random_sample_ratio_bounds(filled_table):
         filled_table.random_sample(1.5, projection="n")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="random_sample rebinds `repeatable` to an SQL object before calling int(repeatable)",
-)
 def test_random_sample_repeatable(filled_table):
     first = list(filled_table.random_sample(0.5, projection="n", mode="bernoulli", repeatable=42))
     second = list(filled_table.random_sample(0.5, projection="n", mode="bernoulli", repeatable=42))

@@ -583,7 +583,6 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         col_description = table.column_description()
         sort = table._sort_orig
         id_ordered = table._id_ordered
-        search_order = table.search_cols
         self.create_table(
             new_name,
             search_columns,
@@ -594,6 +593,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             id_ordered,
             extra_columns,
             tablespace=tablespace,
+            # Without this an integer id would silently widen to the
+            # default bigint in the copy.
+            id_type=table.col_type["id"],
         )
         if data:
             logid = table._check_locks("create_table_like")
@@ -961,6 +963,10 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             ).fetchone()
             table = self._search_table_class_(self, *tabledata)
             self.__dict__[new_name] = table
+            # Also drop the old attribute (as drop_table does), so that
+            # db.<old_name> does not keep handing out a table object whose
+            # postgres table no longer exists.
+            self.__dict__.pop(old_name, None)
             self.tablenames.append(new_name)
             self.tablenames.remove(old_name)
             self.tablenames.sort()

@@ -672,7 +672,10 @@ class PostgresBase():
         if not skip_dep:
             tests.append((r"_dep[\d]+_$", "_depN"))
         for match, message in tests:
-            if re.match(match, name):
+            # re.search, not re.match: these patterns are $-anchored
+            # suffixes, and match() would only ever find them at the start
+            # of the name, so the guard never fired.
+            if re.search(match, name):
                 raise ValueError(
                     "{} name {} is invalid, ".format(kind, name)
                     + "cannot end in {}, ".format(message)
@@ -1302,7 +1305,7 @@ class PostgresBase():
             cols_sql = SQL(", ").join(map(Identifier, meta_cols))
             rows = self._execute(
                 SQL("SELECT {} FROM {} WHERE {} = %s AND version = %s").format(
-                    meta_name_hist_sql, cols_sql, table_name_sql
+                    cols_sql, meta_name_hist_sql, table_name_sql
                 ),
                 [search_table, version],
             )
