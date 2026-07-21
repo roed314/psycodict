@@ -423,14 +423,19 @@ class PostgresStatsTable(PostgresBase):
             # counts for {} when data is updated.
             self._execute(updater, [count, self.search_table])
 
-    def count(self, query={}, groupby=None, record=True):
+    def count(self, query={}, groupby=None, record=False):
         """
         Count the number of results for a given query.
 
         INPUT:
 
         - ``query`` -- a mongo-style dictionary, as in the ``search`` method.
-        - ``record`` -- (default True) whether to record the number of results in the counts table.
+        - ``record`` -- (default False) whether to record the number of results
+          in the counts table.  Recording is useful for queries whose counts
+          are displayed repeatedly (search pages record theirs), but every
+          distinct recorded query adds a row to the counts table, so it is
+          opt-in: scripts running many one-off counts no longer clutter the
+          table (and slow down reloads) by accident.
         - ``groupby`` -- (default None) a list of columns
 
         OUTPUT:
@@ -540,17 +545,18 @@ class PostgresStatsTable(PostgresBase):
         except DatabaseError:
             raise
 
-    def count_distinct(self, col, query={}, record=True):
+    def count_distinct(self, col, query={}, record=False):
         """
         Count the number of distinct values taken on by given column(s).
 
-        The result will be the same as taking the length of the distinct values, but a bit faster and caches the answer
+        The result will be the same as taking the length of the distinct values, but a bit faster and can cache the answer
 
         INPUT:
 
         - ``col`` -- the name of the column, or a list of such names
         - ``query`` -- a query dictionary constraining which rows are considered
-        - ``record`` -- (default True) whether to record the number of results in the stats table.
+        - ``record`` -- (default False) whether to record the number of results
+          in the stats table; opt-in for the same reason as in ``count``.
         """
         if isinstance(col, str):
             col = [col]
@@ -770,7 +776,7 @@ class PostgresStatsTable(PostgresBase):
         """
         if col == "id":
             # We just use the count in this case
-            return self.count()
+            return self.count(record=record)
         if col not in self.table.search_cols:
             raise ValueError("%s not a column of %s" % (col, self.search_table))
         ccols, cvals = self._split_dict(constraint)

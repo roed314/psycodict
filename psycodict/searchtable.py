@@ -1069,8 +1069,9 @@ class PostgresSearchTable(PostgresTable):
             cur = run_one_query(query, prelimit, offset)
             if limit is None:
                 if info is not None:
-                    # caller is requesting count data
-                    info["number"] = self.count(query)
+                    # caller is requesting count data; search-page counts are
+                    # the ones worth caching, so record them
+                    info["number"] = self.count(query, record=True)
                 return self._search_iterator(cur, search_cols, projection, query=query, silent=silent)
             if nres is None:
                 exact_count = cur.rowcount < prelimit and (offset == 0 or cur.rowcount > 0)
@@ -1089,7 +1090,7 @@ class PostgresSearchTable(PostgresTable):
                 # if offset is very large compared to the actual number of results
                 # and we just reduce the offset by the limit each time.  So we count for real.
                 if not exact_count:
-                    nres = self.stats.count(query)
+                    nres = self.stats.count(query, record=True)
                 offset = nres - limit
                 if offset < 0:
                     offset = 0
@@ -1668,7 +1669,7 @@ class PostgresSearchTable(PostgresTable):
         cur = self._execute(selecter, values)
         return [res[0] for res in cur]
 
-    def count(self, query={}, groupby=None, record=True, join=None):
+    def count(self, query={}, groupby=None, record=False, join=None):
         """
         Count the number of results for a given query.
 
@@ -1676,7 +1677,12 @@ class PostgresSearchTable(PostgresTable):
 
         - ``query`` -- a mongo-style dictionary, as in the ``search`` method.
         - ``groupby`` -- (default None) a list of columns
-        - ``record`` -- (default True) whether to record the number of results in the counts table.
+        - ``record`` -- (default False) whether to record the number of results
+          in the counts table.  Recording is useful for queries whose counts are
+          displayed repeatedly (search pages record theirs), but every distinct
+          recorded query adds a row to the counts table, so it is opt-in:
+          scripts running many one-off counts no longer clutter the table (and
+          slow down reloads) by accident.
         - ``join`` -- a list of tuples describing other search tables to join
           to this one, as for ``search``.  Counts of joined queries are
           computed directly and never cached, so ``record`` is ignored;
@@ -1701,17 +1707,18 @@ class PostgresSearchTable(PostgresTable):
             return self._join_count(query, join)
         return self.stats.count(query, groupby=groupby, record=record)
 
-    def count_distinct(self, col, query={}, record=True):
+    def count_distinct(self, col, query={}, record=False):
         """
         Count the number of distinct values taken on by a given column.
 
-        The result will be the same as taking the length of the distinct values, but a bit faster and caches the answer
+        The result will be the same as taking the length of the distinct values, but a bit faster and can cache the answer
 
         INPUT:
 
         - ``col`` -- the name of the column, or a list of such names
         - ``query`` -- a query dictionary constraining which rows are considered
-        - ``record`` -- (default True) whether to record the number of results in the stats table.
+        - ``record`` -- (default False) whether to record the number of results
+          in the stats table; opt-in for the same reason as in ``count``.
         """
         return self.stats.count_distinct(col, query, record=record)
 
