@@ -74,6 +74,12 @@ class PostgresDatabase(PostgresBase):
     It creates and stores the global connection object,
     and collects the table interfaces.
 
+    A single psycopg connection is shared by this database object and every
+    table interface registered on it (see ``register_object`` and
+    ``reset_connection``).  Because that one connection is not safe for
+    concurrent use, a ``PostgresDatabase`` instance is not thread-safe; use
+    one instance per process or thread (this is how LMFDB deploys it).
+
     INPUT:
 
     - ``create`` -- if True, create psycodict's metadata tables (meta_tables,
@@ -1051,7 +1057,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         - ``search_tables`` -- a list of strings giving names of tables to copy
         - ``data_folder`` -- a path to a folder to save the data.  The folder must not currently exist.
-        - ``remote_opts`` -- options for the remote connection (passed on to psycopg2's connect method)
+        - ``remote_opts`` -- options for the remote connection (passed on to psycopg's connect method)
         - ``**kwds`` -- other arguments are passed on to the ``copy_to`` method of each table.
         """
         if remote_opts is None:

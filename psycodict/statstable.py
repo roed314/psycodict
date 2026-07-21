@@ -108,7 +108,7 @@ class PostgresStatsTable(PostgresBase):
         5100
         sage: torsion_structures = db.ec_nfcurves.stats.column_counts('torsion_structure')
         sage: torsion_structures[4,4]
-        14L
+        14
 
     Adding statistics on norm_conductor, grouped by signature::
 
@@ -132,9 +132,9 @@ class PostgresStatsTable(PostgresBase):
     You can see what additional counts are stored using the ``extra_counts`` method::
 
         sage: list(db.mf_newforms.stats.extra_counts())[0]
-        (u'dim',)
+        ('dim',)
         sage: db.mf_newforms.stats.extra_counts()[('dim',)]
-        [(({u'$gte': 10, u'$lte': 20},), 39288L)]
+        [(({'$gte': 10, '$lte': 20},), 39288)]
 
     SCHEMA:
 

@@ -63,11 +63,11 @@ class PostgresSearchTable(PostgresTable):
             sage: from lmfdb import db
             sage: ec = db.ec_padic
             sage: ec._parse_projection(0)
-            (u'label',)
+            ('label',)
             sage: ec._parse_projection(1)
-            (u'lmfdb_iso', u'p', u'prec', u'val', u'unit')
+            ('lmfdb_iso', 'p', 'prec', 'val', 'unit')
             sage: ec._parse_projection({"val":True, "unit":True})
-            (u'val', u'unit')
+            ('val', 'unit')
 
         If you want the "id" column, you can list it explicitly::
 
@@ -77,7 +77,7 @@ class PostgresSearchTable(PostgresTable):
         You can specify a dictionary with columns to exclude:
 
             sage: ec._parse_projection({"prec":False})
-            (u'lmfdb_iso', u'p', u'val', u'unit')
+            ('lmfdb_iso', 'p', 'val', 'unit')
         """
         search_cols = []
         if projection == 0:
@@ -810,23 +810,23 @@ class PostgresSearchTable(PostgresTable):
             sage: from lmfdb import db
             sage: nf = db.nf_fields
             sage: nf.lucky({'degree':int(2),'disc_sign':int(1),'disc_abs':int(5)},projection=0)
-            u'2.2.5.1'
-            sage: nf.lucky({'label':u'6.6.409587233.1'},projection=1)
-            {u'class_group': [],
-             u'class_number': 1,
-             u'cm': False,
-             u'coeffs': [2, -31, 30, 11, -13, -1, 1],
-             u'degree': 6,
-             u'disc_abs': 409587233,
-             u'disc_rad': 409587233,
-             u'disc_sign': 1,
-             u'galt': 16,
-             u'label': u'6.6.409587233.1',
-             u'oldpolredabscoeffs': None,
-             u'r2': 0,
-             u'ramps': [11, 53, 702551],
-             u'used_grh': False}
-            sage: nf.lucky({'label':u'6.6.409587233.1'},projection=['regulator'])
+            '2.2.5.1'
+            sage: nf.lucky({'label':'6.6.409587233.1'},projection=1)
+            {'class_group': [],
+             'class_number': 1,
+             'cm': False,
+             'coeffs': [2, -31, 30, 11, -13, -1, 1],
+             'degree': 6,
+             'disc_abs': 409587233,
+             'disc_rad': 409587233,
+             'disc_sign': 1,
+             'galt': 16,
+             'label': '6.6.409587233.1',
+             'oldpolredabscoeffs': None,
+             'r2': 0,
+             'ramps': [11, 53, 702551],
+             'used_grh': False}
+            sage: nf.lucky({'label':'6.6.409587233.1'},projection=['regulator'])
             {'regulator':455.191694993}
         """
         if join is not None:
@@ -920,23 +920,23 @@ class PostgresSearchTable(PostgresTable):
             sage: nf = db.nf_fields
             sage: info = {}
             sage: nf.search({'degree':int(2),'class_number':int(1),'disc_sign':int(-1)}, projection=0, limit=4, info=info)
-            [u'2.0.3.1', u'2.0.4.1', u'2.0.7.1', u'2.0.8.1']
+            ['2.0.3.1', '2.0.4.1', '2.0.7.1', '2.0.8.1']
             sage: info['number'], info['exact_count']
             (9, True)
             sage: info = {}
             sage: nf.search({'degree':int(6)}, projection=['label','class_number','galt'], limit=4, info=info)
-            [{'class_number': 1, 'galt': 5, 'label': u'6.0.9747.1'},
-             {'class_number': 1, 'galt': 11, 'label': u'6.0.10051.1'},
-             {'class_number': 1, 'galt': 11, 'label': u'6.0.10571.1'},
-             {'class_number': 1, 'galt': 5, 'label': u'6.0.10816.1'}]
+            [{'class_number': 1, 'galt': 5, 'label': '6.0.9747.1'},
+             {'class_number': 1, 'galt': 11, 'label': '6.0.10051.1'},
+             {'class_number': 1, 'galt': 11, 'label': '6.0.10571.1'},
+             {'class_number': 1, 'galt': 5, 'label': '6.0.10816.1'}]
             sage: info['number'], info['exact_count']
             (5522600, True)
             sage: info = {}
             sage: nf.search({'ramps':{'$contains':[int(2),int(7)]}}, limit=4, info=info)
-            [{'label': u'2.2.28.1', 'ramps': [2, 7]},
-             {'label': u'2.0.56.1', 'ramps': [2, 7]},
-             {'label': u'2.2.56.1', 'ramps': [2, 7]},
-             {'label': u'2.0.84.1', 'ramps': [2, 3, 7]}]
+            [{'label': '2.2.28.1', 'ramps': [2, 7]},
+             {'label': '2.0.56.1', 'ramps': [2, 7]},
+             {'label': '2.2.56.1', 'ramps': [2, 7]},
+             {'label': '2.0.84.1', 'ramps': [2, 3, 7]}]
             sage: info['number'], info['exact_count']
             (1000, False)
 
@@ -1392,7 +1392,7 @@ class PostgresSearchTable(PostgresTable):
             sage: nf = db.nf_fields
             sage: rec = nf.lookup('8.0.374187008.1')
             sage: rec['loc_algebras']['13']
-            u'x^2-13,x^2-x+2,x^4+x^2-x+2'
+            'x^2-13,x^2-x+2,x^4+x^2-x+2'
         """
         if label_col is None:
             label_col = self._label_col
@@ -1469,7 +1469,7 @@ class PostgresSearchTable(PostgresTable):
             sage: from lmfdb import db
             sage: nf = db.nf_fields
             sage: nf.random()
-            u'2.0.294787.1'
+            '2.0.294787.1'
         """
         if pick_first:
             colvals = self.distinct(pick_first, query)
