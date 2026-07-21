@@ -176,7 +176,7 @@ def test_dict_projection_rejects_paths(filled_table):
 
 
 def test_split_ors_rejects_path_projection(filled_table):
-    with pytest.raises(ValueError, match="path specifiers in the projection"):
+    with pytest.raises(ValueError, match="in the projection are not supported"):
         filled_table.search(
             {"$or": [{"n": 1}, {"n": 2}]}, ["label", "data.s"],
             split_ors=True, limit=5,
@@ -184,7 +184,7 @@ def test_split_ors_rejects_path_projection(filled_table):
 
 
 def test_split_ors_rejects_path_sort(filled_table):
-    with pytest.raises(ValueError, match="path specifiers in the sort"):
+    with pytest.raises(ValueError, match="in the sort are not supported"):
         filled_table.search(
             {"$or": [{"n": 1}, {"n": 2}]}, ["label"],
             sort=["data.nested.k"], split_ors=True, limit=5,
@@ -192,12 +192,28 @@ def test_split_ors_rejects_path_sort(filled_table):
 
 
 def test_one_per_rejects_path_projection(filled_table):
-    with pytest.raises(ValueError, match="path specifiers in the projection"):
+    with pytest.raises(ValueError, match="in the projection are not supported"):
         filled_table.search({}, ["data.s"], one_per=["flag"], limit=5)
 
 
+def test_one_per_rejects_slicer_projection(filled_table):
+    # An array slicer must be rejected like a dotted path: the one_per outer
+    # query would otherwise re-subscript the inner query's already-scalar
+    # projection ("vec"[1] applied to the scalar vec[1]).
+    with pytest.raises(ValueError, match="array slicers in the projection"):
+        filled_table.search({}, ["vec[0]"], one_per=["flag"], limit=5)
+
+
+def test_split_ors_rejects_slicer_sort(filled_table):
+    with pytest.raises(ValueError, match="array slicers in the sort"):
+        filled_table.search(
+            {"$or": [{"n": 1}, {"n": 2}]}, ["label"],
+            sort=["vec[0]"], split_ors=True, limit=5,
+        )
+
+
 def test_one_per_rejects_path_sort(filled_table):
-    with pytest.raises(ValueError, match="path specifiers in the sort"):
+    with pytest.raises(ValueError, match="in the sort are not supported"):
         filled_table.search(
             {}, ["label"], one_per=["flag"], sort=["data.nested.k"], limit=5
         )

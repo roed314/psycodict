@@ -994,15 +994,18 @@ class PostgresSearchTable(PostgresTable):
             # split_ors and one_per manipulate the fetched records in Python,
             # keyed by the sort and projection names (extracting sort columns,
             # DISTINCT ON, merging and re-sorting).  That machinery assumes the
-            # names are plain columns, so path specifiers are not supported here.
-            if any("." in c for c in search_cols):
-                raise ValueError("path specifiers in the projection are not supported with split_ors or one_per")
+            # names are plain columns: a dotted path or an array slicer would be
+            # projected as a scalar by the inner query and then re-projected by
+            # the same expression on the outer one (subscripting an already
+            # scalar value), so neither is supported here.
+            if any("." in c or "[" in c for c in search_cols):
+                raise ValueError("path specifiers and array slicers in the projection are not supported with split_ors or one_per")
             # We need to be able to extract the sort columns, so they need to be added
             _, _, raw_sort = self._process_sort(query, limit, offset, sort)
             raw_sort = [((col, 1) if isinstance(col, str) else col) for col in raw_sort]
             sort_cols = [col[0] for col in raw_sort]
-            if any("." in col for col in sort_cols):
-                raise ValueError("path specifiers in the sort are not supported with split_ors or one_per")
+            if any("." in col or "[" in col for col in sort_cols):
+                raise ValueError("path specifiers and array slicers in the sort are not supported with split_ors or one_per")
             sort_only = tuple(col for col in sort_cols if col not in search_cols)
             search_cols = search_cols + sort_only
         cols = SQL(", ").join(self._column_composable(c) for c in search_cols)
