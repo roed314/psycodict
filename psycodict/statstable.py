@@ -5,8 +5,8 @@ import math
 import time
 from collections import defaultdict
 
-from psycopg2 import DatabaseError
-from psycopg2.sql import SQL, Identifier, Literal
+from psycopg import DatabaseError
+from psycopg.sql import SQL, Identifier, Literal
 
 from .base import PostgresBase
 from .encoding import Json, numeric_converter
@@ -1956,10 +1956,9 @@ ORDER BY v.ord LIMIT %s"""
             creator = SQL('CREATE TABLE {0} (_id text COLLATE "C", data jsonb)').format(Identifier(name))
             self._execute(creator)
             self._db.grant_select(name)
-            cur = self._db.cursor()
             with open(filename) as F:
                 try:
-                    cur.copy_from(F, self.search_table + "_oldstats")
+                    self._copy_from_stdin(F, self.search_table + "_oldstats")
                 except Exception:
                     self.conn.rollback()
                     raise

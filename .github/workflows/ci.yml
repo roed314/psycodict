@@ -172,11 +172,11 @@ jobs:
           print("psycodict", importlib.metadata.version("psycodict"), "imports from", path)
           PY
 
-      # psycopg2 is deliberately an optional dependency, so that users choose
-      # between the source and binary builds.  Importing without it must fail
-      # with the guidance in psycodict/__init__.py rather than a bare
+      # psycopg is deliberately an optional dependency, so that users choose
+      # between the pure-Python and binary builds.  Importing without it must
+      # fail with the guidance in psycodict/__init__.py rather than a bare
       # ImportError -- this asserts that contract holds.
-      - name: Import without psycopg2 gives a helpful message
+      - name: Import without psycopg gives a helpful message
         run: |
           python -m venv "$RUNNER_TEMP/bare"
           "$RUNNER_TEMP/bare/bin/pip" install "$(echo "$PWD"/dist/*.whl)"
@@ -188,12 +188,12 @@ jobs:
           set -e
           echo "$output"
           if [ $status -eq 0 ]; then
-            echo "::error::importing psycodict without psycopg2 should fail"
+            echo "::error::importing psycodict without psycopg should fail"
             exit 1
           fi
           case "$output" in
-            *psycopg2-binary*) echo "helpful message present" ;;
-            *) echo "::error::missing the install-psycopg2 hint"; exit 1 ;;
+            *psycopg\[binary\]*) echo "helpful message present" ;;
+            *) echo "::error::missing the install-psycopg hint"; exit 1 ;;
           esac
 
       - uses: actions/upload-artifact@v7

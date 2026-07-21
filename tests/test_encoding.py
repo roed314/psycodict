@@ -11,8 +11,6 @@ import datetime
 import json
 
 import pytest
-from psycopg2.extensions import ISQLQuote
-from psycopg2.extras import Json as pgJson
 
 import psycodict.encoding
 from psycodict.encoding import SAGE_MODE, Array, Json, copy_dumps, numeric_converter
@@ -151,9 +149,14 @@ def test_with_sage_copy_dumps_round_trips_sage_types():
 # Json
 # ---------------------------------------------------------------------------
 
-def test_json_subclasses_psycopg2_json():
-    assert issubclass(Json, pgJson)
-    assert Json({"a": 1}).adapted == {"a": 1}
+def test_json_wrapper_contract():
+    # With psycopg2 this class subclassed psycopg2.extras.Json; under psycopg3
+    # it is a plain wrapper adapted by JsonWrapperDumper.  The wrapped value
+    # stays reachable under both spellings.
+    wrapped = Json({"a": 1})
+    assert wrapped.obj == {"a": 1}
+    assert wrapped.adapted == {"a": 1}  # psycopg2-era attribute, kept for compatibility
+    assert repr(wrapped) == "Json({'a': 1})"
 
 
 @pytest.mark.parametrize("obj", [
@@ -410,22 +413,16 @@ def test_copy_dumps_bytea():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("seq,expected", [
-    ([1, 2, 3], b"ARRAY[1, 2, 3]"),
-    ([], b"ARRAY[]"),
-    (["a", "b"], b"ARRAY['a', 'b']"),
+    ([1, 2, 3], b"{1,2,3}"),
+    ([], b"{}"),
+    (["a", "b"], b'{"a","b"}'),
+    ([1.5, None, True], b"{1.5,NULL,t}"),
+    ([[1, 2], [3, 4]], b"{{1,2},{3,4}}"),
+    (['he said "hi"', "back\\slash"], b'{"he said \\"hi\\"","back\\\\slash"}'),
 ])
 def test_array_getquoted(seq, expected):
+    # Under psycopg2 this produced an ARRAY[...] expression spliced into the
+    # SQL client-side; with server-side binding the wrapper renders a postgres
+    # array literal instead (sent with unknown oid, so the server casts by
+    # context, via ArrayDumper).
     assert Array(seq).getquoted() == expected
-
-
-def test_array_adapter_protocol():
-    array = Array([1])
-    assert array.__conform__(ISQLQuote) is array
-    with pytest.raises(NotImplementedError):
-        array.__conform__(object())
-    conn = object()
-    assert array._conn is None
-    array.prepare(conn)
-    assert array._conn is conn
-    # integers adapt without needing the connection
-    assert array.getquoted() == b"ARRAY[1]"

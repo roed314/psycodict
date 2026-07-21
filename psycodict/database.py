@@ -6,21 +6,20 @@ import time
 import traceback
 from collections import defaultdict, Counter
 
-from psycopg2 import connect, DatabaseError
-from psycopg2.errors import UndefinedTable
-from psycopg2.sql import SQL, Identifier, Placeholder
-from psycopg2.extensions import (
-    register_type,
-    register_adapter,
-    new_type,
-    new_array_type,
-    UNICODE,
-    UNICODEARRAY,
-    AsIs,
-)
-from psycopg2.extras import register_json
+from psycopg import connect, DatabaseError
+from psycopg.errors import UndefinedTable
+from psycopg.sql import SQL, Identifier, Placeholder
+from psycopg.adapt import Loader
+from psycopg.types.json import set_json_loads
 
-from .encoding import Json, numeric_converter
+from .encoding import (
+    Json,
+    numeric_converter,
+    Array,
+    ArrayDumper,
+    JsonWrapperDumper,
+    DictJsonDumper,
+)
 from .base import (
     PostgresBase,
     _meta_tables_cols,
@@ -31,31 +30,40 @@ from .searchtable import PostgresSearchTable
 from .utils import DelayCommit
 
 
+class NumericLoader(Loader):
+    """
+    Loads Postgres numeric values through :func:`numeric_converter`
+    (Sage Integer/RealLiteral when Sage is available, int/float otherwise).
+    """
+    def load(self, data):
+        return numeric_converter(bytes(data).decode())
+
+
 def setup_connection(conn):
-    # We want to use unicode everywhere
-    register_type(UNICODE, conn)
-    register_type(UNICODEARRAY, conn)
-    conn.set_client_encoding("UTF8")
-    cur = conn.cursor()
-    cur.execute("SELECT NULL::numeric")
-    oid = cur.description[0][1]
-    NUMERIC = new_type((oid,), "NUMERIC", numeric_converter)
-    cur.execute("SELECT NULL::numeric[]")
-    oid = cur.description[0][1]
-    NUMERICL = new_array_type((oid,), "NUMERIC[]", NUMERIC)
-    register_type(NUMERIC, conn)
-    register_type(NUMERICL, conn)
-    register_adapter(dict, Json)
-    register_json(conn, loads=Json.loads)
+    # psycopg3 uses unicode (str) everywhere by default, so the psycopg2-era
+    # UNICODE/UNICODEARRAY registrations are no longer needed.
+    conn.execute("SET client_encoding TO 'UTF8'")
+    conn.commit()
+    # All registrations below are per-connection (psycopg3 improvement over
+    # psycopg2's process-global register_adapter).
+    conn.adapters.register_loader("numeric", NumericLoader)
+    conn.adapters.register_dumper(dict, DictJsonDumper)
+    conn.adapters.register_dumper(Json, JsonWrapperDumper)
+    conn.adapters.register_dumper(Array, ArrayDumper)
+    set_json_loads(Json.loads, conn)
     try:
-        from sage.all import Integer, RealNumber
-        from .encoding import RealEncoder, LmfdbRealLiteral
+        # RealNumber must come from real_mpfr: sage.all.RealNumber is the
+        # create_RealNumber factory function (not a class), and dumpers can
+        # only be registered on classes
+        from sage.rings.integer import Integer
+        from sage.rings.real_mpfr import RealNumber
+        from .encoding import RealLiteralDumper, SageIntegerDumper, LmfdbRealLiteral
     except ImportError:
         pass
     else:
-        register_adapter(Integer, AsIs)
-        register_adapter(RealNumber, RealEncoder)
-        register_adapter(LmfdbRealLiteral, RealEncoder)
+        conn.adapters.register_dumper(Integer, SageIntegerDumper)
+        conn.adapters.register_dumper(RealNumber, RealLiteralDumper)
+        conn.adapters.register_dumper(LmfdbRealLiteral, RealLiteralDumper)
 
 
 class PostgresDatabase(PostgresBase):
@@ -77,7 +85,7 @@ class PostgresDatabase(PostgresBase):
     The following public attributes are stored on the db object.
 
     - ``server_side_counter`` -- an integer tracking how many buffered connections have been created
-    - ``conn`` -- the psycopg2 connection object
+    - ``conn`` -- the psycopg connection object
     - ``tablenames`` -- a list of tablenames in the database, as strings
 
     Also, each tablename will be stored as an attribute, so that db.ec_curvedata works for example.
@@ -278,7 +286,12 @@ class PostgresDatabase(PostgresBase):
         """
         if buffered:
             self.server_side_counter += 1
-            return self.conn.cursor(str(self.server_side_counter), withhold=True)
+            cur = self.conn.cursor(str(self.server_side_counter), withhold=True)
+            # psycopg3's ServerCursor defaults to itersize=100 (psycopg2's
+            # named cursors used 2000), which multiplies round trips when
+            # iterating over large result sets.
+            cur.itersize = 2000
+            return cur
         else:
             return self.conn.cursor()
 

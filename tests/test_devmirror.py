@@ -255,7 +255,7 @@ def test_search_table_reports_its_columns(mirror):
 
 
 def test_execute_raw_sql(mirror):
-    from psycopg2.sql import SQL
+    from psycopg.sql import SQL
 
     (one,) = mirror._execute(SQL("SELECT 1")).fetchone()
     assert one == 1

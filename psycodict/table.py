@@ -6,11 +6,11 @@ import time
 import re
 from bisect import bisect
 
-from psycopg2.sql import SQL, Identifier, Placeholder, Literal
+from psycopg.sql import SQL, Identifier, Placeholder, Literal
 
 from .encoding import Json, copy_dumps
 from .base import PostgresBase, _meta_table_name
-from .utils import DelayCommit, IdentifierWrapper, LockError, psycopg2_version
+from .utils import DelayCommit, IdentifierWrapper, LockError
 from .base import (
     _meta_indexes_cols,
     _meta_constraints_cols,
@@ -118,7 +118,7 @@ class PostgresTable(PostgresBase):
     - ``_sort_org`` -- either None or a list of columns or pairs ``(col, direction)``
     - ``_sort_keys`` -- a set of column names included in the sort order
     - ``_primary_sort`` -- either None, a column name or a pair ``(col, direction)``, the most significant column when sorting
-    - ``_sort`` -- the psycopg2.sql.Composable object containing the default sort clause
+    - ``_sort`` -- the psycopg.sql.Composable object containing the default sort clause
     """
     _stats_table_class_ = PostgresStatsTable
 
@@ -218,8 +218,7 @@ class PostgresTable(PostgresBase):
             analyzer = SQL("EXPLAIN {0}").format(selecter)
         else:
             analyzer = SQL("EXPLAIN ANALYZE {0}").format(selecter)
-        cur = self._db.cursor()
-        print(cur.mogrify(selecter, values))
+        print(self._mogrify(selecter, values))
         cur = self._execute(analyzer, values, silent=True)
         for line in cur:
             print(line[0])
@@ -274,10 +273,14 @@ class PostgresTable(PostgresBase):
         # We whitelisted the type, modifiers and storage parameters
         # when creating the index so the following is safe from SQL injection
         if storage_params:
-            # The inner format is on a string rather than a psycopg2.sql.Composable:
-            # the keys of storage_params have been whitelisted.
+            # The keys of storage_params have been whitelisted; the values are
+            # inlined as literals because DDL statements cannot take bound
+            # parameters under psycopg3's server-side binding.
             storage_params = SQL(" WITH ({0})").format(
-                SQL(", ").join(SQL("{0} = %s".format(param)) for param in storage_params)
+                SQL(", ").join(
+                    SQL("{0} = {{0}}".format(param)).format(Literal(val))
+                    for param, val in storage_params.items()
+                )
             )
         else:
             storage_params = SQL("")
@@ -317,7 +320,7 @@ class PostgresTable(PostgresBase):
                     [[]] * len(index["columns"]),
                     storage_params,
                 )
-                self._execute(creator, list(storage_params.values()))
+                self._execute(creator)
                 print("Index {} created in {:.3f} secs".format(
                     index["name"].format(self.search_table), time.time() - now
                 ))
@@ -451,7 +454,7 @@ class PostgresTable(PostgresBase):
             creator = self._create_index_statement(
                 name, self.search_table, type, columns, modifiers, storage_params
             )
-            self._execute(creator, list(storage_params.values()))
+            self._execute(creator)
             inserter = SQL("INSERT INTO meta_indexes (index_name, table_name, type, columns, modifiers, storage_params) VALUES (%s, %s, %s, %s, %s, %s)")
             self._execute(
                 inserter,
@@ -516,7 +519,7 @@ class PostgresTable(PostgresBase):
             )
             # this avoids clashes with deprecated indexes/constraints
             self._rename_if_exists(name, suffix)
-            self._execute(creator, list(storage_params.values()))
+            self._execute(creator)
         print("Created index %s in %.3f secs" % (name, time.time() - now))
 
     def _indexes_touching(self, columns):
@@ -1972,10 +1975,12 @@ class PostgresTable(PostgresBase):
         - ``columns`` -- a list of column names to export
         - ``query`` -- a query dictionary
         - ``include_id`` -- whether to include the id column in the output file
-        - ``kwds`` -- passed on to psycopg2's ``copy_to``.  Cannot include "columns".
+        - ``kwds`` -- may contain ``sep`` and ``null`` options for the COPY.
+            Cannot include "columns".
         """
         self._check_file_input(searchfile, kwds)
         sep = kwds.pop("sep", "|")
+        null = kwds.pop("null", r"\N")
 
         search_cols = [col for col in self.search_cols if columns is None or col in columns]
         if columns is not None and len(columns) != len(search_cols):
@@ -2004,28 +2009,38 @@ class PostgresTable(PostgresBase):
                 now = time.time()
                 if addid:
                     cols = ["id"] + cols
-                if psycopg2_version < (2, 9, 0):
-                    cols_wquotes = ['"' + col + '"' for col in cols]
-                else:
-                    cols_wquotes = cols
+                if kwds:
+                    raise TypeError("Unsupported copy_to options: %s" % ", ".join(kwds))
                 cur = self._db.cursor()
                 with open(filename, "w") as F:
                     try:
                         if write_header:
                             self._write_header_lines(F, cols, include_id=include_id, sep=sep)
-                        if query is None:
-                            cur.copy_to(F, table, columns=cols_wquotes, sep=sep, **kwds)
+                        options = []
+                        if sep != "\t":
+                            options.append(SQL("DELIMITER {0}").format(Literal(sep)))
+                        if null != r"\N":
+                            options.append(SQL("NULL {0}").format(Literal(null)))
+                        if options:
+                            sep_clause = SQL(" ({0})").format(SQL(", ").join(options))
                         else:
-                            if sep == "\t":
-                                sep_clause = SQL("")
-                            else:
-                                sep_clause = SQL(" (DELIMITER {0})").format(Literal(sep))
+                            sep_clause = SQL("")
+                        if query is None:
+                            copyto = SQL("COPY {0} ({1}) TO STDOUT{2}").format(
+                                Identifier(table),
+                                SQL(", ").join(map(Identifier, cols)),
+                                sep_clause,
+                            )
+                        else:
                             qstr, values = self._build_query(query, sort=[])
                             scols = SQL(", ").join(map(IdentifierWrapper, cols))
                             selecter = SQL("SELECT {0} FROM {1}{2}").format(scols, IdentifierWrapper(table), qstr)
                             copyto = SQL("COPY ({0}) TO STDOUT{1}").format(selecter, sep_clause)
-                            # copy_expert doesn't support values
-                            cur.copy_expert(cur.mogrify(copyto, values), F, **kwds)
+                            # COPY doesn't support parameters, so interpolate client-side
+                            copyto = SQL(self._mogrify(copyto, values))
+                        with cur.copy(copyto) as copy:
+                            for data in copy:
+                                F.write(bytes(data).decode())
                     except Exception:
                         self.conn.rollback()
                         raise

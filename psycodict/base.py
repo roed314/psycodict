@@ -6,7 +6,8 @@ import sys
 import time
 from collections import defaultdict
 
-from psycopg2 import (
+from psycopg import (
+    ClientCursor,
     DatabaseError,
     InterfaceError,
     OperationalError,
@@ -14,11 +15,10 @@ from psycopg2 import (
     NotSupportedError,
     DataError,
 )
-from psycopg2.sql import SQL, Identifier, Placeholder, Literal, Composable
-from psycopg2.extras import execute_values
+from psycopg.sql import SQL, Identifier, Placeholder, Literal, Composable
 
 from .encoding import Json
-from .utils import reraise, DelayCommit, QueryLogFilter, psycopg2_version
+from .utils import reraise, DelayCommit, QueryLogFilter
 
 
 # This dictionary is used when creating new tables
@@ -238,6 +238,15 @@ class PostgresBase():
         shandler.setFormatter(formatter)
         l.addHandler(shandler)
 
+    def _mogrify(self, query, values):
+        """
+        Render a query with values interpolated, for logging and error messages.
+
+        psycopg3 only supports client-side interpolation through ClientCursor,
+        so we create a temporary one (psycopg2 had mogrify on every cursor).
+        """
+        return ClientCursor(self.conn).mogrify(query, values)
+
     def _execute(
             self,
             query,
@@ -297,7 +306,7 @@ class PostgresBase():
         This function will also log slow queries.
         """
         if not isinstance(query, Composable):
-            raise TypeError("You must use the psycopg2.sql module to execute queries")
+            raise TypeError("You must use the psycopg.sql module to execute queries")
 
         if buffered:
             if commit is None:
@@ -310,15 +319,22 @@ class PostgresBase():
 
             t = time.time()
             if values_list:
-                if template is not None:
-                    template = template.as_string(self.conn)
-                execute_values(cur, query.as_string(self.conn), values, template)
+                # This used to use psycopg2's execute_values; with psycopg3
+                # we expand the single "VALUES %s" placeholder to a per-row
+                # template and rely on executemany, which batches efficiently
+                # using pipeline mode.
+                if values:
+                    if template is not None:
+                        template = template.as_string(self.conn)
+                    else:
+                        template = "(" + ",".join(["%s"] * len(values[0])) + ")"
+                    cur.executemany(query.as_string(self.conn).replace("%s", template, 1), values)
             else:
                 try:
                     cur.execute(query, values)
                 except (OperationalError, ProgrammingError, NotSupportedError, DataError, SyntaxError) as e:
                     try:
-                        context = " happens while executing {}".format(cur.mogrify(query, values))
+                        context = " happens while executing {}".format(self._mogrify(query, values))
                     except Exception:
                         context = " happens while executing {} with values {}".format(query, values)
                     reraise(type(e), type(e)(str(e) + context), sys.exc_info()[2])
@@ -329,7 +345,7 @@ class PostgresBase():
                         query = query.as_string(self.conn).replace("%s", "VALUES_LIST")
                     elif values:
                         try:
-                            query = cur.mogrify(query, values)
+                            query = self._mogrify(query, values)
                         except Exception:
                             # This shouldn't happen since the execution above was successful
                             query = query + str(values)
@@ -647,7 +663,7 @@ class PostgresBase():
                 + "already exists. "
                 + "It has been renamed to {} ".format(deprecated_name)
                 + "and it can be deleted with the following SQL command:\n"
-                + self._db.cursor().mogrify(command)
+                + command.as_string(self.conn)
             )
 
     def _check_restricted_suffix(self, name, kind="Index", skip_dep=False):
@@ -683,7 +699,7 @@ class PostgresBase():
     @staticmethod
     def _sort_str(sort_list):
         """
-        Constructs a psycopg2.sql.Composable object describing a sort order
+        Constructs a psycopg.sql.Composable object describing a sort order
         for Postgres from a list of columns.
 
         INPUT:
@@ -693,7 +709,7 @@ class PostgresBase():
 
         OUTPUT:
 
-        - a Composable to be used by psycopg2 in the ORDER BY clause.
+        - a Composable to be used by psycopg in the ORDER BY clause.
         """
         L = []
         for col in sort_list:
@@ -770,7 +786,7 @@ class PostgresBase():
 
     def _copy_to_select(self, select, filename, header="", sep="|", silent=False):
         """
-        Using the copy_expert from psycopg2, exports the data from a select statement.
+        Using COPY ... TO STDOUT, exports the data from a select statement.
 
         INPUT:
 
@@ -788,7 +804,9 @@ class PostgresBase():
             try:
                 F.write(header)
                 cur = self._db.cursor()
-                cur.copy_expert(copyto, F)
+                with cur.copy(copyto) as copy:
+                    for data in copy:
+                        F.write(bytes(data).decode())
             except Exception:
                 self.conn.rollback()
                 raise
@@ -862,6 +880,42 @@ class PostgresBase():
             raise ValueError(err)
         return names
 
+    def _copy_from_stdin(self, F, table, columns=None, sep=None, null=r"\N"):
+        """
+        Stream an open file object into a table using COPY ... FROM STDIN.
+
+        This replaces psycopg2's ``cursor.copy_from``, which was removed in
+        psycopg3 in favor of an explicit COPY statement.  Returns the cursor,
+        whose ``rowcount`` gives the number of rows loaded.
+
+        INPUT:
+
+        - ``F`` -- an open file object to read from
+        - ``table`` -- the name of the table to load into
+        - ``columns`` -- the columns present in the file, in order
+            (defaults to all columns in table order)
+        - ``sep`` -- the column separator (defaults to postgres' text-format
+            default, a tab, like psycopg2's copy_from did)
+        - ``null`` -- the null marker (the text-format default)
+        """
+        if columns is None:
+            cols = SQL("")
+        else:
+            cols = SQL(" ({0})").format(SQL(", ").join(map(Identifier, columns)))
+        if sep is None:
+            options = SQL("")
+        else:
+            options = SQL(" WITH (DELIMITER {0}, NULL {1})").format(Literal(sep), Literal(null))
+        copy_sql = SQL("COPY {0}{1} FROM STDIN{2}").format(Identifier(table), cols, options)
+        cur = self._db.cursor()
+        with cur.copy(copy_sql) as copy:
+            while True:
+                chunk = F.read(1 << 20)
+                if not chunk:
+                    break
+                copy.write(chunk)
+        return cur
+
     def _copy_from(self, filename, table, columns, header, kwds):
         """
         Helper function for ``copy_from`` and ``reload``.
@@ -874,10 +928,14 @@ class PostgresBase():
             a different order, specified by a header row)
         - ``header`` -- whether the file has header rows ordering the columns.
             This should be True for search tables, False for counts and stats.
-        - ``kwds`` -- passed on to psycopg2's copy_from
+        - ``kwds`` -- may contain ``sep`` and ``null`` options for the COPY
         """
         kwds = dict(kwds)  # to not modify the dict kwds, with the pop
         sep = kwds.pop("sep", "|")
+        null = kwds.pop("null", r"\N")
+        kwds.pop("size", None)  # psycopg2 buffer size, no longer meaningful
+        if kwds:
+            raise TypeError("Unsupported copy_from options: %s" % ", ".join(kwds))
 
         with DelayCommit(self, silence=True):
             with open(filename) as F:
@@ -888,28 +946,24 @@ class PostgresBase():
                 else:
                     addid = False
 
-                if psycopg2_version < (2, 9, 0):
-                    # We have to add quotes manually since copy_from doesn't accept
-                    # psycopg2.sql.Identifiers
-                    # None of our column names have double quotes in them. :-D
-                    assert all('"' not in col for col in columns)
-                    columns = ['"' + col + '"' for col in columns]
                 if addid:
                     # create sequence
+                    # The values are inlined as literals: DDL statements
+                    # cannot take parameters under psycopg3's server-side
+                    # binding (psycopg2 interpolated them client-side).
                     cur_count = self.max_id(table)
                     seq_name = table + "_seq"
                     create_seq = SQL(
-                        "CREATE SEQUENCE {0} START WITH %s MINVALUE %s CACHE 10000"
-                    ).format(Identifier(seq_name))
-                    self._execute(create_seq, [cur_count + 1] * 2)
+                        "CREATE SEQUENCE {0} START WITH {1} MINVALUE {1} CACHE 10000"
+                    ).format(Identifier(seq_name), Literal(cur_count + 1))
+                    self._execute(create_seq)
                     # edit default value
                     alter_table = SQL(
-                        "ALTER TABLE {0} ALTER COLUMN {1} SET DEFAULT nextval(%s)"
-                    ).format(Identifier(table), Identifier("id"))
-                    self._execute(alter_table, [seq_name])
+                        "ALTER TABLE {0} ALTER COLUMN {1} SET DEFAULT nextval({2})"
+                    ).format(Identifier(table), Identifier("id"), Literal(seq_name))
+                    self._execute(alter_table)
 
-                cur = self._db.cursor()
-                cur.copy_from(F, table, columns=columns, sep=sep, **kwds)
+                cur = self._copy_from_stdin(F, table, columns, sep, null=null)
 
                 if addid:
                     alter_table = SQL(
@@ -1196,9 +1250,8 @@ class PostgresBase():
     def _copy_from_meta(self, meta_name, filename, sep="|"):
         meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
         try:
-            cur = self._db.cursor()
             with open(filename) as F:
-                cur.copy_from(F, meta_name, columns=meta_cols, sep=sep)
+                self._copy_from_stdin(F, meta_name, meta_cols, sep)
         except Exception:
             self.conn.rollback()
             raise
@@ -1250,8 +1303,7 @@ class PostgresBase():
             # insert new columns
             with open(filename, "r") as F:
                 try:
-                    cur = self._db.cursor()
-                    cur.copy_from(F, meta_name, columns=meta_cols, sep=sep)
+                    self._copy_from_stdin(F, meta_name, meta_cols, sep)
                 except Exception:
                     self.conn.rollback()
                     raise

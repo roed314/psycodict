@@ -11,7 +11,7 @@ import logging
 from unittest.mock import MagicMock
 
 import pytest
-from psycopg2.sql import SQL, Composed, Identifier, Placeholder
+from psycopg.sql import SQL, Composed, Identifier, Placeholder
 
 from psycodict.utils import (
     DelayCommit,
@@ -47,8 +47,9 @@ def parsed_pieces(clause):
     The composables that filter_sql_injection built out of the user's text.
 
     The return value is ``Composed([col, SQL(" <op> "), Composed([...])])``.
+    Composed is iterable (psycopg2's .seq attribute does not exist in psycopg3).
     """
-    return list(clause.seq[-1])
+    return list(list(clause)[-1])
 
 
 # The complete set of characters the docstring promises to allow through.
@@ -112,7 +113,7 @@ def test_filter_sql_injection_builds_the_expected_composable(table):
 @pytest.mark.parametrize("op", sorted(set(postgres_infix_ops.values()) | {"="}))
 def test_filter_sql_injection_uses_the_requested_operator(table, op):
     clause, _ = filter_sql_injection("n", Identifier("m"), "integer", op, table)
-    assert clause.seq[1] == SQL(" %s " % op)
+    assert list(clause)[1] == SQL(" %s " % op)
 
 
 def test_filter_sql_injection_separates_ints_from_floats(table):
@@ -134,9 +135,9 @@ def test_filter_sql_injection_emits_nothing_but_vetted_pieces(table, clause_text
     for piece in parsed_pieces(clause):
         assert isinstance(piece, (SQL, Identifier, Placeholder))
         if isinstance(piece, Identifier):
-            assert piece.strings[0] in table.search_cols
+            assert any(piece == Identifier(col) for col in table.search_cols)
         elif isinstance(piece, SQL):
-            assert set(piece.string) <= ALLOWED_OPERATOR_CHARS
+            assert set(piece.as_string()) <= ALLOWED_OPERATOR_CHARS
 
 
 def test_filter_sql_injection_binds_numbers_rather_than_inlining_them(table):
@@ -144,7 +145,7 @@ def test_filter_sql_injection_binds_numbers_rather_than_inlining_them(table):
     assert values == [42]
     assert Placeholder() in parsed_pieces(clause)
     assert not any(
-        isinstance(piece, SQL) and "42" in piece.string for piece in parsed_pieces(clause)
+        isinstance(piece, SQL) and "42" in piece.as_string() for piece in parsed_pieces(clause)
     )
 
 
@@ -227,7 +228,8 @@ def test_identifier_wrapper_passes_plain_names_to_identifier(name):
     # quoting at render time.
     wrapped = IdentifierWrapper(name)
     assert wrapped == Identifier(name)
-    assert wrapped.strings == (name,)
+    # rendered with quoting (psycopg3's as_string needs no connection)
+    assert wrapped.as_string() == '"%s"' % name.replace('"', '""')
 
 
 @pytest.mark.parametrize("name,slicer", [

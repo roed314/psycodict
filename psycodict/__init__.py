@@ -26,15 +26,19 @@ You can search using the methods ``search``, ``lucky`` and ``lookup``::
 """
 
 try:
-    import psycopg2
-    assert psycopg2
+    import psycopg
+    assert psycopg
 except ImportError:
-    print('Missing psycopg2 dependency; either do "pip -install psycopg2-binary" or "pip -install psycopg2" (requires a C compiler, some development packages)')
+    print('Missing psycopg dependency; either do "pip install psycopg[binary]" or "pip install psycopg" (requires libpq installed on your system)')
     raise
 
 from .utils import DelayCommit
 
 assert DelayCommit
-from psycopg2.sql import SQL
+# Re-export the SQL composition classes of the driver psycodict is built on.
+# Downstream projects that compose queries for _execute should import these
+# from psycodict rather than from a driver directly, so that their code does
+# not depend on which driver psycodict uses.
+from psycopg.sql import SQL, Identifier, Placeholder, Literal, Composable, Composed
 
-assert SQL
+assert SQL and Identifier and Placeholder and Literal and Composable and Composed

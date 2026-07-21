@@ -5,13 +5,7 @@ import sys
 import re
 from collections import defaultdict
 
-from psycopg2.sql import SQL, Identifier, Placeholder
-from psycopg2 import __version__ as pg_ver_str
-
-psycopg2_version = pg_ver_str.split(" ")[0].split(".")[:3]
-if len(psycopg2_version) < 3:
-    psycopg2_version += ["0"] * (3 - len(psycopg2_version))
-psycopg2_version = tuple(int(c) for c in psycopg2_version)
+from psycopg.sql import SQL, Identifier, Placeholder
 
 
 class SearchParsingError(ValueError):
@@ -103,7 +97,7 @@ def IdentifierWrapper(name, convert=True):
     """
     Returns a composable representing an SQL identifier.
 
-    This is  wrapper for psycopg2.sql.Identifier that supports ARRAY slicers
+    This is  wrapper for psycopg.sql.Identifier that supports ARRAY slicers
     and converts them (if desired) from the Python format to SQL,
     as SQL starts at 1, and it is inclusive at the end
 

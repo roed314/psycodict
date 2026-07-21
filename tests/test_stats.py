@@ -248,7 +248,7 @@ def test_stats_and_counts_tables_exist(db, empty_table):
 
 
 def _information_schema_query():
-    from psycopg2.sql import SQL
+    from psycopg.sql import SQL
 
     return SQL(
         "SELECT table_name FROM information_schema.tables "
@@ -263,7 +263,7 @@ def test_total_starts_at_zero_for_new_table(empty_table):
 def test_set_total_with_suffix_leaves_the_live_total_alone(db, filled_table):
     # refresh_stats(suffix="_tmp") runs while a reload is staged; the count
     # of the staged table must not become the live total before the swap.
-    from psycopg2.sql import SQL
+    from psycopg.sql import SQL
 
     filled_table.stats._set_total(7, suffix="_tmp")
     assert filled_table.stats.total == 200
