@@ -176,7 +176,7 @@ class PostgresTable(PostgresBase):
     # Indexes and performance analysis                               #
     ##################################################################
 
-    def analyze(self, query, projection=1, limit=1000, offset=0, sort=None, explain_only=False):
+    def analyze(self, query, projection=1, limit=1000, offset=0, sort=None, explain_only=False, join=None):
         """
         Prints an analysis of how a given query is being executed, for use in optimizing searches.
 
@@ -188,6 +188,10 @@ class PostgresTable(PostgresBase):
         - ``offset`` -- an offset starting point for results
         - ``sort`` -- a string or list specifying a sort order
         - ``explain_only`` -- whether to execute the query (if ``True`` then will only use Postgres' query planner rather than actually carrying out the query)
+        - ``join`` -- a list of tuples describing other search tables to join
+          to this one, as for ``search``; the query, projection and sort may
+          then use qualified columns.  Slow joined searches log a replication
+          command that includes this argument.
 
         EXAMPLES::
 
@@ -207,13 +211,16 @@ class PostgresTable(PostgresBase):
             Planning time: 2.880 ms
             Execution time: 1947.655 ms
         """
-        search_cols = self._parse_projection(projection)
-        cols = SQL(", ").join(map(IdentifierWrapper, search_cols))
-        if limit is None:
-            qstr, values = self._build_query(query, sort=sort)
+        if join is not None:
+            _, selecter, values = self._join_selecter(query, projection, join, limit=limit, offset=offset, sort=sort)
         else:
-            qstr, values = self._build_query(query, limit, offset, sort)
-        selecter = SQL("SELECT {0} FROM {1}{2}").format(cols, Identifier(self.search_table), qstr)
+            search_cols = self._parse_projection(projection)
+            cols = SQL(", ").join(map(IdentifierWrapper, search_cols))
+            if limit is None:
+                qstr, values = self._build_query(query, sort=sort)
+            else:
+                qstr, values = self._build_query(query, limit, offset, sort)
+            selecter = SQL("SELECT {0} FROM {1}{2}").format(cols, Identifier(self.search_table), qstr)
         if explain_only:
             analyzer = SQL("EXPLAIN {0}").format(selecter)
         else:

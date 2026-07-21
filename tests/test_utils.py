@@ -471,3 +471,41 @@ def test_make_tuple(value, expected):
 def test_make_tuple_output_is_hashable(value):
     # the documented application: using the result as a dictionary key
     assert {make_tuple(value): "ok"}[make_tuple(value)] == "ok"
+
+
+class FakeJoinedTable:
+    search_table = "other_table"
+    search_cols = ["k", "n"]
+
+
+def test_filter_sql_injection_resolves_joined_names(table):
+    ctx = {"other_table": FakeJoinedTable()}
+    clause, values = filter_sql_injection(
+        "n+other_table.k+1", Identifier("m"), "integer", "=", table, join_context=ctx
+    )
+    rendered = clause.as_string(None)
+    # bare names are the primary table's and everything is emitted qualified
+    assert '"test_table"."n"' in rendered
+    assert '"other_table"."k"' in rendered
+    assert values == [1]
+
+
+def test_filter_sql_injection_joined_rejects_unknown_names(table):
+    ctx = {"other_table": FakeJoinedTable()}
+    # an unknown column of the joined table names that table in the error
+    with pytest.raises(SearchParsingError, match="other_table"):
+        filter_sql_injection("other_table.bogus", Identifier("m"), "integer", "=", table, join_context=ctx)
+    # a prefix that is not a joined table is not a column path either
+    with pytest.raises(SearchParsingError, match="not a column"):
+        filter_sql_injection("elsewhere.k", Identifier("m"), "integer", "=", table, join_context=ctx)
+    # a joined table's name alone is not a column
+    with pytest.raises(SearchParsingError, match="not a column"):
+        filter_sql_injection("other_table", Identifier("m"), "integer", "=", table, join_context=ctx)
+
+
+def test_filter_sql_injection_joined_still_binds_floats(table):
+    ctx = {"other_table": FakeJoinedTable()}
+    clause, values = filter_sql_injection(
+        "other_table.k*2.5", Identifier("m"), "numeric", "=", table, join_context=ctx
+    )
+    assert values == [2.5]

@@ -7,7 +7,7 @@ It is designed to interface with PostgreSQL, though it could be modified to work
 
 ## Overall structure
 
- * A query is evalauted in the context of a single table and does not contain information on which table it applies to.
+ * A query is evalauted in the context of a single table and does not contain information on which table it applies to.  Columns of other tables can be brought into a query by joining the tables; see [Joined queries](#joined-queries).
  * The constructed query is the conjunction of the terms defined by the key-value pairs: all terms must be satisfied.  In particular, the empty dictionary corresponds to omitting a `WHERE` clause, yielding all rows.
  * The top-level keys may be
    * a column name,
@@ -97,9 +97,37 @@ The value should be a pair of integers `[a, b]` with `0 <= a < b`, and rows are 
 
 For array columns, searches for rows where the column overlaps with a given list of values.  Translates to the `&&` operator.
 
+## Comparing columns: the `$col` special key
+
+The special keys above compare a column to a fixed value.  To compare a column to *another column of the same table*, use `$col` with the other column's name:
+
+ * `{"col1": {"$col": "col2"}}` translates to `WHERE col1 = col2`;
+ * `{"col1": {"$lte": {"$col": "col2"}}}` translates to `WHERE col1 <= col2`, and `{"$col": ...}` can likewise be used as the value for any of the infix operator keys (`$lt`, `$gte`, `$gt`, `$ne`, `$like`, `$ilike`, `$regex`);
+ * an array slicer is allowed on the named column, so `{"n": {"$col": "vec[2]"}}` compares `n` with the third entry of `vec` (slicers are written in Python style, starting at zero).
+
+The named column resolves exactly like a query key — a bare name is a column of the table being searched, and in a [joined query](#joined-queries) `"table.column"` names a joined table's column, so `$col` can compare columns of different tables.  Path specifiers are not supported, and the two columns must have comparable types.
+
 ## The `$raw` special key
 
-Note that the column constraints enabled by all of the above special keys only allow comparing a column to a fixed value, not columns to each other.  As a limited mechanism to get around this limitation, the `$raw` key is available.  Details to be added.
+For constraints beyond column-to-column comparison, `$raw` accepts a limited arithmetic expression in the table's columns: `{"abvar_count": {"$lte": {"$raw": "q^g"}}}` translates to `WHERE abvar_count <= q^g`, and a direct `{"col": {"$raw": "expr"}}` to `WHERE col = expr`.  Names in the expression resolve like query keys, so in a [joined query](#joined-queries) `"table.column"` brings in a joined table's column.  The expression is not passed through as SQL: it may only contain column names, numeric literals, and the characters `+-*/^()`, so that untrusted input cannot inject SQL.
+
+## Joined queries
+
+The `search`, `count`, `lucky` and `lookup` methods accept a `join` option that makes columns of other search tables available to the query, the projection and the results:
+
+```python
+db.ec_nfcurves.search(
+    {"rank": 1, "nf_fields.r2": 1},
+    ["label", "nf_fields.degree"],
+    join=[("field_label", "nf_fields.label")],
+    limit=3,
+)
+```
+
+ * **Join specification.**  `join` is a list of tuples `(col1, col2)` or `(col1, col2, jointype)`, each adding one table to the query via `JOIN ... ON col1 = col2`.  `col2` must be written as `"table.column"` and names the table being joined; `col1` is a column of the primary table, or of a previously joined table if written as `"table.column"`.  `jointype` is `"inner"` (the default), `"left"`, `"right"` or `"full"`.  Each table can be joined at most once, and join columns must be plain columns (no path specifiers).
+ * **Name resolution.**  When `join` is given, keys in the query, entries in the projection and sort, and column names given to `$col` are split at the first period: if the prefix names a joined table, the name refers to that table's column, and any further periods are a path specifier within that column.  Otherwise the whole name refers to the primary table as usual, with periods keeping their [path specifier](#column-part-specifiers) meaning.  Result dictionaries use the projection entries verbatim as keys, so joined columns come back under their qualified names.
+ * **What works.**  The special keys above all apply to joined columns, including path specifiers; `$or`, `$and` and `$not` clauses may mix constraints on several tables; `$col` may compare, and `$raw` expressions may combine, columns of different tables — names in both resolve like query keys — covering cross-table conditions beyond the `ON` clauses.  A LEFT join yields NULLs for the joined columns of unmatched rows, so `{"table.col": None}` finds the rows of the primary table without a match; RIGHT and FULL joins likewise surface rows with the *primary* table's columns NULL — project a joined column to identify them, since None values are omitted from result dictionaries.
+ * **Restrictions** (violations raise `ValueError`): `split_ors`, `one_per`, `raw` and `groupby` do not combine with `join`; dictionary projections are not supported.  Counts of joined queries are computed directly and never cached.
 
 ## Typecasts
 
