@@ -37,6 +37,7 @@ check whether the columns constrained by slow queries are covered.
 import re
 from collections import defaultdict
 from datetime import datetime
+from heapq import heapify, heappop, heappush
 from math import ceil, floor, log10
 
 _TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - ")
@@ -219,6 +220,7 @@ _NUMBER_RE = re.compile(_NUMBER)
 _ARRAY_RE = re.compile(r"\bARRAY\[")
 _ARRAY_CONTENT_RE = re.compile(r"^[?,\s\[\]]*$")
 _PLACEHOLDER_LIST_RE = re.compile(r"\(\s*\?\s*(?:,\s*\?\s*)+\)")
+_PLACEHOLDER_BRACKET_RE = re.compile(r"\[\s*\?\s*(?:,\s*\?\s*)+\]")
 _DUP_CLAUSE_RE = re.compile(r"(?<![\w\"'?])((?:NOT )?[^()]{1,400}?) (OR|AND) \1(?![\w\"'?])")
 _JSONB_PATH_OPS = ("->", "->>", "#>", "#>>")
 
@@ -230,9 +232,9 @@ def normalize_query(query):
     differing only in their constants compare equal.
 
     - numbers, quoted strings and boolean literals become ``?`` (string
-      literals directly after the jsonb path operators ``->``, ``->>``,
-      ``#>``, ``#>>`` are kept, since they select which field is queried
-      rather than which value)
+      literals and numbers directly after the jsonb path operators ``->``,
+      ``->>``, ``#>``, ``#>>`` are kept, since they select which field or
+      array position is queried rather than which value)
     - the contents of ``ARRAY[...]`` literals collapse to ``ARRAY[?]``
     - comma-separated lists of replaced values, as in ``IN (1, 2, 3)``,
       collapse to ``(?)``
@@ -317,8 +319,15 @@ def normalize_query(query):
                 tail = (tail + c)[-4:]
                 i += 1
                 continue
-            out.append("?")
-            tail = (tail + "?")[-4:]
+            if tail.endswith(_JSONB_PATH_OPS):
+                # an array position in a jsonb path: part of the query
+                # shape, not a value
+                number = query[i:m.end()]
+                out.append(number)
+                tail = (tail + number)[-4:]
+            else:
+                out.append("?")
+                tail = (tail + "?")[-4:]
             i = m.end()
         elif c.isspace():
             if out and not out[-1].endswith(" "):
@@ -376,6 +385,93 @@ def _collapse_repeats(s):
         if new == s:
             break
         s = new
+    return s
+
+
+def normalize_dict_query(query):
+    """
+    Normalize a query dictionary rendered as a string (the Python repr that
+    ``Search iterator`` log lines carry) to its shape.
+
+    In a query dictionary the keys -- column names and ``$``-operators like
+    ``$gte`` -- describe the structure of the query, and only the values
+    are data, so :func:`normalize_query` (which treats every quoted string
+    as a literal value) would collapse structurally different queries such
+    as ``{'n': {'$gte': 5}}`` and ``{'label': {'$lte': 'z'}}`` to the same
+    shape.  Here a quoted string or a number is kept exactly when it is
+    followed by ``:``, i.e. when it is a dictionary key:
+
+    - values (numbers, quoted strings, ``True``/``False``/``None``) become
+      ``?``
+    - lists and tuples of replaced values collapse: ``[1, 2, 3]`` becomes
+      ``[?]``, so ``$in`` queries group independently of the list length
+    - runs of whitespace (including newlines) become a single space
+
+    EXAMPLES::
+
+        sage: from psycodict.slowlog import normalize_dict_query
+        sage: normalize_dict_query("{'n': {'$gte': 5}, 'label': 'a'}")
+        "{'n': {'$gte': ?}, 'label': ?}"
+    """
+    out = []
+    i = 0
+    n = len(query)
+
+    def is_key(j):
+        # whether the literal ending just before position j is a dict key,
+        # i.e. is followed by a colon
+        while j < n and query[j].isspace():
+            j += 1
+        return j < n and query[j] == ":"
+
+    while i < n:
+        c = query[i]
+        if c in "'\"":
+            # a Python string literal, with backslash escapes
+            j = i + 1
+            while j < n:
+                if query[j] == "\\":
+                    j += 2
+                    continue
+                if query[j] == c:
+                    break
+                j += 1
+            if is_key(j + 1):
+                out.append(query[i:j + 1])
+            else:
+                out.append("?")
+            i = j + 1
+        elif c.isalpha() or c == "_":
+            j = i + 1
+            while j < n and (query[j].isalnum() or query[j] == "_"):
+                j += 1
+            word = query[i:j]
+            if word in ("True", "False", "None") and not is_key(j):
+                out.append("?")
+            else:
+                out.append(word)
+            i = j
+        elif c.isdigit() or (c in ".-" and i + 1 < n and query[i + 1].isdigit()):
+            m = _NUMBER_RE.match(query, i + (1 if c == "-" else 0))
+            if m is None:
+                out.append(c)
+                i += 1
+                continue
+            if is_key(m.end()):
+                out.append(query[i:m.end()])
+            else:
+                out.append("?")
+            i = m.end()
+        elif c.isspace():
+            if out and not out[-1].endswith(" "):
+                out.append(" ")
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    s = "".join(out).strip()
+    s = _PLACEHOLDER_BRACKET_RE.sub("[?]", s)
+    s = _PLACEHOLDER_LIST_RE.sub("(?)", s)
     return s
 
 
@@ -472,9 +568,26 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
       percentiles.
     - ``shapes`` -- a list of dictionaries, one per query shape, sorted by
       total time, with keys ``shape``, ``kind``, ``count``, ``total``,
-      ``mean``, ``max``, ``tables``, ``example`` (the slowest query seen
-      with this shape), ``replicate`` (its hint-line call, if any) and
-      ``suggestions`` (a list of strings; see the module documentation).
+      ``mean``, ``max``, ``tables``, ``example`` (the slowest query
+      retained for this shape; see below), ``replicate`` (the hint-line
+      call of that same example record, if it had one) and ``suggestions``
+      (a list of strings; see the module documentation).
+
+    Memory use: the per-shape numeric aggregates (``count``, ``total``,
+    ``max``, ``tables`` and the shape string itself) are exact and are kept
+    for every distinct shape, so that ``total_time``, ``percentiles``,
+    ``thresholds`` and the reported aggregates do not depend on ``top``.
+    This dictionary grows with the number of DISTINCT shapes -- bounded in
+    practice by the variety of queries the application issues, not by the
+    length of the log.  The large per-shape strings (``example`` and
+    ``replicate``), by contrast, are retained only for a candidate set of
+    about ``4 * top`` shapes, the current leaders by total time; when a
+    shape drops out of the candidate set its example is discarded, and if
+    it later climbs back the next record of that shape refills it.  The
+    example of a reported shape is therefore the slowest of the records
+    that arrived while the shape was retained -- normally, but not always,
+    its globally slowest record.  Every reported shape has an example, and
+    with ``top=None`` all shapes retain theirs.
     """
     stats = {}
     shapes = {}
@@ -482,6 +595,14 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
     records = skipped = considered_lines = 0
     total_time = 0.0
     max_duration = None
+    # Example retention (see the docstring): full example/replicate strings
+    # are kept only for the ``cap`` current leaders by total time.  Each
+    # retaining shape has exactly one live entry in ``heap`` (marked by its
+    # ``_seq``); older entries are stale and dropped when encountered.
+    cap = None if top is None else 4 * top
+    holders = set()  # shapes currently retaining an example
+    heap = []  # (total at push time, seq, shape)
+    seq = 0
     for rec in parse_slow_log(logfile, stats=stats):
         records += 1
         duration = rec["duration"]
@@ -495,9 +616,10 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
         entry = histogram[_bucket(duration)]
         entry[0] += 1
         entry[1] += rec["lines"]
-        shape = normalize_query(rec["query"])
         if rec["kind"] == "iterator":
-            shape = "Search iterator for %s %s" % (rec["table"], shape)
+            shape = "Search iterator for %s %s" % (rec["table"], normalize_dict_query(rec["query"]))
+        else:
+            shape = normalize_query(rec["query"])
         data = shapes.get(shape)
         if data is None:
             tables = _tables_in_sql(shape) if rec["kind"] == "query" else set()
@@ -508,18 +630,55 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
                 "total": 0.0,
                 "max": 0.0,
                 "tables": tables,
-                "example": rec["query"],
-                "replicate": rec["replicate"],
+                "example": None,
+                "replicate": None,
             }
         data["count"] += 1
         data["total"] += duration
         if rec["table"]:
             data["tables"].add(rec["table"])
-        if duration >= data["max"]:
+        if duration > data["max"]:
             data["max"] = duration
-            data["example"] = rec["query"]
-            if rec["replicate"]:
+        if shape in holders:
+            if duration >= data["_exdur"]:
+                # the example and its replicate hint always come from the
+                # same record: a slower record without a hint replaces both
+                data["example"] = rec["query"]
                 data["replicate"] = rec["replicate"]
+                data["_exdur"] = duration
+            if cap is not None:
+                seq += 1
+                data["_seq"] = seq
+                heappush(heap, (data["total"], seq, shape))
+        else:
+            admit = cap is None or len(holders) < cap
+            if not admit and cap:
+                # drop heap entries no longer describing a retained shape
+                while heap:
+                    _, seq0, shape0 = heap[0]
+                    if shape0 in holders and seq0 == shapes[shape0]["_seq"]:
+                        break
+                    heappop(heap)
+                if heap and data["total"] >= heap[0][0]:
+                    _, _, evicted = heappop(heap)
+                    holders.discard(evicted)
+                    ev = shapes[evicted]
+                    ev["example"] = ev["replicate"] = None
+                    del ev["_exdur"], ev["_seq"]
+                    admit = True
+            if admit:
+                holders.add(shape)
+                data["example"] = rec["query"]
+                data["replicate"] = rec["replicate"]
+                data["_exdur"] = duration
+                if cap is not None:
+                    seq += 1
+                    data["_seq"] = seq
+                    heappush(heap, (data["total"], seq, shape))
+        if cap is not None and len(heap) > 4 * cap + 64:
+            # compact the stale entries away, keeping the heap O(cap)
+            heap = [(shapes[s]["total"], shapes[s]["_seq"], s) for s in holders]
+            heapify(heap)
 
     considered = records - skipped
     buckets = sorted((value, counts[0]) for value, counts in histogram.items())
@@ -548,8 +707,15 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
                 "percent": 100.0 * kept_lines / considered_lines,
             })
 
-    top_shapes = sorted(shapes.values(), key=lambda data: -data["total"])[:top]
+    # among shapes tied on total time, prefer those retaining an example,
+    # so that every reported shape has one (there are at least ``top``
+    # retaining shapes whenever at least ``top`` shapes were seen)
+    top_shapes = sorted(
+        shapes.values(), key=lambda data: (-data["total"], data["example"] is None)
+    )[:top]
     for data in top_shapes:
+        data.pop("_exdur", None)
+        data.pop("_seq", None)
         data["mean"] = data["total"] / data["count"]
         data["tables"] = sorted(data["tables"])
         data["suggestions"] = _suggestions(data, db)
@@ -573,12 +739,17 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
 ##################################################################
 
 # A column reference as it appears in psycodict-generated SQL: a quoted
-# identifier, optionally followed by jsonb path accesses or array slices
-_COLREF = r'"(?P<col>[A-Za-z_][A-Za-z0-9_]*)"(?P<path>(?:(?:->>?|#>>?)(?:\'(?:[^\']|\'\')*\'|\?)|\[[^\]]*\])*)'
+# identifier, optionally qualified by a quoted table name (as in joined
+# queries), optionally followed by jsonb path accesses or array slices
+_COLREF = (
+    r'(?:"(?P<tbl>[A-Za-z_][A-Za-z0-9_]*)"\.)?'
+    r'"(?P<col>[A-Za-z_][A-Za-z0-9_]*)"'
+    r'(?P<path>(?:(?:->>?|#>>?)(?:\'(?:[^\']|\'\')*\'|\?|-?[0-9]+)|\[[^\]]*\])*)'
+)
 _CONSTRAINT_RE = re.compile(_COLREF + r"\s*(?P<op>=\s*ANY\s*\(|@>|<@|&&|<=|>=|!=|<>|=|<|>)")
 _LIKE_RE = re.compile(_COLREF + r"\s+(?:NOT\s+)?(?:LIKE|ILIKE)\s+(?P<pat>'(?:[^']|'')*')", re.IGNORECASE)
 _ORDER_BY_RE = re.compile(r"\bORDER\s+BY\s+(?P<cols>[^()]*?)(?:\s+LIMIT\b|\s+OFFSET\b|\)|$)", re.IGNORECASE | re.DOTALL)
-_SORT_COL_RE = re.compile(r'^"([A-Za-z_][A-Za-z0-9_]*)"')
+_SORT_COL_RE = re.compile(r'^(?:"(?P<tbl>[A-Za-z_][A-Za-z0-9_]*)"\.)?"(?P<col>[A-Za-z_][A-Za-z0-9_]*)"')
 _WHERE_RE = re.compile(r"\bWHERE\b", re.IGNORECASE)
 
 
@@ -599,18 +770,21 @@ def _constrained_columns(example):
     OUTPUT:
 
     A dictionary with keys ``equality``, ``range``, ``containment`` (the
-    array/jsonb operators ``@>``, ``<@``, ``&&``), ``path`` (equality on a
-    path inside a jsonb column), ``like`` (a list of (column, pattern)
-    pairs) and ``order`` (the columns of the outermost ORDER BY), each a
-    list of column names in order of first appearance.  Only quoted column
-    names are recognized, which is how psycodict renders columns; the
-    parsing is heuristic and makes no attempt to understand subqueries.
+    array/jsonb operators ``@>``, ``<@``, ``&&``) and ``order`` (the
+    columns of the outermost ORDER BY), each a list of ``(table, column)``
+    pairs in order of first appearance, where ``table`` is the explicit
+    qualifier of a ``"tbl"."col"`` reference (as in joined queries) or
+    None; and keys ``path`` (equality on a path inside a jsonb column, a
+    list of column names) and ``like`` (a list of (column, pattern)
+    pairs).  Only quoted column names are recognized, which is how
+    psycodict renders columns; the parsing is heuristic and makes no
+    attempt to understand subqueries.
     """
     found = {"equality": [], "range": [], "containment": [], "path": [], "like": [], "order": []}
 
-    def add(kind, col):
-        if col not in found[kind]:
-            found[kind].append(col)
+    def add(kind, item):
+        if item not in found[kind]:
+            found[kind].append(item)
 
     m = _WHERE_RE.search(example)
     if m:
@@ -619,7 +793,7 @@ def _constrained_columns(example):
         if tail:
             where = where[:tail.start()]
         for m in _CONSTRAINT_RE.finditer(where):
-            col, path, op = m.group("col"), m.group("path"), m.group("op")
+            tbl, col, path, op = m.group("tbl"), m.group("col"), m.group("path"), m.group("op")
             op = op.rstrip()
             if op.startswith("=") and op.endswith("("):
                 op = "ANY"
@@ -632,11 +806,11 @@ def _constrained_columns(example):
                     add("path", col)
                 continue
             if op in ("=", "ANY"):
-                add("equality", col)
+                add("equality", (tbl, col))
             elif op in ("<", "<=", ">", ">="):
-                add("range", col)
+                add("range", (tbl, col))
             else:  # @>, <@, &&
-                add("containment", col)
+                add("containment", (tbl, col))
         for m in _LIKE_RE.finditer(where):
             found["like"].append((m.group("col"), m.group("pat").strip("'")))
     m = _ORDER_BY_RE.search(example)
@@ -644,7 +818,7 @@ def _constrained_columns(example):
         for piece in m.group("cols").split(","):
             cm = _SORT_COL_RE.match(piece.strip())
             if cm:
-                add("order", cm.group(1))
+                add("order", (cm.group("tbl"), cm.group("col")))
     return found
 
 
@@ -670,15 +844,13 @@ def _leading_index_columns(db, tables):
     return leaders
 
 
-def _owning_table(col, tables, db):
+def _render_col(tbl, col):
     """
-    The table among ``tables`` (already filtered to ``db.tablenames``)
-    having ``col`` as a search column, or None.
+    Render a possibly qualified column reference for a suggestion message.
     """
-    for tname in tables:
-        if col in db[tname].search_cols:
-            return tname
-    return None
+    if tbl:
+        return '"%s"."%s"' % (tbl, col)
+    return '"%s"' % col
 
 
 def _suggestions(data, db):
@@ -688,17 +860,23 @@ def _suggestions(data, db):
     Each suggestion states what was observed in the query text and what to
     try.  With ``db`` provided, equality/range/containment observations are
     checked against the indexes recorded in ``meta_indexes`` and reported
-    only when no index leads with the constrained column.
+    only when no index leads with the constrained column.  A qualified
+    reference (``"tbl"."col"``, as in joined queries) is resolved against
+    exactly that table; an unqualified column is looked up in all the
+    referenced tables, and when several of them have a column of that name
+    the suggestion lists each candidate rather than silently picking one.
     """
-    if data["kind"] != "query":
+    if data["kind"] != "query" or not data["example"]:
         return []
     example = data["example"]
     found = _constrained_columns(example)
     suggestions = []
 
-    checked = None
     if db is not None:
-        checked = _leading_index_columns(db, data["tables"])
+        referenced = set(data["tables"])
+        for kind in ("equality", "range", "containment", "order"):
+            referenced.update(tbl for tbl, _ in found[kind] if tbl)
+        checked = _leading_index_columns(db, sorted(referenced))
 
         def leaders(tname, types=None):
             per_type = checked.get(tname, {})
@@ -708,37 +886,91 @@ def _suggestions(data, db):
                     cols |= first
             return cols
 
+        def candidate_tables(tbl, col):
+            # the tables the constrained column could belong to: exactly
+            # the qualifier when there is one, otherwise every referenced
+            # table having a search column of that name
+            if tbl is not None:
+                if tbl in checked and col in db[tbl].search_cols:
+                    return [tbl]
+                return []
+            return [tname for tname in checked if col in db[tname].search_cols]
+
         for kind, types, description in [
             ("equality", None, "an equality constraint"),
             ("range", ("btree",), "a range constraint"),
         ]:
-            for col in found[kind]:
+            for tbl, col in found[kind]:
                 if col == "id":
                     continue  # id always has its primary key index
-                tname = _owning_table(col, checked, db)
-                if tname is not None and col not in leaders(tname, types):
+                candidates = candidate_tables(tbl, col)
+                lacking = [t for t in candidates if col not in leaders(t, types)]
+                if not lacking:
+                    continue
+                if len(candidates) == 1:
+                    tname = candidates[0]
                     suggestions.append(
                         '"%s" appears in %s but no index on %s leads with it; '
                         "consider db.%s.create_index(['%s'])"
                         % (col, description, tname, tname, col)
                     )
-        for col in found["containment"]:
-            tname = _owning_table(col, checked, db)
-            if tname is not None and col not in leaders(tname, ("gin",)):
+                else:
+                    suggestions.append(
+                        '"%s" appears in %s and several of the referenced tables '
+                        "have a column of that name (%s); no index leads with it "
+                        "on %s; consider %s"
+                        % (col, description, ", ".join(candidates), ", ".join(lacking),
+                           " or ".join("db.%s.create_index(['%s'])" % (t, col) for t in lacking))
+                    )
+        for tbl, col in found["containment"]:
+            candidates = candidate_tables(tbl, col)
+            lacking = [t for t in candidates if col not in leaders(t, ("gin",))]
+            if not lacking:
+                continue
+            if len(candidates) == 1:
+                tname = candidates[0]
                 suggestions.append(
                     '"%s" is filtered with a containment/overlap operator (@>, <@, &&) '
                     "but has no GIN index; consider db.%s.create_index(['%s'], type='gin')"
                     % (col, tname, col)
                 )
-        if found["order"]:
-            first = found["order"][0]
-            tname = _owning_table(first, checked, db)
-            if tname is not None and first not in leaders(tname, ("btree",)):
+            else:
                 suggestions.append(
-                    "the sort ORDER BY %s is not supported by an index leading "
-                    "with \"%s\"; consider db.%s.create_index(%s)"
-                    % (", ".join('"%s"' % c for c in found["order"]), first, tname, found["order"])
+                    '"%s" is filtered with a containment/overlap operator (@>, <@, &&) '
+                    "and several of the referenced tables have a column of that name "
+                    "(%s); no GIN index covers it on %s; consider %s"
+                    % (col, ", ".join(candidates), ", ".join(lacking),
+                       " or ".join("db.%s.create_index(['%s'], type='gin')" % (t, col) for t in lacking))
                 )
+        if found["order"]:
+            tbl, first = found["order"][0]
+            order_str = ", ".join(_render_col(t, c) for t, c in found["order"])
+            candidates = candidate_tables(tbl, first)
+            lacking = [t for t in candidates if first not in leaders(t, ("btree",))]
+            if lacking:
+                if len(candidates) == 1:
+                    tname = candidates[0]
+                    # an index can only support the sort as far as the sort
+                    # columns stay on the same table
+                    idxcols = []
+                    for q, c in found["order"]:
+                        if (q is None or q == tname) and c in db[tname].search_cols:
+                            idxcols.append(c)
+                        else:
+                            break
+                    suggestions.append(
+                        "the sort ORDER BY %s is not supported by an index leading "
+                        "with \"%s\"; consider db.%s.create_index(%s)"
+                        % (order_str, first, tname, idxcols)
+                    )
+                else:
+                    suggestions.append(
+                        'the sort ORDER BY %s leads with "%s", and several of the '
+                        "referenced tables have a column of that name (%s); no btree "
+                        "index leads with it on %s; consider %s"
+                        % (order_str, first, ", ".join(candidates), ", ".join(lacking),
+                           " or ".join("db.%s.create_index(['%s'])" % (t, first) for t in lacking))
+                    )
     else:
         observed = [
             (kind, found[kind])
@@ -750,7 +982,7 @@ def _suggestions(data, db):
                 "columns constrained in this shape -- %s -- pass db= to check "
                 "them against existing indexes"
                 % "; ".join(
-                    "%s: %s" % (kind, ", ".join('"%s"' % c for c in cols))
+                    "%s: %s" % (kind, ", ".join(_render_col(t, c) for t, c in cols))
                     for kind, cols in observed
                 )
             )
@@ -837,7 +1069,7 @@ def show_slow_report(logfile, top=20, cutoff=None, db=None):
                " on " + tables if tables else "")
         )
         print("    %s" % data["shape"])
-        if data["count"] > 1 or data["example"] != data["shape"]:
+        if data["example"] is not None and (data["count"] > 1 or data["example"] != data["shape"]):
             print("    example: %s" % _abbreviate(data["example"], 500))
         if data["replicate"]:
             print("    replicate: %s" % _abbreviate(data["replicate"], 500))

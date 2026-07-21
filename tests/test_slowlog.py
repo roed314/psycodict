@@ -6,9 +6,10 @@ slow-query logs written by PostgresBase._execute.
 Rather than fabricating log lines to match what we believe the logging code
 emits, most tests here generate a real log: a Configuration with
 ``slowcutoff = 0`` makes every query slow, so running ordinary searches
-against a small table produces a genuine slow-query log to analyze.  One
-test does use a synthetic file, to cover formats from older versions of the
-code (no ANSI colors) that the current code no longer writes.
+against a small table produces a genuine slow-query log to analyze.  Some
+tests do use synthetic files, to cover formats from older versions of the
+code (no ANSI colors) that the current code no longer writes, and to pin
+down grouping, retention and suggestion behavior on exactly known input.
 """
 import os
 import uuid
@@ -16,6 +17,7 @@ import uuid
 import pytest
 
 from psycodict.slowlog import (
+    normalize_dict_query,
     normalize_query,
     parse_slow_log,
     show_slow_report,
@@ -210,6 +212,17 @@ def test_normalize_query():
     # jsonb paths are part of the shape: the field stays, the value goes
     assert normalize_query("\"data\"->'s' = '\"v1\"'") == "\"data\"->'s' = ?"
     assert normalize_query("\"data\"->'s' = '\"v1\"'") != normalize_query("\"data\"->'t' = '\"v1\"'")
+    # numeric jsonb path components are structure too, just like string ones
+    assert normalize_query("\"data\"->0 = '\"v1\"'") == '"data"->0 = ?'
+    assert normalize_query('"data"->>2 > 7') == '"data"->>2 > ?'
+    assert normalize_query('"data"->-1 = 3') == '"data"->-1 = ?'
+    assert normalize_query('SELECT "data"->0 FROM "t" WHERE "n" = 5') != normalize_query(
+        'SELECT "data"->1 FROM "t" WHERE "n" = 5'
+    )
+    # while numbers used as values still collapse
+    assert normalize_query('SELECT "data"->0 FROM "t" WHERE "n" = 5') == normalize_query(
+        'SELECT "data"->0 FROM "t" WHERE "n" = 99'
+    )
     # identifiers containing digits are not values
     assert (
         normalize_query('SELECT "dim1_factor" FROM "av_fq_isog" WHERE "dim1_factor" = 5')
@@ -223,6 +236,53 @@ def test_normalize_query():
         'SELECT count FROM "t_counts" WHERE split = ?'
     )
     assert normalize_query('SELECT "a"\n    FROM "t"') == 'SELECT "a" FROM "t"'
+
+
+def test_normalize_dict_query():
+    # dictionary keys and $-operators are structure and survive; values go
+    assert normalize_dict_query("{'n': {'$gte': 5}}") == "{'n': {'$gte': ?}}"
+    # different keys or operators give different shapes...
+    assert normalize_dict_query("{'n': {'$gte': 5}}") != normalize_dict_query("{'label': {'$lte': 'z'}}")
+    assert normalize_dict_query("{'n': {'$gte': 5}}") != normalize_dict_query("{'n': {'$lte': 5}}")
+    # ...while values still collapse, whatever their type
+    assert normalize_dict_query("{'n': {'$gte': 5}}") == normalize_dict_query("{'n': {'$gte': 1234}}")
+    assert normalize_dict_query("{'label': 'abc'}") == normalize_dict_query("{'label': 'z'}") == "{'label': ?}"
+    # a double-quoted value (the repr of a string containing ') is a value
+    assert normalize_dict_query('{\'label\': "o\'brien"}') == "{'label': ?}"
+    # $in lists collapse regardless of length
+    assert normalize_dict_query("{'n': {'$in': [1, 2, 3]}}") == normalize_dict_query("{'n': {'$in': [7]}}")
+    # True/False/None are values; numeric keys are structure
+    assert normalize_dict_query("{'n': {'$exists': True}}") == "{'n': {'$exists': ?}}"
+    assert normalize_dict_query("{'x': None}") == "{'x': ?}"
+    assert normalize_dict_query("{1: 'x'}") == "{1: ?}"
+    assert normalize_dict_query("{}") == "{}"
+
+
+def test_iterator_shapes_report(tmp_path):
+    # Search-iterator records carry Python dict reprs, whose keys are
+    # structure: queries on different columns (or with different operators)
+    # must not collapse to a single shape, while different values must.
+    logfile = str(tmp_path / "iterators.log")
+    with open(logfile, "w") as F:
+        F.write("2020-01-01 12:00:00,000 - Search iterator for t {'n': {'$gte': 5}} required a total of 2.5s\n")
+        F.write("2020-01-01 12:00:01,000 - Search iterator for t {'n': {'$gte': 8}} required a total of 1.5s\n")
+        F.write("2020-01-01 12:00:02,000 - Search iterator for t {'label': {'$lte': 'z'}} required a total of 1.0s\n")
+        F.write("2020-01-01 12:00:03,000 - Search iterator for t {'n': {'$lte': 5}} required a total of 0.5s\n")
+    report = slow_query_report(logfile, top=10)
+    assert report["records"] == 4 and report["unparsed"] == 0
+    shapes = {data["shape"]: data for data in report["shapes"]}
+    assert set(shapes) == {
+        "Search iterator for t {'n': {'$gte': ?}}",
+        "Search iterator for t {'label': {'$lte': ?}}",
+        "Search iterator for t {'n': {'$lte': ?}}",
+    }
+    gte = shapes["Search iterator for t {'n': {'$gte': ?}}"]
+    assert gte["kind"] == "iterator"
+    assert gte["count"] == 2
+    assert abs(gte["total"] - 4.0) < 1e-9
+    # the example is the slowest raw dict of that shape
+    assert gte["example"] == "{'n': {'$gte': 5}}"
+    assert gte["tables"] == ["t"]
 
 
 def test_slow_query_report(slow_setup):
@@ -329,6 +389,143 @@ def test_index_suggestions(slow_setup):
     # without a database, the constrained columns are reported for manual checking
     report4 = slow_query_report(logfile, top=50)
     assert any("pass db=" in s and '"n"' in s for s in all_suggestions(report4))
+
+
+def test_join_suggestions_target_correct_table(slow_setup, tmp_path):
+    # Two joined tables sharing a column name: a qualified constraint
+    # ("tbl"."col") must be resolved against exactly that table, and an
+    # unqualified one against every referenced table having the column,
+    # naming each candidate rather than silently picking the first.
+    database, table, logfile = slow_setup
+    ja = table.search_table + "_ja"
+    jb = table.search_table + "_jb"
+    database.create_table(ja, COLUMNS, label_col="label", sort=["n"])
+    database.create_table(jb, COLUMNS, label_col="label", sort=["n"])
+    try:
+        # ja has an index leading with "n"; jb does not
+        database[ja].create_index(["n"])
+        joinlog = str(tmp_path / "join.log")
+        frm = 'FROM "%s" JOIN "%s" ON "%s"."id" = "%s"."id"' % (ja, jb, ja, jb)
+        with open(joinlog, "w") as F:
+            F.write('2020-01-01 12:00:00,000 - SELECT "%s"."label" %s WHERE "%s"."n" = 5 ran in 1.5s\n'
+                    % (ja, frm, jb))
+            F.write('2020-01-01 12:00:01,000 - SELECT "%s"."label" %s WHERE "%s"."n" = 7 ran in 1.25s\n'
+                    % (ja, frm, ja))
+            F.write('2020-01-01 12:00:02,000 - SELECT "%s"."label" %s WHERE "n" = 9 ran in 1.0s\n'
+                    % (ja, frm))
+        report = slow_query_report(joinlog, top=50, db=database)
+        assert report["records"] == 3 and report["unparsed"] == 0
+        assert len(report["shapes"]) == 3
+        by_where = {}
+        for data in report["shapes"]:
+            assert data["tables"] == sorted([ja, jb])
+            by_where[data["shape"].split("WHERE ")[1]] = data["suggestions"]
+
+        # constraint qualified with the unindexed table: the suggestion names
+        # that table, not the (indexed) one that happens to sort first
+        qualified_jb = by_where['"%s"."n" = ?' % jb]
+        assert any("db.%s.create_index(['n'])" % jb in s for s in qualified_jb), qualified_jb
+        assert not any("db.%s.create_index" % ja in s for s in qualified_jb), qualified_jb
+
+        # constraint qualified with the indexed table: no suggestion at all
+        # (in particular none pointing at the other, unindexed table)
+        qualified_ja = by_where['"%s"."n" = ?' % ja]
+        assert not any("create_index(['n'])" in s for s in qualified_ja), qualified_ja
+
+        # unqualified constraint on a column both tables have: the ambiguity
+        # is stated explicitly, with both candidates named
+        unqualified = by_where['"n" = ?']
+        ambiguous = [s for s in unqualified if "create_index(['n'])" in s]
+        assert len(ambiguous) == 1, unqualified
+        assert ja in ambiguous[0] and jb in ambiguous[0]
+        assert "several of the referenced tables" in ambiguous[0]
+        assert "db.%s.create_index(['n'])" % jb in ambiguous[0]
+    finally:
+        database.drop_table(ja, force=True)
+        database.drop_table(jb, force=True)
+
+
+def test_top_bounds_example_retention(tmp_path):
+    # More distinct shapes than the example-retention candidate set (4*top)
+    # holds: the numeric aggregates must still be exact for every shape,
+    # and every reported shape must come with an example.  Shape "aaa" is
+    # admitted, evicted by a flood of heavier shapes, and climbs back: its
+    # example is then the record that refilled it (not its globally
+    # slowest), while count/total/max stay exact.
+    logfile = str(tmp_path / "many_shapes.log")
+    with open(logfile, "w") as F:
+        def q(tbl, nval, dur):
+            F.write('2020-01-01 12:00:00,000 - SELECT "x" FROM "%s" WHERE "n" = %d ran in %ss\n'
+                    % (tbl, nval, dur))
+        q("aaa", 1, "5.0")
+        for i in range(15):
+            q("t%02d" % i, 1, "6.0")
+        q("bbb", 1, "7.0")
+        q("aaa", 2, "4.0")
+
+    report = slow_query_report(logfile, top=2)  # candidate set of 8 < 17 shapes
+    assert report["records"] == 18 and report["unparsed"] == 0
+    assert abs(report["total_time"] - 106.0) < 1e-9
+    assert len(report["shapes"]) == 2
+    a, b = report["shapes"]
+    assert a["shape"] == 'SELECT "x" FROM "aaa" WHERE "n" = ?'
+    assert (a["count"], a["max"]) == (2, 5.0)
+    assert abs(a["total"] - 9.0) < 1e-9 and abs(a["mean"] - 4.5) < 1e-9
+    # the example was refilled after eviction by the (faster) later record
+    assert a["example"] == 'SELECT "x" FROM "aaa" WHERE "n" = 2'
+    assert b["shape"] == 'SELECT "x" FROM "bbb" WHERE "n" = ?'
+    assert (b["count"], b["max"]) == (1, 7.0)
+    assert b["example"] == 'SELECT "x" FROM "bbb" WHERE "n" = 1'
+    for data in report["shapes"]:
+        assert data["example"] is not None
+        assert "_exdur" not in data and "_seq" not in data
+
+    # a run whose candidate set covers every shape agrees on the aggregates
+    full = slow_query_report(logfile, top=50)
+    assert len(full["shapes"]) == 17 > 4 * 2
+    assert sum(data["count"] for data in full["shapes"]) == 18
+    fa = [d for d in full["shapes"] if d["shape"] == a["shape"]][0]
+    assert (fa["count"], fa["total"], fa["max"]) == (a["count"], a["total"], a["max"])
+    # with an unbounded candidate set the example is the globally slowest
+    assert fa["example"] == 'SELECT "x" FROM "aaa" WHERE "n" = 1'
+
+
+def test_example_replicate_atomic(tmp_path):
+    # The example and its replicate hint must always come from the same
+    # record: when a hintless slower record replaces a hinted faster one,
+    # the stale hint must go too.
+    logfile = str(tmp_path / "atomic.log")
+    with open(logfile, "w") as F:
+        # hinted faster, then hintless slower: example moves, hint cleared
+        F.write('2020-01-01 12:00:00,000 - SELECT "a" FROM "ta" WHERE "n" = 1 ran in 0.2s\n')
+        F.write("2020-01-01 12:00:00,001 - Replicate with db.ta.analyze({'n': 1}, ['a'], 1000, 0)\n")
+        F.write('2020-01-01 12:00:01,000 - SELECT "a" FROM "ta" WHERE "n" = 2 ran in 0.9s\n')
+        # hintless slower first, hinted faster second: pairing kept
+        F.write('2020-01-01 12:00:02,000 - SELECT "a" FROM "tb" WHERE "n" = 3 ran in 0.9s\n')
+        F.write('2020-01-01 12:00:03,000 - SELECT "a" FROM "tb" WHERE "n" = 4 ran in 0.2s\n')
+        F.write("2020-01-01 12:00:03,001 - Replicate with db.tb.analyze({'n': 4}, ['a'], 1000, 0)\n")
+        # hintless faster first, hinted slower second: both move together
+        F.write('2020-01-01 12:00:04,000 - SELECT "a" FROM "tc" WHERE "n" = 5 ran in 0.2s\n')
+        F.write('2020-01-01 12:00:05,000 - SELECT "a" FROM "tc" WHERE "n" = 6 ran in 0.9s\n')
+        F.write("2020-01-01 12:00:05,001 - Replicate with db.tc.analyze({'n': 6}, ['a'], 1000, 0)\n")
+
+    report = slow_query_report(logfile, top=10)
+    assert report["records"] == 6 and report["unparsed"] == 0
+    shapes = {data["shape"].split('FROM "')[1][:2]: data for data in report["shapes"]}
+    assert set(shapes) == {"ta", "tb", "tc"}
+
+    ta = shapes["ta"]
+    assert ta["example"] == 'SELECT "a" FROM "ta" WHERE "n" = 2'
+    assert ta["replicate"] is None  # not the stale hint of the faster record
+    assert ta["max"] == 0.9 and ta["count"] == 2
+
+    tb = shapes["tb"]
+    assert tb["example"] == 'SELECT "a" FROM "tb" WHERE "n" = 3'
+    assert tb["replicate"] is None  # the hint of the faster record is not stolen
+
+    tc = shapes["tc"]
+    assert tc["example"] == 'SELECT "a" FROM "tc" WHERE "n" = 6'
+    assert tc["replicate"] == "db.tc.analyze({'n': 6}, ['a'], 1000, 0)"
 
 
 def test_show_slow_report(slow_setup, capsys):
