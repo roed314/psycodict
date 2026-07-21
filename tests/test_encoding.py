@@ -89,10 +89,6 @@ def test_numeric_converter_decimals(value, expected):
     # the sign, the decimal point and leading zeros carry no information
     ("-0.5", 4),
     ("0.5", 4),
-    # a decimal zero is exact at any precision, and a generous one keeps it
-    # from dragging down the precision of arithmetic partners
-    ("0.000", 53),
-    ("-0.0", 53),
 ])
 def test_numeric_precision_counts_significant_digits(value, prec):
     from psycodict.encoding import numeric_precision
@@ -100,17 +96,30 @@ def test_numeric_precision_counts_significant_digits(value, prec):
     assert numeric_precision(value) == prec
 
 
-def test_zero_does_not_degrade_sage_arithmetic():
+def test_decimal_zero_is_float_zero_without_sage():
+    assert numeric_converter("0.000") == 0.0
+    assert isinstance(numeric_converter("-0.0"), float)
+
+
+def test_decimal_zero_is_exact_and_does_not_degrade_sage_arithmetic():
     # Sage coerces a sum to the lowest precision of its operands, so a
-    # low-precision zero would turn 123.456 + 0.000 into a 2-bit 130.
-    pytest.importorskip("sage.rings.real_mpfr")
+    # floating zero of ANY fixed precision would drag higher-precision
+    # partners down to it (a 2-bit zero turned 123.456 + 0.000 into a
+    # 2-bit 130.).  An exact zero coerces into the partner's field instead.
+    sage_integer = pytest.importorskip("sage.rings.integer")
     from psycodict.encoding import numeric_converter
 
-    x = numeric_converter("123.456")
     z = numeric_converter("0.000")
-    total = x + z
-    assert total.parent().precision() >= x.parent().precision()
-    assert total == x
+    assert isinstance(z, sage_integer.Integer)
+    assert z == 0
+    # the literal is preserved for printing and serialization
+    assert str(z) == "0.000"
+    assert repr(z) == "0.000"
+    for value in ("123.456", "1.23456789012345678901234567890"):
+        x = numeric_converter(value)
+        total = x + z
+        assert total.parent().precision() == x.parent().precision()
+        assert total == x
 
 
 def test_numeric_converter_none_and_unused_cursor():

@@ -16,7 +16,7 @@ try:
         from sage.rings.complex_number import ComplexNumber, ComplexField
     from sage.rings.complex_double import ComplexDoubleElement
     from sage.rings.real_mpfr import RealLiteral, RealField, RealNumber
-    from sage.rings.integer import Integer
+    from sage.rings.integer import Integer, IntegerWrapper
     from sage.rings.rational import Rational
     from sage.rings.integer_ring import ZZ
     from sage.rings.rational_field import QQ
@@ -49,6 +49,31 @@ else:
             RealLiteral.__init__(self, parent, x, base)
 
         def __repr__(self):
+            return self.literal
+
+    class LmfdbDecimalZero(IntegerWrapper):
+        """
+        An exact zero constructed from an all-zero decimal string ("0.000").
+
+        A zero stored with decimal places is still exactly zero, and an
+        exact integer coerces into a real field at that field's precision,
+        so sums with high-precision values lose nothing -- a floating zero
+        of any fixed precision would drag them down to it instead.  The
+        string used to construct it is kept so the value prints (and is
+        serialized) as it was stored, like LmfdbRealLiteral.
+
+        IntegerWrapper rather than Integer: plain Integer allocation hands
+        out pooled instances for small values, bypassing subclasses.
+        """
+
+        def __init__(self, literal):
+            IntegerWrapper.__init__(self, ZZ, 0)
+            self.literal = literal
+
+        def __repr__(self):
+            return self.literal
+
+        def __str__(self):
             return self.literal
 
     class RealEncoder():
@@ -103,12 +128,8 @@ def numeric_precision(value):
         40
     """
     digits = len(value.lstrip("+-").replace(".", "", 1).lstrip("0"))
-    if digits == 0:
-        # A decimal zero ("0.000") is exact in binary at any precision, so a
-        # generous default costs nothing -- while a tiny one would poison
-        # arithmetic: Sage coerces to the lowest precision of the operands,
-        # so a 2-bit zero would turn x + 0 into a 2-bit result.
-        return 53
+    # All-zero decimals never reach this in Sage mode: numeric_converter
+    # returns them as exact zeros, since no floating precision suits a zero.
     # log(10)/log(2) = 3.3219280948873626
     return max(math.ceil(digits * 3.3219280948873626), 2)
 
@@ -130,6 +151,12 @@ def numeric_converter(value, cur=None):
         return None
     if "." in value:
         if SAGE_MODE:
+            if not value.strip("+-0."):
+                # An all-zero decimal is exactly zero, and an exact zero
+                # coerces into any real field at that field's precision --
+                # a floating zero of fixed precision would instead drag
+                # sums with higher-precision values down to it.
+                return LmfdbDecimalZero(value)
             # A good guess for the bit-precision; we use LmfdbRealLiterals
             # to ensure that our number prints the same as we got it.
             return LmfdbRealLiteral(RealField(numeric_precision(value)), value)
