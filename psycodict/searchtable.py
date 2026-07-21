@@ -1180,7 +1180,12 @@ class PostgresSearchTable(PostgresTable):
             results = cur.fetchmany(limit) if limit else []
             results = list(self._search_iterator(results, search_cols, projection, query=query, silent=silent))
         if info is not None:
-            if offset >= nres > 0:
+            # ``limit`` guards the recursion: the last-page retry sets
+            # offset = nres - limit, so with limit == 0 (a count-only query)
+            # the offset never shrinks and the call recurses on identical
+            # arguments forever.  A zero-limit query wants only the count in
+            # ``info``, so there is no last page to jump to.
+            if limit and offset >= nres > 0:
                 # We're passing in an info dictionary, so this is a front end query,
                 # and the user has requested a start location larger than the number
                 # of results.  We adjust the results to be the last page instead.
@@ -1416,7 +1421,10 @@ class PostgresSearchTable(PostgresTable):
         results = cur.fetchmany(limit) if limit else []
         results = list(self._search_iterator(results, search_cols, projection, query=query, silent=silent))
         if info is not None:
-            if offset >= nres > 0:
+            # limit guards the recursion just as in search (see that comment):
+            # a zero-limit query has no last page and would otherwise recurse
+            # forever on identical arguments.
+            if limit and offset >= nres > 0:
                 # The caller requested a start location past the last result;
                 # adjust to the last page instead, as search does.
                 if not exact_count:

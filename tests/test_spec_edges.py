@@ -499,3 +499,15 @@ def test_info_with_limit_none_is_full_count(big_table):
     # Confirm it really is a lazy iterator, then drain it so the cursor closes.
     assert iter(it) is it
     assert len(list(it)) == 1500
+
+
+def test_zero_limit_with_offset_past_end_does_not_recurse(spec_table):
+    # A count-only query (limit=0) whose start is past the last row must not
+    # trigger the last-page retry: that retry sets offset = nres - limit, which
+    # for limit == 0 never shrinks, so the call would recurse on identical
+    # arguments until RecursionError.  It should just report the count.
+    info = {}
+    assert spec_table.search({}, "n", limit=0, offset=15, info=info) == []
+    assert info["count"] == 0
+    assert info["start"] == 15
+
