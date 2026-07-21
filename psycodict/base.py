@@ -114,13 +114,26 @@ def jsonb_idx(cols, cols_type):
     return tuple(i for i, elt in enumerate(cols) if cols_type[elt] == "jsonb")
 
 
-# The version of the metadata format described by the constants below.  It is
-# stamped into the single-row meta_version table when a database is created
-# (or when an existing database is connected to with create=True), and every
-# connection checks it, so that psycodict can refuse to run against a
-# database whose metadata layout it does not understand.  Bump it whenever
-# the layout of the meta_* tables changes incompatibly.
-META_VERSION = 1
+# The version of the metadata format described by the constants below: the
+# layout of the meta_* tables, versioned by a single integer aligned with
+# psycodict's major version (format N is introduced by psycodict N.0).  The
+# format of a database is stamped into the single-row meta_format table as
+# (version, min_compat), and every connection checks it: an older but
+# compatible format connects with a warning and reduced functionality, while
+# a layout this psycodict cannot safely use is refused.  The policy, and the
+# checklist to follow when changing the format, live in MetadataFormats.md.
+#
+# History:
+#   0 -- the baseline (psycodict 0.x): meta_tables, meta_indexes,
+#        meta_constraints and their _hist counterparts, with no format stamp.
+#        An unstamped database that has meta tables is format 0.
+#   1 -- (psycodict 1.0) meta_indexes/meta_indexes_hist gained a nullable
+#        ``whereclause`` column, holding the predicate of a partial index
+#        (NULL for an ordinary index).  Compatible: against a format-0
+#        database everything keeps working except creating partial indexes.
+#        Migrate with ``PostgresDatabase.upgrade_metadata`` (or connect with
+#        upgrade=True).
+META_FORMAT = 1
 
 
 _meta_tables_cols = (
@@ -171,9 +184,12 @@ _meta_indexes_cols = (
     "columns",
     "modifiers",
     "storage_params",
+    # The predicate of a partial index (raw SQL), or NULL for an ordinary
+    # index.  Added in metadata format 1; see META_FORMAT.
+    "whereclause",
 )
 _meta_indexes_types = dict(
-    zip(_meta_indexes_cols, ("text", "text", "text", "jsonb", "jsonb", "jsonb"))
+    zip(_meta_indexes_cols, ("text", "text", "text", "jsonb", "jsonb", "jsonb", "text"))
 )
 _meta_indexes_jsonb_idx = jsonb_idx(_meta_indexes_cols, _meta_indexes_types)
 
@@ -189,8 +205,28 @@ _meta_constraints_types = dict(
 )
 _meta_constraints_jsonb_idx = jsonb_idx(_meta_constraints_cols, _meta_constraints_types)
 
+# Columns introduced by a metadata format bump: column -> the format that
+# added it; columns not listed are part of the format-0 baseline.  A format
+# bump must append its columns at the end of the _cols tuple above (see
+# MetadataFormats.md), so that the columns of an older format are a prefix of
+# the current ones.
+_meta_col_formats = {
+    "meta_tables": {},
+    "meta_indexes": {"whereclause": 1},
+    "meta_constraints": {},
+}
 
-def _meta_cols_types_jsonb_idx(meta_name):
+
+def _meta_cols_types_jsonb_idx(meta_name, fmt=None):
+    """
+    The (columns, types, jsonb column indexes) of a metadata table.
+
+    ``fmt`` restricts the columns to those present in that metadata format
+    (a prefix of the current ones, since format bumps only append columns);
+    the default is the current format.  Callers touching a live database
+    should pass the connection's format, ``self._db._meta_format``, so that
+    their SQL matches the columns the database actually has.
+    """
     assert meta_name in ["meta_tables", "meta_indexes", "meta_constraints"]
     if meta_name == "meta_tables":
         meta_cols = _meta_tables_cols
@@ -205,6 +241,10 @@ def _meta_cols_types_jsonb_idx(meta_name):
         meta_types = _meta_constraints_types
         meta_jsonb_idx = _meta_constraints_jsonb_idx
 
+    if fmt is not None and fmt < META_FORMAT:
+        added = _meta_col_formats[meta_name]
+        meta_cols = tuple(col for col in meta_cols if added.get(col, 0) <= fmt)
+        meta_jsonb_idx = jsonb_idx(meta_cols, meta_types)
     return meta_cols, meta_types, meta_jsonb_idx
 
 
@@ -1256,7 +1296,10 @@ class PostgresBase():
     ##################################################################
 
     def _copy_to_meta(self, meta_name, filename, search_table, sep="|"):
-        meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
+        # The columns this database actually has: an export from an
+        # older-format database carries that format's columns (a prefix of
+        # the current ones), which _meta_file_columns recognizes on import.
+        meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name, self._db._meta_format)
         table_name = _meta_table_name(meta_name)
         table_name_sql = Identifier(table_name)
         meta_name_sql = Identifier(meta_name)
@@ -1272,8 +1315,55 @@ class PostgresBase():
             % (meta_name, search_table, time.time() - now)
         )
 
+    def _meta_file_columns(self, meta_name, filename, sep="|"):
+        """
+        The columns of ``meta_name`` that an exported metadata file carries.
+
+        Metadata files have no header line, so the format they were exported
+        at is recovered from their width: format bumps only append columns,
+        so a file written at format f holds the first ``len(columns at f)``
+        of the current columns.  Returns that column prefix, or None for an
+        empty file.  A file wider than this database's meta table (exported
+        from a newer format than the database is at) or of a width matching
+        no known format is rejected here, with instructions, rather than
+        passed on to COPY to fail cryptically.
+        """
+        with open(filename) as F:
+            first = next(csv.reader(F, delimiter=str(sep)), None)
+        if first is None:
+            return None
+        width = len(first)
+        db_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name, self._db._meta_format)
+        # width -> the oldest format with that many columns
+        widths = {}
+        for fmt in range(META_FORMAT + 1):
+            widths.setdefault(len(_meta_cols_types_jsonb_idx(meta_name, fmt)[0]), fmt)
+        if width not in widths:
+            raise ValueError(
+                "The file %s has %s columns, which matches no known format of "
+                "%s (expected %s)"
+                % (filename, width, meta_name,
+                   " or ".join(str(w) for w in sorted(widths)))
+            )
+        if width > len(db_cols):
+            raise ValueError(
+                "The file %s was exported from a database using metadata "
+                "format %s, but this database uses the older format %s: "
+                "migrate it with upgrade_metadata() (or reconnect with "
+                "upgrade=True) before reloading, or re-export the file from "
+                "a format-%s database."
+                % (filename, widths[width], self._db._meta_format,
+                   self._db._meta_format)
+            )
+        return db_cols[:width]
+
     def _copy_from_meta(self, meta_name, filename, sep="|"):
-        meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
+        # Take the column list from the file's width, so files exported from
+        # an older metadata format keep loading after the database migrates
+        # (columns the file predates are left NULL).
+        meta_cols = self._meta_file_columns(meta_name, filename, sep)
+        if meta_cols is None:
+            return
         try:
             with open(filename) as F:
                 self._copy_from_stdin(F, meta_name, meta_cols, sep)
@@ -1297,7 +1387,11 @@ class PostgresBase():
         return res
 
     def _reload_meta(self, meta_name, filename, search_table, sep="|"):
-        meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name)
+        # The database's columns for the SELECT/INSERT below; the file may
+        # carry fewer (it was exported from an older format), in which case
+        # the trailing columns load as NULL.
+        meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name, self._db._meta_format)
+        file_cols = self._meta_file_columns(meta_name, filename, sep)
         # the column which will match search_table
         table_name = _meta_table_name(meta_name)
 
@@ -1328,7 +1422,7 @@ class PostgresBase():
             # insert new columns
             with open(filename, "r") as F:
                 try:
-                    self._copy_from_stdin(F, meta_name, meta_cols, sep)
+                    self._copy_from_stdin(F, meta_name, file_cols, sep)
                 except Exception:
                     self.conn.rollback()
                     raise
@@ -1354,7 +1448,7 @@ class PostgresBase():
                 self._execute(query, row + [version])
 
     def _revert_meta(self, meta_name, search_table, version=None):
-        meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name)
+        meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name, self._db._meta_format)
         # the column which will match search_table
         table_name = _meta_table_name(meta_name)
 

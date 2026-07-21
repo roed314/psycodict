@@ -22,13 +22,46 @@ from .encoding import (
 )
 from .base import (
     PostgresBase,
-    META_VERSION,
+    META_FORMAT,
     _meta_tables_cols,
     _meta_tables_defaults,
     _meta_cols_types_jsonb_idx,
 )
 from .searchtable import PostgresSearchTable
 from .utils import DelayCommit
+
+# The registry of metadata-format migrations.  Entry N describes the step
+# from format N-1 to format N; MetadataFormats.md has the checklist a new
+# format must follow.
+#
+#   description -- one line, shown when the step is applied
+#   compatible  -- whether a psycodict expecting format >= N still operates
+#                  against a database at format < N (features introduced by
+#                  the new format degrade gracefully, nothing else changes).
+#                  Decides warn-and-proceed versus refuse at connect time.
+#   min_compat  -- stamped into meta_format alongside the version: the oldest
+#                  META_FORMAT a psycodict may have and still safely use a
+#                  database at this format.  Kept low by additive changes,
+#                  raised by breaking ones.
+#   upgrade     -- name of the PostgresDatabase method performing the DDL
+#                  (just the DDL, idempotently: stamping is done by
+#                  upgrade_metadata itself).
+META_MIGRATIONS = {
+    1: {
+        "description": "meta_indexes/meta_indexes_hist gain a whereclause column (partial indexes)",
+        "compatible": True,
+        "min_compat": 0,
+        "upgrade": "_upgrade_meta_0_to_1",
+    },
+}
+
+
+def _stamped_min_compat(version):
+    """
+    The min_compat that stamping ``version`` should record (format 0 predates
+    both the stamp and the registry, hence the default).
+    """
+    return META_MIGRATIONS[version]["min_compat"] if version in META_MIGRATIONS else 0
 
 
 class NumericLoader(Loader):
@@ -90,6 +123,11 @@ class PostgresDatabase(PostgresBase):
     - ``create`` -- if True, create psycodict's metadata tables (meta_tables,
       meta_indexes, meta_constraints and their _hist counterparts) when they
       are missing, allowing use of a fresh database
+    - ``upgrade`` -- if True, migrate the metadata tables to the format this
+      psycodict implements before connecting (see upgrade_metadata and
+      MetadataFormats.md).  Without it, a database using an older but
+      compatible metadata format connects with a warning and operates at the
+      older format.
     - ``**kwargs`` -- passed on to psycopg's connect method
 
     ATTRIBUTES:
@@ -99,6 +137,8 @@ class PostgresDatabase(PostgresBase):
     - ``server_side_counter`` -- an integer tracking how many buffered connections have been created
     - ``conn`` -- the psycopg connection object
     - ``tablenames`` -- a list of tablenames in the database, as strings
+    - ``meta_format`` -- the metadata format this connection operates at (see
+      MetadataFormats.md)
 
     Also, each tablename will be stored as an attribute, so that db.ec_curvedata works for example.
 
@@ -161,7 +201,7 @@ class PostgresDatabase(PostgresBase):
         obj.conn = self.conn
         self._objects.append(obj)
 
-    def __init__(self, config=None, secretsfile=None, create=False, **kwargs):
+    def __init__(self, config=None, secretsfile=None, create=False, upgrade=False, **kwargs):
         if config is None:
             from .config import Configuration
             config = Configuration()
@@ -179,6 +219,13 @@ class PostgresDatabase(PostgresBase):
             # Create any missing metadata tables before the read-only detection
             # below, which concludes read-only when no tables are visible
             self._bootstrap_meta()
+
+        if upgrade:
+            # Migrate the metadata tables up to the format this psycodict
+            # expects.  This runs before the format check below, so that
+            # ``PostgresDatabase(..., upgrade=True)`` connects at the current
+            # format (and without the older-format warning) in one call.
+            self.upgrade_metadata()
 
         if self._execute(SQL("SELECT pg_is_in_recovery()")).fetchone()[0]:
             self._read_only = True
@@ -260,36 +307,23 @@ class PostgresDatabase(PostgresBase):
                     % (", ".join(rec[0] for rec in cur))
                 )
 
-        # Refuse to run when the database's metadata format doesn't match this
-        # version of psycodict.  A database with meta tables but no
-        # meta_version predates the stamp, which makes its format the
-        # pre-stamp baseline (1) -- treating it that way means a future
-        # format bump will reject it until it is migrated, rather than
-        # accepting it silently.  A database with no meta tables at all is
-        # fresh; the missing meta_tables is diagnosed below.
-        if self._table_exists("meta_version"):
-            row = self._execute(SQL("SELECT version FROM meta_version")).fetchone()
-            stored = None if row is None else row[0]
-        elif self._table_exists("meta_tables"):
-            stored = 1
-        else:
-            stored = META_VERSION
-        if stored != META_VERSION:
-            if stored is None:
-                hint = ("its meta_version table is empty; insert the "
-                        "correct version to assert compatibility")
-            elif stored > META_VERSION:
-                hint = ("it uses metadata format %s, which is newer; "
-                        "upgrade psycodict" % stored)
-            else:
-                hint = ("it uses metadata format %s, which is older; "
-                        "migrate the meta_* tables and update meta_version"
-                        % stored)
-            raise RuntimeError(
-                "This database is not compatible with this version of "
-                "psycodict (which expects metadata format %s): %s."
-                % (META_VERSION, hint)
-            )
+        # Check the database's metadata format (see MetadataFormats.md): an
+        # older-but-compatible or acceptably-newer format connects with a
+        # warning and this connection operates at the shared format,
+        # self._meta_format; a layout this psycodict cannot safely use is
+        # refused.  _stored_meta_format explains how the format of an
+        # unstamped database is inferred.
+        stored, min_compat = self._stored_meta_format()
+        action, message = self._meta_format_action(stored, min_compat, self._read_only)
+        if action == "error":
+            raise RuntimeError(message)
+        if action == "warn":
+            logging.warning(message)
+        # The metadata format this connection operates at: everything that
+        # reads or writes meta_* columns consults this, so that a psycodict
+        # ahead of the database (or behind it) only touches the columns both
+        # sides have.
+        self._meta_format = min(stored, META_FORMAT)
 
         self.tablenames = []
         self.refresh_tables()
@@ -553,14 +587,16 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             sizes[name]["total_bytes"] += total_bytes
         return sizes
 
-    def _meta_creator(self, meta_name, hist=False):
+    def _meta_creator(self, meta_name, hist=False, fmt=None):
         """
         Create one of the six metadata tables, with columns generated from
         the shared definitions in base.py (_meta_*_cols and _meta_*_types),
         so that the DDL cannot drift from the code that reads and writes
-        these tables.
+        these tables.  ``fmt`` gives the metadata format to create the table
+        at (default: the current one), so that filling in a table missing
+        from an older-format database does not smuggle in a partial upgrade.
         """
-        meta_cols, meta_types, _ = _meta_cols_types_jsonb_idx(meta_name)
+        meta_cols, meta_types, _ = _meta_cols_types_jsonb_idx(meta_name, fmt)
         cols = list(meta_cols)
         types = dict(meta_types)
         if hist:
@@ -578,38 +614,217 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         self._execute(SQL("CREATE TABLE {0} ({1})").format(Identifier(tbl), SQL(", ").join(parts)))
         self.grant_select(tbl)
 
-    def _create_meta_version(self, version=None):
-        if version is None:
-            version = META_VERSION
-        with DelayCommit(self, silence=True):
-            self._execute(SQL("CREATE TABLE meta_version (version integer NOT NULL)"))
-            self._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"), [version])
-            self.grant_select("meta_version")
-        print("Table meta_version created")
+    @property
+    def meta_format(self):
+        """
+        The metadata format this connection operates at.
 
-    def _create_meta_tables(self):
+        This is the format stamped in the database, capped at the format this
+        psycodict implements (``META_FORMAT``).  When it is lower than
+        ``META_FORMAT``, features introduced by newer formats are unavailable
+        (their methods raise with instructions) until the database is
+        migrated with :meth:`upgrade_metadata`; see MetadataFormats.md.
+        """
+        return self._meta_format
+
+    def _stored_meta_format(self):
+        """
+        The (version, min_compat) pair recorded in this database's single-row
+        ``meta_format`` table.
+
+        A database that has meta tables but no ``meta_format`` is a format-0
+        database: psycodict 0.x never stamped.  A database with no meta
+        tables at all is fresh, so it reports the current format (the missing
+        ``meta_tables`` is diagnosed elsewhere).  ``(None, None)`` means the
+        stamp exists but is empty; its format is unknowable, which the caller
+        reports rather than guessing.
+        """
+        if self._table_exists("meta_format"):
+            row = self._execute(SQL("SELECT version, min_compat FROM meta_format")).fetchone()
+            return (None, None) if row is None else (row[0], row[1])
+        elif self._table_exists("meta_tables"):
+            return (0, 0)
+        return (META_FORMAT, _stamped_min_compat(META_FORMAT))
+
+    @staticmethod
+    def _meta_format_action(stored, min_compat, read_only):
+        """
+        How to treat a database whose stamped metadata format is ``stored``
+        (with ``min_compat``, the oldest format allowed to use it) when this
+        psycodict implements ``META_FORMAT``: one of ``("ok", None)``,
+        ``("warn", message)`` or ``("error", message)``.
+
+        A pure function of its inputs, so the whole compatibility matrix can
+        be tested without manufacturing a database in each state.  The policy
+        (MetadataFormats.md):
+
+        - the same format connects silently;
+        - an older format connects with a warning when every intervening
+          migration is marked compatible (the connection then operates at the
+          older format, newer features unavailable), and is refused otherwise;
+        - a newer format connects with a warning when its stamped
+          ``min_compat`` admits this psycodict, and is refused otherwise.
+        """
+        if stored is None:
+            return ("error",
+                    "This database's meta_format table is empty, so its "
+                    "metadata format is unknown; insert the correct "
+                    "(version, min_compat) row to assert compatibility.")
+        if stored == META_FORMAT:
+            return ("ok", None)
+        if stored > META_FORMAT:
+            if min_compat is not None and min_compat <= META_FORMAT:
+                return ("warn",
+                        "This database uses metadata format %s, newer than this "
+                        "psycodict (format %s) but marked compatible with it.  "
+                        "Metadata added by the newer format is preserved but "
+                        "invisible here; upgrade psycodict to use it."
+                        % (stored, META_FORMAT))
+            return ("error",
+                    "This database uses metadata format %s and requires a "
+                    "psycodict with format at least %s (this one implements "
+                    "format %s): upgrade psycodict."
+                    % (stored, min_compat, META_FORMAT))
+        # stored < META_FORMAT: possible only when every step up to the
+        # current format is registered and marked compatible
+        if all(META_MIGRATIONS.get(fmt, {}).get("compatible", False)
+               for fmt in range(stored + 1, META_FORMAT + 1)):
+            if read_only:
+                remedy = ("The warning will go away once the primary "
+                          "database is migrated (upgrade_metadata, run by an "
+                          "administrator on a read-write connection).")
+            else:
+                remedy = ("Migrate it with upgrade_metadata() -- or connect "
+                          "with PostgresDatabase(upgrade=True) -- at your "
+                          "convenience.")
+            return ("warn",
+                    "This database uses metadata format %s, older than this "
+                    "psycodict (format %s).  Everything present in format %s "
+                    "keeps working, but features introduced by newer formats "
+                    "(see MetadataFormats.md) are unavailable.  %s"
+                    % (stored, META_FORMAT, stored, remedy))
+        return ("error",
+                "This database uses metadata format %s, which this psycodict "
+                "(format %s) cannot operate against.  Migrate the database "
+                "with upgrade_metadata() (or connect with upgrade=True)%s, or "
+                "use the psycodict release matching its format."
+                % (stored, META_FORMAT,
+                   " on a read-write connection" if read_only else ""))
+
+    def upgrade_metadata(self):
+        """
+        Migrate this database's metadata tables up to the format that this
+        version of psycodict implements (``META_FORMAT``), applying each
+        registered migration in order and stamping the format as it goes.
+
+        Connecting to an older-format database only warns (when the formats
+        are compatible; see MetadataFormats.md), so migrating is a deliberate
+        act -- this method, or ``PostgresDatabase(config=..., upgrade=True)``,
+        which bootstraps (when ``create=True``), migrates, and then connects,
+        all in one call.
+
+        Migrations only move forward.  A database already at the current
+        format is left untouched, so calling this is idempotent; a database
+        whose format is *newer* than this psycodict is an error (upgrade
+        psycodict instead), as is a ``meta_format`` table that exists but is
+        empty (its format is unknown, so it cannot be migrated blindly).
+        """
+        stored, _ = self._stored_meta_format()
+        if stored is None:
+            raise RuntimeError(
+                "Cannot upgrade the metadata: the meta_format table is empty, "
+                "so the current format is unknown.  Insert the correct "
+                "(version, min_compat) row into meta_format first."
+            )
+        if stored > META_FORMAT:
+            raise RuntimeError(
+                "Cannot upgrade the metadata: this database uses format %s, "
+                "which is newer than this psycodict understands (%s); upgrade "
+                "psycodict instead." % (stored, META_FORMAT)
+            )
+        while stored < META_FORMAT:
+            target = stored + 1
+            step = META_MIGRATIONS.get(target)
+            if step is None:
+                raise RuntimeError(
+                    "No metadata migration from format %s to %s is known"
+                    % (stored, target)
+                )
+            # The DDL and the stamp commit together, so an interrupted
+            # migration leaves the database cleanly at the old format.
+            with DelayCommit(self, silence=True):
+                getattr(self, step["upgrade"])()
+                self._stamp_meta_format(target)
+            print("Upgraded metadata format %s -> %s (%s)"
+                  % (stored, target, step["description"]))
+            stored = target
+        # A post-construction upgrade lifts the format this connection
+        # operates at; during __init__ (upgrade=True) this is recomputed by
+        # the format check that follows.
+        self._meta_format = META_FORMAT
+
+    def _upgrade_meta_0_to_1(self):
+        """
+        The DDL migrating metadata format 0 to 1: meta_indexes and its history
+        table gain a nullable ``whereclause`` column, holding the predicate of
+        a partial index (NULL for an ordinary index).
+
+        The column is added with ``IF NOT EXISTS`` so that re-running the
+        migration -- or running it on a database that already grew the column
+        out of band -- is a harmless no-op.
+        """
+        for tbl in ("meta_indexes", "meta_indexes_hist"):
+            self._execute(SQL(
+                "ALTER TABLE {0} ADD COLUMN IF NOT EXISTS whereclause text"
+            ).format(Identifier(tbl)))
+
+    def _stamp_meta_format(self, version):
+        """
+        Record ``(version, min_compat)`` in the single-row ``meta_format``
+        table, creating the table when the database predates it.  Also drops
+        the transient ``meta_version`` table that briefly played this role
+        during development (it never appeared in a release, and its numbering
+        was off by one from the meta_format one).
+        """
+        min_compat = _stamped_min_compat(version)
         with DelayCommit(self, silence=True):
-            self._meta_creator("meta_tables")
+            if self._table_exists("meta_format"):
+                self._execute(SQL("UPDATE meta_format SET version = %s, min_compat = %s"),
+                              [version, min_compat])
+            else:
+                self._execute(SQL(
+                    "CREATE TABLE meta_format (version integer NOT NULL, "
+                    "min_compat integer NOT NULL)"
+                ))
+                self._execute(SQL("INSERT INTO meta_format (version, min_compat) VALUES (%s, %s)"),
+                              [version, min_compat])
+                self.grant_select("meta_format")
+            self._execute(SQL("DROP TABLE IF EXISTS meta_version"))
+        print("Stamped metadata format %s (min_compat %s)" % (version, min_compat))
+
+    def _create_meta_tables(self, fmt=None):
+        with DelayCommit(self, silence=True):
+            self._meta_creator("meta_tables", fmt=fmt)
         print("Table meta_tables created")
 
-    def _create_meta_indexes(self):
+    def _create_meta_indexes(self, fmt=None):
         with DelayCommit(self, silence=True):
-            self._meta_creator("meta_indexes")
+            self._meta_creator("meta_indexes", fmt=fmt)
         print("Table meta_indexes created")
 
-    def _create_meta_constraints(self):
+    def _create_meta_constraints(self, fmt=None):
         with DelayCommit(self, silence=True):
-            self._meta_creator("meta_constraints")
+            self._meta_creator("meta_constraints", fmt=fmt)
         print("Table meta_constraints created")
 
-    def _create_meta_hist(self, meta_name):
+    def _create_meta_hist(self, meta_name, fmt=None):
         """
         Create the _hist counterpart of a metadata table, copying any rows
         already present in the base table at version 0.
         """
-        meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name)
+        meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name, fmt)
         with DelayCommit(self, silence=True):
-            self._meta_creator(meta_name, hist=True)
+            self._meta_creator(meta_name, hist=True, fmt=fmt)
             cols = meta_cols + ("version",)
             rows = self._execute(SQL("SELECT {0} FROM {1}").format(
                 SQL(", ").join(map(Identifier, meta_cols)),
@@ -630,9 +845,14 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
     def _bootstrap_meta(self):
         """
         Create any missing psycodict metadata tables (meta_tables, meta_indexes,
-        meta_constraints, their _hist counterparts, and the meta_version format
-        stamp), for use on a fresh database.  Called from the constructor when
+        meta_constraints, their _hist counterparts, and the meta_format stamp),
+        for use on a fresh database.  Called from the constructor when
         ``create=True`` is passed.
+
+        Missing tables are created at the format the database is already at:
+        a fresh database comes up at the current format, while filling in the
+        gaps of an older-format database must not silently migrate it -- that
+        is upgrade_metadata's job, deliberately invoked.
         """
         existing = {
             rec[0] for rec in self._execute(SQL(
@@ -640,6 +860,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 "WHERE table_schema = 'public'"
             ))
         }
+        stored, _ = self._stored_meta_format()
+        fmt = META_FORMAT if stored is None else min(stored, META_FORMAT)
         # The base tables must be created before the _hist creators, which copy from them
         for name, creator in [
             ("meta_tables", self._create_meta_tables),
@@ -650,23 +872,23 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             ("meta_constraints_hist", self._create_meta_constraints_hist),
         ]:
             if name not in existing:
-                creator()
-        if "meta_version" not in existing:
-            # A database that already had meta tables predates the version
-            # stamp, so it is stamped with the pre-stamp format (1); moving
-            # it to the current format is a deliberate migration, not a side
-            # effect of connecting.  A fresh database is created at the
-            # current format.
-            self._create_meta_version(META_VERSION if "meta_tables" not in existing else 1)
+                creator(fmt=fmt)
+        if "meta_format" not in existing:
+            # A database that already had meta tables predates the stamp, so
+            # it is stamped with the format it actually has (0); moving it to
+            # the current format is a deliberate migration, not a side effect
+            # of connecting.  A fresh database is created at the current
+            # format.
+            self._stamp_meta_format(META_FORMAT if "meta_tables" not in existing else 0)
 
-    def _create_meta_indexes_hist(self):
-        self._create_meta_hist("meta_indexes")
+    def _create_meta_indexes_hist(self, fmt=None):
+        self._create_meta_hist("meta_indexes", fmt=fmt)
 
-    def _create_meta_constraints_hist(self):
-        self._create_meta_hist("meta_constraints")
+    def _create_meta_constraints_hist(self, fmt=None):
+        self._create_meta_hist("meta_constraints", fmt=fmt)
 
-    def _create_meta_tables_hist(self):
-        self._create_meta_hist("meta_tables")
+    def _create_meta_tables_hist(self, fmt=None):
+        self._create_meta_hist("meta_tables", fmt=fmt)
 
     def _clone_storage_settings(self, new_name, table):
         """
