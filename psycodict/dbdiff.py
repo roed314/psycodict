@@ -67,19 +67,34 @@ def _column_types(db, names):
     OUTPUT:
 
     A dictionary indexed by table name whose values are dictionaries mapping
-    column name to postgres type (as a string, e.g. ``"numeric[]"``).  Tables
-    with no row in information_schema (dropped out from under meta_tables)
-    are absent.
+    column name to the full rendered postgres type (as a string, e.g.
+    ``"numeric[]"`` or ``"character varying(16)"``).  Tables that no longer
+    exist in pg_class (dropped out from under meta_tables) are absent.
+
+    Types are rendered with ``format_type`` from the catalog rather than read
+    off information_schema's ``udt_name``, because ``udt_name`` drops type
+    modifiers: ``numeric(10,2)`` and ``numeric(20,4)`` would both come back
+    as ``numeric`` and precision or scale drift between the two databases
+    would go unreported.  information_schema's separate modifier columns
+    (character_maximum_length and friends) would need per-type reassembly and
+    are NULL for arrays, while ``format_type`` on ``pg_attribute`` is exactly
+    the canonical human-readable rendering psql's ``\\d`` shows, and for
+    modifier-less columns it matches the ``udt_name::regtype`` strings this
+    function used to return.
     """
     names = set(names)
     cur = db._execute(SQL(
-        "SELECT table_name, column_name, udt_name::regtype "
-        "FROM information_schema.columns WHERE table_schema = 'public'"
+        "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod) "
+        "FROM pg_attribute a "
+        "JOIN pg_class c ON a.attrelid = c.oid "
+        "JOIN pg_namespace n ON c.relnamespace = n.oid "
+        "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+        "AND a.attnum > 0 AND NOT a.attisdropped"
     ))
     columns = {}
-    for table_name, column_name, regtype in cur:
+    for table_name, column_name, typ in cur:
         if table_name in names:
-            columns.setdefault(table_name, {})[column_name] = regtype
+            columns.setdefault(table_name, {})[column_name] = typ
     return columns
 
 
@@ -132,7 +147,9 @@ def compare_databases(self_db, other_db, tables=None, row_counts=True, null_coun
       - ``only_in_self``, ``only_in_other`` -- sorted lists of pairs
         ``(col, type)`` for columns present on one side only
       - ``type_changed`` -- a sorted list of triples ``(col, type_self,
-        type_other)`` for columns whose postgres types disagree
+        type_other)`` for columns whose postgres types disagree.  Types are
+        rendered in full, including any modifiers, so ``numeric(10,2)`` vs
+        ``numeric(20,4)`` is a difference
       - ``meta_changed`` -- a list of triples ``(item, value_self,
         value_other)`` for the meta_tables settings in ``_meta_compared``
         (label_col, sort, id_ordered, include_nones, count_cutoff) that

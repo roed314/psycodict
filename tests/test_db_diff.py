@@ -15,14 +15,17 @@ skipped, mirroring how conftest skips the whole suite without a server.
 
 The tests plant a known set of differences between the two databases (a
 table on each side only, a shared table with column, type, row-count and
-null-count drift, a shared table whose meta_tables settings disagree, and a
-shared table with no differences at all) and check that every section of
-the comparison reports exactly what was planted.
+null-count drift, a shared table whose columns differ only in a type
+modifier, a shared table whose meta_tables settings disagree, and a shared
+table with no differences at all) and check that every section of the
+comparison reports exactly what was planted.
 """
 import os
 import uuid
 
 import pytest
+
+from psycopg.sql import SQL, Identifier
 
 
 def _second_connection_kwargs():
@@ -86,16 +89,20 @@ def scenario(db, db2):
     - ``drift`` -- in both databases, with a column on each side only, a
       column typed integer here and bigint there, 3 rows here and 5 there,
       and 1 null label here and 3 there
+    - ``modif`` -- in both databases with the same rows, but a column typed
+      varchar(16) here and varchar(64) there (the same base type, differing
+      only in the modifier) alongside a column typed varchar(32) on both
+      sides
     - ``meta`` -- in both databases with the same columns and rows, but
       label_col label vs None and sort ["n"] vs ["label"]
     - ``only1`` / ``only2`` -- in only the first / second database
-    - ``all`` -- the five names above, for restricting comparisons to this
+    - ``all`` -- the six names above, for restricting comparisons to this
       scenario
     """
     tag = uuid.uuid4().hex[:12]
     names = {
         key: "test_diff_%s_%s" % (key, tag)
-        for key in ["ident", "drift", "meta", "only1", "only2"]
+        for key in ["ident", "drift", "modif", "meta", "only1", "only2"]
     }
     names["all"] = sorted(names.values())
     base_cols = [("n", "integer"), ("label", "text")]
@@ -130,6 +137,17 @@ def scenario(db, db2):
                 for i, lab in enumerate([None, None, None, "a", "b"])
             ],
         )
+        # create_table only hands out unmodified types, so the modifier
+        # drift is planted with raw DDL after identical creation: v differs
+        # only in its varchar length and must be reported, while w carries
+        # the same modifier on both sides and must not be
+        modif_rows = [{"n": i, "label": "v%d" % i} for i in range(2)]
+        create(db, names["modif"], base_cols, "label", ["n"], modif_rows)
+        create(db2, names["modif"], base_cols, "label", ["n"], modif_rows)
+        for database, size in [(db, 16), (db2, 64)]:
+            database._execute(SQL(
+                "ALTER TABLE {0} ADD COLUMN v varchar(%d), ADD COLUMN w varchar(32)" % size
+            ).format(Identifier(names["modif"])))
         meta_rows = [{"n": i, "label": "m%d" % i} for i in range(2)]
         create(db, names["meta"], base_cols, "label", ["n"], meta_rows)
         create(db2, names["meta"], base_cols, None, ["label"], meta_rows)
@@ -160,6 +178,12 @@ def test_schema_section(db, db2, scenario):
         "only_in_self": [("only_left", "smallint")],
         "only_in_other": [("only_right", "text")],
         "type_changed": [("x", "integer", "bigint")],
+    }
+    # Modifier-only drift is reported with the full rendered types; the
+    # exact equality also checks that w, whose varchar(32) modifier agrees
+    # on both sides, is not reported
+    assert schema[scenario["modif"]] == {
+        "type_changed": [("v", "character varying(16)", "character varying(64)")],
     }
     assert schema[scenario["meta"]] == {
         "meta_changed": [("label_col", "label", None), ("sort", ["n"], ["label"])],
@@ -237,6 +261,7 @@ def test_show_differences_report(db, db2, scenario, capsys):
     assert "only_left (smallint)" in out
     assert "only_right (text)" in out
     assert "type of x changed: integer vs bigint" in out
+    assert "type of v changed: character varying(16) vs character varying(64)" in out
     assert "label_col changed: label vs None" in out
     assert "sort changed: ['n'] vs ['label']" in out
     # Row and null count sections

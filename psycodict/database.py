@@ -1295,7 +1295,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
           whichever of the following differences occur: ``only_in_self`` and
           ``only_in_other`` (lists of pairs ``(col, type)`` of columns
           present on one side only), ``type_changed`` (a list of triples
-          ``(col, type_self, type_other)``) and ``meta_changed`` (a list of
+          ``(col, type_self, type_other)``, with types rendered in full so
+          that e.g. ``numeric(10,2)`` vs ``numeric(20,4)`` is reported) and
+          ``meta_changed`` (a list of
           triples ``(item, value_self, value_other)`` recording disagreements
           in the label_col, sort, id_ordered, include_nones or count_cutoff
           settings from meta_tables)
