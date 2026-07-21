@@ -114,6 +114,15 @@ def jsonb_idx(cols, cols_type):
     return tuple(i for i, elt in enumerate(cols) if cols_type[elt] == "jsonb")
 
 
+# The version of the metadata format described by the constants below.  It is
+# stamped into the single-row meta_version table when a database is created
+# (or when an existing database is connected to with create=True), and every
+# connection checks it, so that psycodict can refuse to run against a
+# database whose metadata layout it does not understand.  Bump it whenever
+# the layout of the meta_* tables changes incompatibly.
+META_VERSION = 1
+
+
 _meta_tables_cols = (
     "name",
     "sort",
