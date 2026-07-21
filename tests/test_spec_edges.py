@@ -126,6 +126,16 @@ def test_contains_empty_on_array_matches_everything(spec_table):
     assert spec_table.search({"vec": {"$contains": []}}, "n", limit=20) == list(range(10))
 
 
+def test_contains_accepts_a_tuple_like_a_list(spec_table):
+    # A tuple must be adapted as an array (the "contains all of these"
+    # semantics of the list form), not as psycopg's composite literal
+    # '(2,3)', which fails when cast to the column's array type.  Only row 2
+    # (vec = [2, 3, 2]) contains both 2 and 3.
+    as_list = spec_table.search({"vec": {"$contains": [2, 3]}}, "n", limit=20)
+    assert as_list == [2]
+    assert spec_table.search({"vec": {"$contains": (2, 3)}}, "n", limit=20) == as_list
+
+
 def test_contains_empty_on_jsonb_depends_on_stored_type(db, spec_table):
     # jsonb containment is type-sensitive: an object @> '[]' is false, so the
     # sample ``data`` (an object) matches nothing.  (A jsonb column holding an
