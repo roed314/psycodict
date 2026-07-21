@@ -227,8 +227,8 @@ def test_join_col_and_raw_on_joined_table(jtables):
     # joined table qualifies both
     assert curves.search({"%s.deg" % F: {"$col": "%s.r2" % F}}, 0, join=join, limit=10) == ["c1", "c2"]
     assert curves.search({"%s.deg" % F: {"$gt": {"$col": "%s.r2" % F}}}, 0, join=join, limit=10) == ["c3", "c4", "c5", "c8"]
-    # $raw arithmetic stays within the key's table, and is qualified
-    assert curves.search({"%s.deg" % F: {"$raw": "2*r2"}}, 0, join=join, limit=10) == ["c3", "c5", "c8"]
+    # $raw names resolve like query keys too, and come out qualified
+    assert curves.search({"%s.deg" % F: {"$raw": "2*%s.r2" % F}}, 0, join=join, limit=10) == ["c3", "c5", "c8"]
 
 
 def test_join_cross_table_col(jtables):
@@ -250,7 +250,20 @@ def test_join_or_and_not_across_tables(jtables):
     # $not over a joined-table constraint
     assert curves.count({"$not": {"%s.gp" % F: "g1"}}, join=join) == 3
     # nested: $or under a joined column, mixing $raw and a comparison
-    assert curves.count({"%s.deg" % F: {"$or": [{"$raw": "2*r2"}, {"$gte": 5}]}}, join=join) == 3
+    assert curves.count({"%s.deg" % F: {"$or": [{"$raw": "2*%s.r2" % F}, {"$gte": 5}]}}, join=join) == 3
+
+
+def test_join_cross_table_raw(jtables):
+    curves, fields, groups = jtables
+    F = fields.search_table
+    join = FK(fields)
+    # a curve whose n is one more than its field's n
+    assert curves.count({"n": {"$raw": "%s.n+1" % F}}, join=join) == 4
+    # bare names in a $raw expression are the primary table's, even under a
+    # joined key
+    assert curves.search({"%s.deg" % F: {"$raw": "n"}}, 0, join=join, limit=10) == ["c2"]
+    with pytest.raises(ValueError, match="not a column"):
+        curves.count({"n": {"$raw": "%s.missing+1" % F}}, join=join)
 
 
 def test_join_sort_by_joined_column(jtables):

@@ -37,7 +37,7 @@ postgres_infix_ops = {
 }
 
 # This function is used to support the inclusion of limited raw postgres in queries
-def filter_sql_injection(clause, col, col_type, op, table):
+def filter_sql_injection(clause, col, col_type, op, table, join_context=None):
     """
     INPUT:
 
@@ -48,6 +48,11 @@ def filter_sql_injection(clause, col, col_type, op, table):
     - ``op`` -- a string giving the operator to use
       (`=` or one of the values in the ``postgres_infix_ops dictionary`` above)
     - ``table`` -- a PostgresTable object for determining which columns are valid
+    - ``join_context`` -- when filtering an expression inside a joined query,
+      a dictionary mapping joined table names to their table objects.  Names
+      then resolve like query keys -- bare names are columns of ``table``,
+      while "joinedtable.column" names a joined table's column -- and every
+      identifier is emitted table-qualified.
     """
     # Our approach:
     # * strip all whitespace: this makes some of the analysis below easier
@@ -75,8 +80,27 @@ def filter_sql_injection(clause, col, col_type, op, table):
         if not piece:  # skip empty strings at beginning/end
             continue
         if i % 2:  # a word/number
-            if piece in table.search_cols:
-                processed.append(Identifier(piece))
+            resolved = None
+            if join_context is not None and "." in piece:
+                # A joined-table prefix names that table's column; the piece
+                # arrives whole because the word class includes periods.  The
+                # prefix is checked against the validated join specification
+                # and the column against that table's own whitelist, so this
+                # admits nothing an unjoined clause couldn't name in its table.
+                prefix, _, rest = piece.partition(".")
+                if prefix in join_context:
+                    resolved = (prefix, rest, join_context[prefix])
+            if resolved is not None:
+                tname, cname, tbl = resolved
+                if cname not in tbl.search_cols:
+                    raise SearchParsingError("%s: %s is not a column of %s" % (clause, cname, tname))
+                processed.append(Identifier(tname, cname))
+            elif piece in table.search_cols:
+                if join_context is None:
+                    processed.append(Identifier(piece))
+                else:
+                    # in a joined query every identifier is emitted qualified
+                    processed.append(Identifier(table.search_table, piece))
             elif re.match(FLOAT_RE, piece):
                 processed.append(Placeholder())
                 if any(c in piece for c in "Ee."):

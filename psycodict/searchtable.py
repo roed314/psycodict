@@ -171,7 +171,7 @@ class PostgresSearchTable(PostgresTable):
             wrapped = _qualify(wrapped, tname)
         return wrapped
 
-    def _parse_special(self, key, value, col, col_type, join_context=None, owner=None):
+    def _parse_special(self, key, value, col, col_type, join_context=None):
         """
         Implements more complicated query conditions than just testing for equality:
         inequalities, containment and disjunctions.
@@ -208,8 +208,6 @@ class PostgresSearchTable(PostgresTable):
         - ``col_type`` -- the SQL type of the column
         - ``join_context`` -- when parsing a joined query, the dictionary of joined
           tables (as produced by ``_parse_join``); None otherwise
-        - ``owner`` -- when parsing a joined query, a pair (table name, table object)
-          giving the table that ``col`` belongs to; None otherwise
 
         OUTPUT:
 
@@ -244,7 +242,7 @@ class PostgresSearchTable(PostgresTable):
         if key in ["$or", "$and"]:
             pairs = [
                 self._parse_dict(clause, outer=col, outer_type=col_type,
-                                 join_context=join_context, outer_owner=owner)
+                                 join_context=join_context)
                 for clause in value
             ]
             if key == "$or" and any(pair[0] is None for pair in pairs):
@@ -265,7 +263,7 @@ class PostgresSearchTable(PostgresTable):
                     return None, None
         elif key == "$not":
             negated, values = self._parse_dict(value, outer=col, outer_type=col_type,
-                                               join_context=join_context, outer_owner=owner)
+                                               join_context=join_context)
             if negated is None:
                 return SQL("%s"), [False]
             else:
@@ -291,17 +289,14 @@ class PostgresSearchTable(PostgresTable):
             cmd = SQL("MOD(%s + MOD({0}, %s), %s) = %s").format(col)
             value = [value[1], value[1], value[1], value[0] % value[1]]
         elif key == "$raw":
-            # The expression's columns are those of the table the key belongs
-            # to (this table when there is no join)
-            cmd, value = filter_sql_injection(value, col, col_type, "=", owner[1] if owner else self)
-            if owner is not None:
-                cmd = _qualify(cmd, owner[0])
+            # Names in the expression resolve like query keys: bare names are
+            # this table's columns, and in a joined query table.column names
+            # a joined table's column
+            cmd, value = filter_sql_injection(value, col, col_type, "=", self, join_context=join_context)
         elif isinstance(value, dict) and len(value) == 1 and "$raw" in value:
             # We support queries like {'abvar_count':{'$lte':{'$raw':'q^g'}}}
             if key in postgres_infix_ops:
-                cmd, value = filter_sql_injection(value["$raw"], col, col_type, postgres_infix_ops[key], owner[1] if owner else self)
-                if owner is not None:
-                    cmd = _qualify(cmd, owner[0])
+                cmd, value = filter_sql_injection(value["$raw"], col, col_type, postgres_infix_ops[key], self, join_context=join_context)
             else:
                 raise ValueError("Error building query: {0} (in $raw)".format(key))
         elif key == "$col":
@@ -414,7 +409,7 @@ class PostgresSearchTable(PostgresTable):
             for key, val in D.items()
         ]
 
-    def _parse_dict(self, D, outer=None, outer_type=None, join_context=None, outer_owner=None):
+    def _parse_dict(self, D, outer=None, outer_type=None, join_context=None):
         """
         Parses a dictionary that specifies a query in something close to Mongo syntax into an SQL query.
 
@@ -428,8 +423,6 @@ class PostgresSearchTable(PostgresTable):
           at the first period (a joined-table prefix means that table's column) and
           all identifiers are emitted table-qualified.  None otherwise, in which
           case behavior is exactly as without joins.
-        - ``outer_owner`` -- when parsing a joined query, a pair (table name, table
-          object) giving the table that ``outer`` belongs to
 
         OUTPUT:
 
@@ -469,7 +462,7 @@ class PostgresSearchTable(PostgresTable):
                     raise ValueError("Error building query: empty key")
                 if key[0] == "$":
                     sub, vals = self._parse_special(key, value, outer, col_type=outer_type,
-                                                    join_context=join_context, owner=outer_owner)
+                                                    join_context=join_context)
                     if sub is not None:
                         strings.append(sub)
                         values.extend(vals)
@@ -496,7 +489,6 @@ class PostgresSearchTable(PostgresTable):
                     raise ValueError("%s is not a column of %s" % (key, table.search_table))
                 # Have to determine whether key is jsonb before wrapping it in Identifier
                 col_type = table.col_type[key]
-                owner = None if tname is None else (tname, table)
                 ident = Identifier(key) if tname is None else Identifier(tname, key)
                 if path:
                     key = SQL("{0}{1}").format(ident, SQL("").join(path))
@@ -504,7 +496,7 @@ class PostgresSearchTable(PostgresTable):
                     key = ident
                 if isinstance(value, dict) and all(k.startswith("$") for k in value):
                     sub, vals = self._parse_dict(value, key, outer_type=col_type,
-                                                 join_context=join_context, outer_owner=owner)
+                                                 join_context=join_context)
                     if sub is not None:
                         strings.append(sub)
                         values.extend(vals)
@@ -881,7 +873,8 @@ class PostgresSearchTable(PostgresTable):
           ``col1`` is a column of this table, or of a previously joined table if
           qualified.  ``jointype`` is ``"inner"`` (the default), ``"left"``,
           ``"right"`` or ``"full"``.  When ``join`` is given, query keys,
-          projection entries, sort entries and ``$col`` names may be qualified
+          projection entries, sort entries, ``$col`` names and names in
+          ``$raw`` expressions may be qualified
           as ``"table.column"`` to refer to columns of the joined tables
           (unqualified names refer to this table, with periods keeping their
           usual path meaning), and the keys in the result dictionaries match
