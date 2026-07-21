@@ -1139,8 +1139,20 @@ class PostgresStatsTable(PostgresBase):
                 raise ValueError("Must provide exactly one column")
         where, values, constraint, ccols, cvals, _ = self._process_constraint([col], constraint)
         jcol = Json([col])
-        jcgcols = Json(sorted(ccols.adapted + grouping))
-        if self._has_numstats(jcol, jcgcols, cvals, threshold, suffix=suffix):
+        # Two key conventions are in play.  The avg/min/max stats rows and the
+        # counts rows are keyed by the jointly sorted union of the constraint
+        # and grouping columns, matching _split_dict on a query dictionary.
+        # The "ntotal" row instead records the constraint columns followed by
+        # the grouping columns, without sorting them together, so that _status
+        # can split them apart again (the first len(cvals) entries are the
+        # constraint columns).  The existence guard checks the ntotal row, so
+        # it must use the latter key: sorting it (as this used to do) made
+        # repeated constrained calls miss the previous run's row and stack up
+        # duplicate ntotal rows.  list(): _split_dict wraps tuples, which
+        # cannot be concatenated with the grouping list.
+        cgcols = list(ccols.adapted) + grouping
+        jcgcols = Json(sorted(cgcols))
+        if self._has_numstats(jcol, Json(cgcols), cvals, threshold, suffix=suffix):
             self._logger.info("Numstats already exist")
             return
         now = time.time()
@@ -1173,7 +1185,7 @@ class PostgresStatsTable(PostgresBase):
                 jcol,
                 "ntotal",
                 total,
-                Json(ccols.adapted + grouping),
+                Json(cgcols),
                 cvals,
                 threshold,
             ))
@@ -1182,7 +1194,8 @@ class PostgresStatsTable(PostgresBase):
             # and inserting alongside them would create duplicate rows (LMFDB
             # issue #4103).  There is no unique index to hang ON CONFLICT on,
             # so instead we delete the rows being replaced first.  The ntotal
-            # row cannot collide: _has_numstats would have returned above.
+            # row cannot collide: it is inserted with the same key that
+            # _has_numstats checked above, so we would have returned already.
             self._delete_superseded_stats(
                 jcol,
                 ["avg", "min", "max"],
@@ -1214,7 +1227,10 @@ class PostgresStatsTable(PostgresBase):
         INPUT:
 
         - ``jcol`` -- a list containing the column name whose min/max/avg were computed (wrapped in Json)
-        - ``cgcols`` -- the sorted constraint columns, followed by the sorted grouping columns (wrappe in Json)
+        - ``cgcols`` -- the sorted constraint columns, followed by the sorted
+            grouping columns (wrapped in Json).  These are *not* sorted
+            together: this is the key the ntotal row is stored under, chosen
+            so that ``_status`` can recover the two parts.
         - ``cvals`` -- a list of the values required for the constraint columns (wrapped in Json).
         - ``threshold`` -- an integer: if the number of rows with a given tuple of
            values for the grouping columns is less than this threshold, those
@@ -1266,9 +1282,13 @@ class PostgresStatsTable(PostgresBase):
                 raise ValueError("Only single columns supported")
         grouping = sorted(grouping)
         ccols, cvals = self._split_dict(constraint)
-        jcgcols = Json(sorted(ccols.adapted + grouping))
+        # As in add_numstats: the existence check keys on the ntotal row
+        # (constraint columns followed by grouping columns), while the
+        # avg/min/max rows fetched below are keyed by the sorted union.
+        cgcols = list(ccols.adapted) + grouping
+        jcgcols = Json(sorted(cgcols))
         jcol = Json([col])
-        if not self._has_numstats(jcol, jcgcols, cvals, threshold):
+        if not self._has_numstats(jcol, Json(cgcols), cvals, threshold):
             self._logger.info("Missing numstats, adding them")
             self.add_numstats(col, grouping, constraint, threshold)
             # raise ValueError("Missing numstats")
@@ -1755,7 +1775,11 @@ ORDER BY v.ord LIMIT %s"""
                     continue
                 self.add_stats(cols, (ccols, cvals), threshold, split_list=True, suffix=suffix)
             for col, grouping, ccols, cvals, threshold in nstat_cmds:
-                if any(col not in self.table.search_cols for col in cols + ccols):
+                # Check the columns this command actually uses.  This used to
+                # read the ``cols`` left over from the loops above -- unbound
+                # when only numstats were recorded -- with the generator
+                # variable shadowing ``col``.
+                if any(c not in self.table.search_cols for c in [col] + grouping + ccols):
                     # Column may have been deleted
                     continue
                 self.add_numstats(col, grouping, (ccols, cvals), threshold, suffix=suffix)

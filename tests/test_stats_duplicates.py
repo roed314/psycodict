@@ -246,6 +246,110 @@ def test_add_numstats_overlap(saving_table):
     assert stats.quick_count({"flag": True}) == NFLAGGED
 
 
+# ---------------------------------------- constrained numstats: the ntotal row
+
+
+@pytest.fixture
+def constrained_table(table_factory):
+    """
+    A table whose constraint column ``z`` sorts after the grouping column
+    ``a``.  The ntotal row is keyed by the constraint columns followed by the
+    grouping columns (``["z", "a"]``, so that ``_status`` can split the two
+    apart again), which then differs from the sorted union ``["a", "z"]``
+    keying the avg/min/max and counts rows.
+    """
+    table = table_factory(
+        columns=[("n", "integer"), ("a", "integer"), ("z", "integer"), ("label", "text")]
+    )
+    table.insert_many(
+        [{"n": i, "a": i % 3, "z": i % 2, "label": "l%d" % i} for i in range(30)]
+    )
+    table.stats.saving = True
+    return table
+
+
+def ntotal_rows(table):
+    """
+    The ``(constraint_cols, value)`` pairs of the raw ntotal stats rows.
+    """
+    cur = table._execute(
+        SQL("SELECT constraint_cols, value FROM {0} WHERE stat = %s").format(
+            Identifier(table.search_table + "_stats")
+        ),
+        ["ntotal"],
+    )
+    return [(rec[0], rec[1]) for rec in cur]
+
+
+def test_repeated_constrained_add_numstats(constrained_table):
+    # The existence guard used to look the ntotal row up under the sorted
+    # union of the constraint and grouping columns, so repeated constrained
+    # calls never found the previous run's row (stored constraint-first) and
+    # stacked up duplicates -- and the dictionary form of the constraint did
+    # not survive the key construction at all (tuple + list).
+    stats = constrained_table.stats
+    stats.add_numstats("n", ["a"], constraint={"z": 1})
+    stats.add_numstats("n", ["a"], constraint={"z": 1})
+    # refresh_stats replays the command in its (ccols, cvals) form
+    stats.add_numstats("n", ["a"], constraint=(["z"], [1]))
+    assert ntotal_rows(constrained_table) == [(["z", "a"], 15)]
+    assert duplicated_stat_keys(constrained_table) == []
+    assert duplicated_count_keys(constrained_table) == []
+    # Odd n grouped by n % 3: 3,9,..,27 / 1,7,..,25 / 5,11,..,29.
+    assert stats.numstats("n", ["a"], constraint={"z": 1}) == {
+        (0,): {"avg": 15, "min": 3, "max": 27},
+        (1,): {"avg": 13, "min": 1, "max": 25},
+        (2,): {"avg": 17, "min": 5, "max": 29},
+    }
+    # The read found the stored statistics rather than recomputing them.
+    assert ntotal_rows(constrained_table) == [(["z", "a"], 15)]
+    # The counts rows are keyed by the sorted union, where quick_count looks.
+    assert stats.quick_count({"a": 0, "z": 1}) == 5
+
+
+def test_constrained_numstats_read_computes_once(constrained_table):
+    # numstats performs the same existence check before deciding to call
+    # add_numstats: a constrained read used to miss the stored ntotal row
+    # every time, recomputing the statistics (and inserting another copy)
+    # on every call.
+    stats = constrained_table.stats
+    for _ in range(2):
+        nstats = stats.numstats("n", "a", constraint={"z": 1})
+        assert nstats[0] == {"avg": 15, "min": 3, "max": 27}
+    assert ntotal_rows(constrained_table) == [(["z", "a"], 15)]
+    assert duplicated_stat_keys(constrained_table) == []
+
+
+def test_legacy_ntotal_duplicates_cleaned_by_refresh(constrained_table):
+    # ntotal duplicates left behind by pre-fix runs are not deleted by a
+    # plain re-run -- the existence check now finds the rows and returns
+    # before the delete-and-insert machinery -- but they no longer multiply,
+    # and refresh_stats, which wipes the tables and replays each recorded
+    # command through the fixed check, converges to a single row.
+    stats = constrained_table.stats
+    stats.add_numstats("n", ["a"], constraint={"z": 1})
+    # a second identical ntotal row, as a pre-fix run would have left
+    constrained_table._execute(
+        SQL(
+            "INSERT INTO {0} (cols, stat, value, constraint_cols, constraint_values, threshold) "
+            "VALUES (%s, %s, %s, %s, %s, %s)"
+        ).format(Identifier(constrained_table.search_table + "_stats")),
+        [Json(["n"]), "ntotal", 15, Json(["z", "a"]), Json([1]), None],
+    )
+    assert len(ntotal_rows(constrained_table)) == 2
+    stats.add_numstats("n", ["a"], constraint={"z": 1})
+    assert len(ntotal_rows(constrained_table)) == 2  # no growth
+    # This table records numstats only, which also exercises the regeneration
+    # loop's deleted-column check (it used to read the stats commands' loop
+    # variable, unbound here).
+    stats.refresh_stats()
+    assert ntotal_rows(constrained_table) == [(["z", "a"], 15)]
+    assert duplicated_stat_keys(constrained_table) == []
+    assert duplicated_count_keys(constrained_table) == []
+    nstats = stats.numstats("n", ["a"], constraint={"z": 1})
+    assert nstats[(1,)] == {"avg": 13, "min": 1, "max": 25}
+
+
 # -------------------------------------------- _record_count keys rows properly
 
 
