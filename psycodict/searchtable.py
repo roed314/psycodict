@@ -148,19 +148,30 @@ class PostgresSearchTable(PostgresTable):
             return "%s::" + col_type + "[]"
         return "%s"
 
-    def _col_identifier(self, name):
+    def _col_identifier(self, name, join_context=None):
         """
         Wraps a column name given as the value of a ``$col`` special key,
-        after checking that it is a column of this table.  An array slicer
-        (as in ``vec[2]``) is allowed.
+        after checking that it exists.  The name resolves exactly like a
+        query key: a bare name is a column of this table, while
+        "table.column" names a column of a joined table when a join is in
+        use.  An array slicer (as in ``vec[2]``) is allowed.
         """
         if not isinstance(name, str):
             raise ValueError("$col takes a column name, not %s" % (type(name).__name__,))
-        if name != "id" and name.split("[", 1)[0] not in self.search_cols:
-            raise ValueError("%s is not a column of %s" % (name, self.search_table))
-        return IdentifierWrapper(name)
+        table, tname, colspec = self, None, name
+        if join_context is not None:
+            tname = self.search_table
+            prefix, dot, rest = name.partition(".")
+            if dot and prefix in join_context:
+                table, tname, colspec = join_context[prefix], prefix, rest
+        if colspec != "id" and colspec.split("[", 1)[0] not in table.search_cols:
+            raise ValueError("%s is not a column of %s" % (colspec, table.search_table))
+        wrapped = IdentifierWrapper(colspec)
+        if tname is not None:
+            wrapped = _qualify(wrapped, tname)
+        return wrapped
 
-    def _parse_special(self, key, value, col, col_type):
+    def _parse_special(self, key, value, col, col_type, join_context=None, owner=None):
         """
         Implements more complicated query conditions than just testing for equality:
         inequalities, containment and disjunctions.
@@ -188,12 +199,17 @@ class PostgresSearchTable(PostgresTable):
             - ``$ilike`` -- for text columns, matches strings according to the ILIKE, the case-insensitive version of LIKE in PostgreSQL.
             - ``$regex`` -- for text columns, matches the given regex expression supported by PostgresSQL
             - ``$raw`` -- a string to be inserted as SQL after filtering against SQL injection
-            - ``$col`` -- the name of another column of this table: ``{"col1": {"$col": "col2"}}``
+            - ``$col`` -- the name of another column: ``{"col1": {"$col": "col2"}}``
               imposes ``col1 = col2``, and ``{"$col": "col2"}`` can also be used as the value
-              for any of the infix comparison operators above.
+              for any of the infix comparison operators above.  The name resolves like a
+              query key, so it can name a joined table's column when a join is in use.
         - ``value`` -- The value to compare to.  The meaning depends on the key.
         - ``col`` -- The name of the column, wrapped in SQL
         - ``col_type`` -- the SQL type of the column
+        - ``join_context`` -- when parsing a joined query, the dictionary of joined
+          tables (as produced by ``_parse_join``); None otherwise
+        - ``owner`` -- when parsing a joined query, a pair (table name, table object)
+          giving the table that ``col`` belongs to; None otherwise
 
         OUTPUT:
 
@@ -227,7 +243,8 @@ class PostgresSearchTable(PostgresTable):
                 value = {"$or": value}
         if key in ["$or", "$and"]:
             pairs = [
-                self._parse_dict(clause, outer=col, outer_type=col_type)
+                self._parse_dict(clause, outer=col, outer_type=col_type,
+                                 join_context=join_context, outer_owner=owner)
                 for clause in value
             ]
             if key == "$or" and any(pair[0] is None for pair in pairs):
@@ -247,7 +264,8 @@ class PostgresSearchTable(PostgresTable):
                 else:
                     return None, None
         elif key == "$not":
-            negated, values = self._parse_dict(value, outer=col, outer_type=col_type)
+            negated, values = self._parse_dict(value, outer=col, outer_type=col_type,
+                                               join_context=join_context, outer_owner=owner)
             if negated is None:
                 return SQL("%s"), [False]
             else:
@@ -273,22 +291,28 @@ class PostgresSearchTable(PostgresTable):
             cmd = SQL("MOD(%s + MOD({0}, %s), %s) = %s").format(col)
             value = [value[1], value[1], value[1], value[0] % value[1]]
         elif key == "$raw":
-            cmd, value = filter_sql_injection(value, col, col_type, "=", self)
+            # The expression's columns are those of the table the key belongs
+            # to (this table when there is no join)
+            cmd, value = filter_sql_injection(value, col, col_type, "=", owner[1] if owner else self)
+            if owner is not None:
+                cmd = _qualify(cmd, owner[0])
         elif isinstance(value, dict) and len(value) == 1 and "$raw" in value:
             # We support queries like {'abvar_count':{'$lte':{'$raw':'q^g'}}}
             if key in postgres_infix_ops:
-                cmd, value = filter_sql_injection(value["$raw"], col, col_type, postgres_infix_ops[key], self)
+                cmd, value = filter_sql_injection(value["$raw"], col, col_type, postgres_infix_ops[key], owner[1] if owner else self)
+                if owner is not None:
+                    cmd = _qualify(cmd, owner[0])
             else:
                 raise ValueError("Error building query: {0} (in $raw)".format(key))
         elif key == "$col":
             # {'col1': {'$col': 'col2'}} imposes "col1" = "col2"
-            cmd = SQL("{0} = {1}").format(col, self._col_identifier(value))
+            cmd = SQL("{0} = {1}").format(col, self._col_identifier(value, join_context))
             value = []
         elif isinstance(value, dict) and len(value) == 1 and "$col" in value:
             # {'col1': {'$lte': {'$col': 'col2'}}} imposes "col1" <= "col2"
             if key in postgres_infix_ops:
                 cmd = SQL("{0} " + postgres_infix_ops[key] + " {1}").format(
-                    col, self._col_identifier(value["$col"])
+                    col, self._col_identifier(value["$col"], join_context)
                 )
                 value = []
             else:
@@ -390,7 +414,7 @@ class PostgresSearchTable(PostgresTable):
             for key, val in D.items()
         ]
 
-    def _parse_dict(self, D, outer=None, outer_type=None):
+    def _parse_dict(self, D, outer=None, outer_type=None, join_context=None, outer_owner=None):
         """
         Parses a dictionary that specifies a query in something close to Mongo syntax into an SQL query.
 
@@ -399,6 +423,13 @@ class PostgresSearchTable(PostgresTable):
         - ``D`` -- a dictionary, or a scalar if outer is set
         - ``outer`` -- the column that we are parsing (None if not yet parsing any column).  Used in recursion.  Should be wrapped in SQL.
         - ``outer_type`` -- the SQL type for the outer column
+        - ``join_context`` -- when parsing a joined query, the dictionary of joined
+          tables (as produced by ``_parse_join``).  Keys then resolve by splitting
+          at the first period (a joined-table prefix means that table's column) and
+          all identifiers are emitted table-qualified.  None otherwise, in which
+          case behavior is exactly as without joins.
+        - ``outer_owner`` -- when parsing a joined query, a pair (table name, table
+          object) giving the table that ``outer`` belongs to
 
         OUTPUT:
 
@@ -437,30 +468,43 @@ class PostgresSearchTable(PostgresTable):
                 if not key:
                     raise ValueError("Error building query: empty key")
                 if key[0] == "$":
-                    sub, vals = self._parse_special(key, value, outer, col_type=outer_type)
+                    sub, vals = self._parse_special(key, value, outer, col_type=outer_type,
+                                                    join_context=join_context, owner=outer_owner)
                     if sub is not None:
                         strings.append(sub)
                         values.extend(vals)
                     continue
+                # In a joined query, a prefix naming a joined table sends the
+                # key to that table; anything else is a column of this table,
+                # with periods keeping their usual path meaning
+                table, tname = self, None
+                if join_context is not None:
+                    tname = self.search_table
+                    prefix, dot, rest = key.partition(".")
+                    if dot and prefix in join_context:
+                        table, tname, key = join_context[prefix], prefix, rest
                 if "." in key:
                     path = [int(p) if p.isdigit() else p for p in key.split(".")]
                     key = path[0]
-                    if self.col_type.get(key) == "jsonb":
+                    if table.col_type.get(key) == "jsonb":
                         path = [SQL("->{0}").format(Literal(p)) for p in path[1:]]
                     else:
                         path = [SQL("[{0}]").format(Literal(p)) for p in path[1:]]
                 else:
                     path = None
-                if key != "id" and key not in self.search_cols:
-                    raise ValueError("%s is not a column of %s" % (key, self.search_table))
+                if key != "id" and key not in table.search_cols:
+                    raise ValueError("%s is not a column of %s" % (key, table.search_table))
                 # Have to determine whether key is jsonb before wrapping it in Identifier
-                col_type = self.col_type[key]
+                col_type = table.col_type[key]
+                owner = None if tname is None else (tname, table)
+                ident = Identifier(key) if tname is None else Identifier(tname, key)
                 if path:
-                    key = SQL("{0}{1}").format(Identifier(key), SQL("").join(path))
+                    key = SQL("{0}{1}").format(ident, SQL("").join(path))
                 else:
-                    key = Identifier(key)
+                    key = ident
                 if isinstance(value, dict) and all(k.startswith("$") for k in value):
-                    sub, vals = self._parse_dict(value, key, outer_type=col_type)
+                    sub, vals = self._parse_dict(value, key, outer_type=col_type,
+                                                 join_context=join_context, outer_owner=owner)
                     if sub is not None:
                         strings.append(sub)
                         values.extend(vals)
@@ -835,13 +879,14 @@ class PostgresSearchTable(PostgresTable):
           describing other search tables to join to this one.  In each tuple, ``col2``
           must be qualified as ``"table.column"`` and names the table being joined;
           ``col1`` is a column of this table, or of a previously joined table if
-          qualified.  ``jointype`` is ``"inner"`` (the default) or ``"left"``.
-          When ``join`` is given, query keys and projection entries may be qualified
-          as ``"table.column"`` to refer to columns of the joined tables (unqualified
-          names refer to this table, with periods keeping their usual path meaning),
-          and the keys in the result dictionaries match the projection entries as
-          given.  Sorting is by columns of this table only, counts are never cached,
-          and ``split_ors``, ``one_per`` and ``raw`` are not supported.  See the
+          qualified.  ``jointype`` is ``"inner"`` (the default), ``"left"``,
+          ``"right"`` or ``"full"``.  When ``join`` is given, query keys,
+          projection entries, sort entries and ``$col`` names may be qualified
+          as ``"table.column"`` to refer to columns of the joined tables
+          (unqualified names refer to this table, with periods keeping their
+          usual path meaning), and the keys in the result dictionaries match
+          the projection entries as given.  Counts are never cached, and
+          ``split_ors``, ``one_per`` and ``raw`` are not supported.  See the
           Joined queries section of QueryLanguage.md for details.
 
         OUTPUT:
@@ -1077,8 +1122,8 @@ class PostgresSearchTable(PostgresTable):
                 )
             col1, col2 = entry[0], entry[1]
             jointype = entry[2] if len(entry) == 3 else "inner"
-            if not (isinstance(jointype, str) and jointype.lower() in ("inner", "left")):
-                raise ValueError("join type must be 'inner' or 'left', not %r" % (jointype,))
+            if not (isinstance(jointype, str) and jointype.lower() in ("inner", "left", "right", "full")):
+                raise ValueError("join type must be 'inner', 'left', 'right' or 'full', not %r" % (jointype,))
             if not isinstance(col2, str) or "." not in col2:
                 raise ValueError(
                     "%r: the second column of a join entry names the table being "
@@ -1117,69 +1162,6 @@ class PostgresSearchTable(PostgresTable):
                 Identifier(tname2, cname2),
             )
         return joined, frm
-
-    def _split_join_query(self, query, joined):
-        """
-        Splits a query dictionary into per-table query dictionaries.
-
-        Keys whose prefix (the part before the first period) names a joined
-        table are assigned to that table, with the prefix stripped; all other
-        keys, including the top-level $or/$and/$not, belong to this table.
-
-        OUTPUT:
-
-        A dictionary mapping table names to query dictionaries; only tables
-        with at least one constraint appear.
-        """
-        def check_special(clause, special):
-            # Each table's constraints are parsed separately and combined with
-            # AND, so a clause combining constraints in any other way cannot
-            # span several tables.
-            if isinstance(clause, (list, tuple)):
-                for part in clause:
-                    check_special(part, special)
-            elif isinstance(clause, dict):
-                for k, v in clause.items():
-                    if isinstance(k, str) and not k.startswith("$") and k.partition(".")[0] in joined:
-                        raise ValueError(
-                            "%s: constraints on joined tables cannot appear inside %s" % (k, special)
-                        )
-                    check_special(v, special)
-
-        split = {}
-        for key, value in query.items():
-            if key.startswith("$"):
-                check_special(value, key)
-                tname, subkey = self.search_table, key
-            else:
-                prefix, dot, rest = key.partition(".")
-                if dot and prefix in joined:
-                    tname, subkey = prefix, rest
-                else:
-                    tname, subkey = self.search_table, key
-            split.setdefault(tname, {})[subkey] = value
-        return split
-
-    def _join_where(self, split, joined):
-        """
-        Builds the WHERE clause of a joined query from the output of
-        ``_split_join_query``, qualifying each table's constraints.
-
-        OUTPUT:
-
-        - an SQL Composable giving the WHERE clause (empty if no constraints)
-        - a list of values to substitute for the %s entries
-        """
-        where, values = [], []
-        for tname, Q in split.items():
-            table = self if tname == self.search_table else joined[tname]
-            qstr, vals = table._parse_dict(Q)
-            if qstr is not None:
-                where.append(SQL("({0})").format(_qualify(qstr, tname)))
-                values.extend(vals)
-        if where:
-            return SQL(" WHERE {0}").format(SQL(" AND ").join(where)), values
-        return SQL(""), values
 
     def _parse_join_projection(self, projection, joined):
         """
@@ -1227,17 +1209,28 @@ class PostgresSearchTable(PostgresTable):
             cols.append(_qualify(IdentifierWrapper(colspec), table.search_table))
         return tuple(keys), cols
 
-    def _join_sort(self, thisquery, limit, offset, sort, joined):
+    def _join_sort(self, query, limit, offset, sort, joined):
         """
         Processes the sort order for a joined query, returning the ORDER BY
-        clause.  Sorting is by columns of this table only.
+        clause.  Sort entries resolve like query keys: a bare name is a
+        column of this table, while "table.column" names a joined table's
+        column.  The default sort (sort=None) is this table's.
         """
         if sort:
+            L = []
             for s in sort:
-                name = s if isinstance(s, str) else s[0]
-                if name.partition(".")[0] in joined:
-                    raise ValueError("%s: sorting by columns of joined tables is not supported" % (name,))
-        sort_composed, has_sort, _ = self._process_sort(thisquery, limit, offset, sort)
+                name, asc = (s, 1) if isinstance(s, str) else (s[0], s[1])
+                prefix, dot, rest = name.partition(".")
+                if dot and prefix in joined:
+                    tname, colspec, table = prefix, rest, joined[prefix]
+                else:
+                    tname, colspec, table = self.search_table, name, self
+                if colspec != "id" and colspec.split("[", 1)[0] not in table.search_cols:
+                    raise ValueError("%s is not a column of %s" % (colspec, table.search_table))
+                ident = _qualify(IdentifierWrapper(colspec), tname)
+                L.append(ident if asc == 1 else SQL("{0} DESC NULLS LAST").format(ident))
+            return SQL(" ORDER BY {0}").format(SQL(", ").join(L))
+        sort_composed, has_sort, _ = self._process_sort(query, limit, offset, sort)
         if has_sort:
             return SQL(" ORDER BY {0}").format(_qualify(sort_composed, self.search_table))
         return SQL("")
@@ -1250,10 +1243,13 @@ class PostgresSearchTable(PostgresTable):
         if offset < 0:
             raise ValueError("Offset cannot be negative")
         joined, frm = self._parse_join(join)
-        split = self._split_join_query(query, joined)
         search_cols, cols = self._parse_join_projection(projection, joined)
-        where, values = self._join_where(split, joined)
-        olo = self._join_sort(split.get(self.search_table, {}), limit, offset, sort, joined)
+        qstr, values = self._parse_dict(query, join_context=joined)
+        if qstr is None:
+            where, values = SQL(""), []
+        else:
+            where = SQL(" WHERE {0}").format(qstr)
+        olo = self._join_sort(query, limit, offset, sort, joined)
         if limit is None:
             prelimit = None
         else:
@@ -1303,10 +1299,13 @@ class PostgresSearchTable(PostgresTable):
         documentation there.
         """
         joined, frm = self._parse_join(join)
-        split = self._split_join_query(query, joined)
         search_cols, cols = self._parse_join_projection(projection, joined)
-        where, values = self._join_where(split, joined)
-        olo = self._join_sort(split.get(self.search_table, {}), 1, offset, sort, joined)
+        qstr, values = self._parse_dict(query, join_context=joined)
+        if qstr is None:
+            where, values = SQL(""), []
+        else:
+            where = SQL(" WHERE {0}").format(qstr)
+        olo = self._join_sort(query, 1, offset, sort, joined)
         olo = SQL("{0} LIMIT %s").format(olo)
         values.append(1)
         if offset != 0:
@@ -1331,8 +1330,11 @@ class PostgresSearchTable(PostgresTable):
         documentation there.  The count is computed directly and never cached.
         """
         joined, frm = self._parse_join(join)
-        split = self._split_join_query(query, joined)
-        where, values = self._join_where(split, joined)
+        qstr, values = self._parse_dict(query, join_context=joined)
+        if qstr is None:
+            where, values = SQL(""), []
+        else:
+            where = SQL(" WHERE {0}").format(qstr)
         selecter = SQL("SELECT COUNT(*) FROM {0}{1}").format(frm, where)
         cur = self._execute(selecter, values)
         return cur.fetchone()[0]

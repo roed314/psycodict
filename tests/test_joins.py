@@ -42,6 +42,8 @@ def jtables(table_factory):
         {"n": 2, "label": "f2", "deg": 2, "r2": 1, "gp": "g2", "coeffs": [3, 4], "data": {"s": "y", "nested": {"k": 2}}},
         {"n": 3, "label": "f3", "deg": 3, "r2": 1, "gp": "g1", "coeffs": [5, 6], "data": {"s": "x", "nested": {"k": 1}}},
         {"n": 4, "label": "f4", "deg": 4, "r2": 2, "gp": "g2", "coeffs": [7, 8], "data": {"s": "z", "nested": {"k": 0}}},
+        # referenced by no curve, so RIGHT and FULL joins differ from INNER
+        {"n": 5, "label": "f5", "deg": 5, "r2": 0, "gp": None, "coeffs": [9, 10], "data": {"s": "w", "nested": {"k": 2}}},
     ])
     groups.insert_many([
         {"n": 1, "label": "g1", "size": 1},
@@ -221,11 +223,63 @@ def test_join_col_and_raw_on_joined_table(jtables):
     curves, fields, groups = jtables
     F = fields.search_table
     join = FK(fields)
-    # $col compares two columns of the same (joined) table, both qualified
-    assert curves.search({"%s.deg" % F: {"$col": "r2"}}, 0, join=join, limit=10) == ["c1", "c2"]
-    assert curves.search({"%s.deg" % F: {"$gt": {"$col": "r2"}}}, 0, join=join, limit=10) == ["c3", "c4", "c5", "c8"]
-    # $raw arithmetic within the joined table is qualified too
+    # $col names resolve like query keys, so comparing two columns of the
+    # joined table qualifies both
+    assert curves.search({"%s.deg" % F: {"$col": "%s.r2" % F}}, 0, join=join, limit=10) == ["c1", "c2"]
+    assert curves.search({"%s.deg" % F: {"$gt": {"$col": "%s.r2" % F}}}, 0, join=join, limit=10) == ["c3", "c4", "c5", "c8"]
+    # $raw arithmetic stays within the key's table, and is qualified
     assert curves.search({"%s.deg" % F: {"$raw": "2*r2"}}, 0, join=join, limit=10) == ["c3", "c5", "c8"]
+
+
+def test_join_cross_table_col(jtables):
+    curves, fields, groups = jtables
+    F = fields.search_table
+    join = FK(fields)
+    # a curve whose n equals its field's n
+    assert curves.search({"n": {"$col": "%s.n" % F}}, 0, join=join, limit=10) == ["c1"]
+    # and inside a comparison operator
+    assert curves.count({"n": {"$gt": {"$col": "%s.n" % F}}}, join=join) == 5
+
+
+def test_join_or_and_not_across_tables(jtables):
+    curves, fields, groups = jtables
+    F = fields.search_table
+    join = FK(fields)
+    # $or branches may constrain different tables
+    assert curves.count({"$or": [{"n": 1}, {"%s.gp" % F: "g2"}]}, join=join) == 4
+    # $not over a joined-table constraint
+    assert curves.count({"$not": {"%s.gp" % F: "g1"}}, join=join) == 3
+    # nested: $or under a joined column, mixing $raw and a comparison
+    assert curves.count({"%s.deg" % F: {"$or": [{"$raw": "2*r2"}, {"$gte": 5}]}}, join=join) == 3
+
+
+def test_join_sort_by_joined_column(jtables):
+    curves, fields, groups = jtables
+    F = fields.search_table
+    join = FK(fields)
+    assert curves.search({}, 0, join=join, sort=["%s.deg" % F, "n"], limit=10) == \
+        ["c1", "c2", "c3", "c8", "c4", "c5"]
+    assert curves.search({}, 0, join=join, sort=[("%s.deg" % F, -1), "n"], limit=10) == \
+        ["c5", "c4", "c1", "c2", "c3", "c8"]
+    with pytest.raises(ValueError, match="not a column"):
+        curves.search({}, 0, join=join, sort=["%s.missing" % F], limit=1)
+
+
+def test_join_right_and_full(jtables):
+    curves, fields, groups = jtables
+    F = fields.search_table
+    right = [("fk", "%s.label" % F, "right")]
+    full = [("fk", "%s.label" % F, "full")]
+    # f5 is referenced by no curve; c6 (unknown field) and c7 (null fk) match none
+    assert curves.count(join=right) == 7
+    assert curves.count(join=full) == 9
+    # the f5 row surfaces with this table's columns NULL
+    degs = curves.search({}, "%s.deg" % F, join=right, limit=20)
+    assert degs == [2, 2, 2, 3, 4, 2, 5]
+    labels = curves.search({}, 0, join=full, limit=20)
+    assert labels.count(None) == 1
+    assert sorted(x for x in labels if x is not None) == \
+        ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"]
 
 
 def test_join_array_slicer_projection(jtables):
@@ -272,10 +326,6 @@ def test_join_usage_errors(jtables):
     curves, fields, groups = jtables
     F = fields.search_table
     join = FK(fields)
-    with pytest.raises(ValueError, match="cannot appear inside"):
-        curves.count({"$or": [{"%s.deg" % F: 2}, {"n": 1}]}, join=join)
-    with pytest.raises(ValueError, match="sorting by columns of joined tables"):
-        curves.search({}, 0, join=join, sort=["%s.deg" % F], limit=1)
     with pytest.raises(ValueError, match="split_ors"):
         curves.search({}, 0, join=join, split_ors=True, limit=1)
     with pytest.raises(ValueError, match="one_per"):
