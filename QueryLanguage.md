@@ -97,6 +97,20 @@ The value should be a pair of integers `[a, b]` with `0 <= a < b`, and rows are 
 
 For array columns, searches for rows where the column overlaps with a given list of values.  Translates to the `&&` operator.
 
+### `$size`
+
+For a column of array or `jsonb` type, constrains the number of elements.  The value may be either an integer (an equality test on the length) or a dictionary of the [lower-level special keys](#lower-level-special-keys) above (constraining the length like any integer column):
+
+ * `{"vec": {"$size": 3}}` matches rows whose `vec` array has exactly three elements;
+ * `{"vec": {"$size": {"$gte": 2, "$lte": 5}}}` matches rows whose `vec` array has between two and five elements, and `$in`, `$ne`, `$or` and the other integer operators work the same way.
+
+For an array column this translates to `cardinality(column)` and for a `jsonb` column to `jsonb_array_length(column)`.  Note the following:
+
+ * `cardinality` is used rather than `array_length(column, 1)` precisely so that an empty array has size `0`; `array_length` returns NULL for an empty array, so `{"$size": 0}` would never match one.
+ * `{"$size": 0}` matches an empty array but **not** a row where the column is NULL, since the length of a NULL column is NULL, not `0` (and a NULL length compares as unknown, so it is likewise excluded by `$ne` and the inequality operators).
+ * For a multidimensional array, `cardinality` counts the elements of every dimension, not the length of the outermost one (e.g. a `2×3` array has size `6`).
+ * For a `jsonb` column, `jsonb_array_length` raises a database error at query time if the value is not a JSON array (an object or a scalar), so `$size` should only be used on `jsonb` columns known to hold arrays.  A path specifier can pick out a `jsonb` sub-array, as in `{"data.a": {"$size": 2}}`.
+
 ## Comparing columns: the `$col` special key
 
 The special keys above compare a column to a fixed value.  To compare a column to *another column of the same table*, use `$col` with the other column's name:

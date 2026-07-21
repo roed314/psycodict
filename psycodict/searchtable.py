@@ -219,6 +219,10 @@ class PostgresSearchTable(PostgresTable):
             - ``$notcontains`` -- for json columns, the column must not contain any entry of the given value (which should be iterable)
             - ``$containedin`` -- for json columns, the column should be a subset of the given list
             - ``$overlaps`` -- the column should overlap the given array
+            - ``$size`` -- for an array or jsonb-array column, constrains the number of
+              elements.  The value is either an integer (testing equality of the length)
+              or an operator dictionary (e.g. ``{"$gte": 2}``, ``{"$in": [2, 3]}``) that
+              constrains the length like any integer column.
             - ``$exists`` -- if True, require not null; if False, require null.
             - ``$startswith`` -- for text columns, matches strings that start with the given string.
             - ``$like`` -- for text columns, matches strings according to the LIKE operand in SQL.
@@ -314,6 +318,33 @@ class PostgresSearchTable(PostgresTable):
             # have to take modulus twice since MOD(-1,5) = -1 in postgres
             cmd = SQL("MOD(%s + MOD({0}, %s), %s) = %s").format(col)
             value = [value[1], value[1], value[1], value[0] % value[1]]
+        elif key == "$size":
+            # Constrains the number of elements of an array or jsonb-array column.
+            if col_type is not None and col_type.endswith("[]"):
+                # cardinality, not array_length(col, 1): array_length of an
+                # empty array is NULL (so {"$size": 0} could never match an
+                # empty array), while cardinality returns 0.  For a
+                # multidimensional array it counts the elements of every
+                # dimension, not the length of the outermost one.
+                length = SQL("cardinality({0})").format(col)
+            elif col_type == "jsonb":
+                # jsonb_array_length raises a database error at query time if
+                # the value is a jsonb non-array (an object or a scalar).  An
+                # empty jsonb array gives 0 and a SQL NULL gives NULL.
+                length = SQL("jsonb_array_length({0})").format(col)
+            else:
+                raise ValueError("$size requires an array or jsonb column")
+            if isinstance(value, dict):
+                # An operator dictionary recurses with the length expression as
+                # the outer column, exactly as $or/$and recurse with a column,
+                # so every integer operator ($gte, $in, $ne, ...) works against
+                # the length -- including on joined columns and dotted paths,
+                # since ``col`` arrives as an already-built composable.
+                return self._parse_dict(value, outer=length, outer_type="integer",
+                                        join_context=join_context)
+            # A bare integer is an equality test on the length.
+            cmd = SQL("{0} = %s").format(length)
+            value = [value]
         elif key == "$raw":
             # Names in the expression resolve like query keys: bare names are
             # this table's columns, and in a joined query table.column names
