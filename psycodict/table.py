@@ -1091,6 +1091,13 @@ class PostgresTable(PostgresBase):
         - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
         """
         self._forbid_reindex_false(reindex, inplace)
+        if not inplace:
+            # The non-inplace update clones the search table to a _tmp copy
+            # and rebuilds its indexes with _tmp names, just like reload, so
+            # leftovers from an unfinished reload would make it fail midway.
+            # The counts and stats tables are not checked: this method
+            # deliberately reuses their _tmp versions when they exist.
+            self._check_tmp_leftovers([self.search_table])
         logid = self._check_locks(logging["operation"], datafile=datafile)
         logging["aborted"] = True
         try:
@@ -1599,6 +1606,111 @@ class PostgresTable(PostgresBase):
         if "columns" in kwds:
             raise ValueError("Cannot specify column order using the columns parameter")
 
+    def _check_tmp_leftovers(self, clone_tables=None):
+        """
+        Check for indexes, constraints and tables left over from an earlier
+        unfinished reload, whose names collide with the temporary names that
+        the next reload will use.
+
+        A crashed or interrupted reload can leave objects whose names end in
+        ``_tmp`` (or ``_tmp_pkey`` for primary keys) attached to the live
+        search, counts and stats tables.  The next reload then fails partway
+        through, after the expensive data loading.  This is called at the
+        start of ``reload`` and of a non-inplace ``update_from_file`` so that
+        the failure happens before any work is done, with a ValueError whose
+        message lists each offending object together with SQL commands that
+        rename or drop it.
+
+        INPUT:
+
+        - ``clone_tables`` -- a list of table names (optional).  The caller
+            will create a fresh ``<name>_tmp`` table for each, so an existing
+            table of that name is reported as a leftover.  Tables for which
+            the caller reuses an existing ``_tmp`` table (the counts and
+            stats tables when no data file is given) must not be included.
+        """
+        tables = [self.search_table]
+        if self.stats.saving:
+            tables.extend([self.stats.counts, self.stats.stats])
+        # The two shapes of temporary names used by reload: indexes and
+        # constraints get <name>_tmp, primary keys get <table>_tmp_pkey.
+        pattern = "_tmp(_pkey)?$"
+        leftovers = [
+            ("constraint", tbl, name)
+            for tbl, name in self._execute(
+                SQL(
+                    "SELECT rel.relname, con.conname FROM pg_constraint con "
+                    "JOIN pg_class rel ON rel.oid = con.conrelid "
+                    "WHERE rel.relname = ANY(%s) AND con.conname ~ %s"
+                ),
+                [tables, pattern],
+                silent=True,
+            )
+        ]
+        # A unique or primary key constraint is backed by an index of the same
+        # name; it can only be renamed or dropped as a constraint, so report
+        # it once, as a constraint.
+        found = {(tbl, name) for (kind, tbl, name) in leftovers}
+        leftovers.extend(
+            ("index", tbl, name)
+            for tbl, name in self._execute(
+                SQL(
+                    "SELECT tablename, indexname FROM pg_indexes "
+                    "WHERE tablename = ANY(%s) AND indexname ~ %s"
+                ),
+                [tables, pattern],
+                silent=True,
+            )
+            if (tbl, name) not in found
+        )
+        leftovers.sort(key=lambda trip: (trip[1], trip[2]))
+        if clone_tables is None:
+            clone_tables = []
+        tmp_tables = [t + "_tmp" for t in clone_tables if self._table_exists(t + "_tmp")]
+        if not (leftovers or tmp_tables):
+            return
+        lines = [
+            "Found leftover objects from an earlier unfinished reload of %s; "
+            "they would collide with this operation." % (self.search_table,),
+            "If an object holds live data (e.g. the final swap of a reload "
+            "was interrupted), rename it; if it is junk, drop it:",
+        ]
+        for name in tmp_tables:
+            lines.append("- table %s:\n    %s;" % (
+                name,
+                SQL("DROP TABLE {0}").format(Identifier(name)).as_string(self.conn),
+            ))
+        for kind, tbl, name in leftovers:
+            if name.endswith("_tmp"):
+                newname = name[:-len("_tmp")]
+            else:
+                newname = name[:-len("_tmp_pkey")] + "_pkey"
+            if kind == "constraint":
+                rename = SQL("ALTER TABLE {0} RENAME CONSTRAINT {1} TO {2}").format(
+                    Identifier(tbl), Identifier(name), Identifier(newname)
+                )
+                drop = SQL("ALTER TABLE {0} DROP CONSTRAINT {1}").format(
+                    Identifier(tbl), Identifier(name)
+                )
+            else:
+                rename = SQL("ALTER INDEX {0} RENAME TO {1}").format(
+                    Identifier(name), Identifier(newname)
+                )
+                drop = SQL("DROP INDEX {0}").format(Identifier(name))
+            lines.append("- %s %s on table %s:\n    %s;\n    %s;" % (
+                kind, name, tbl,
+                rename.as_string(self.conn), drop.as_string(self.conn),
+            ))
+        if tmp_tables:
+            lines.append(
+                "Leftover _tmp tables can also be removed with "
+                "db.%s.drop_tmp(); if they come from a reload with "
+                "final_swap=False, finish that reload with "
+                "db.%s.reload_final_swap() instead."
+                % (self.search_table, self.search_table)
+            )
+        raise ValueError("\n".join(lines))
+
     def reload(
         self,
         searchfile,
@@ -1662,6 +1774,17 @@ class PostgresTable(PostgresBase):
         if restat is None:
             restat = countsfile is None or statsfile is None
         self._check_file_input(searchfile, kwds)
+        # Fail now, rather than partway through, if an earlier unfinished
+        # reload left _tmp objects behind.  Only the tables with a data file
+        # get a fresh clone below; the other tables reuse an existing _tmp.
+        clone_tables = [self.search_table]
+        if self.stats.saving:
+            clone_tables.extend(
+                tbl
+                for tbl, datafile in [(self.stats.counts, countsfile), (self.stats.stats, statsfile)]
+                if datafile is not None
+            )
+        self._check_tmp_leftovers(clone_tables)
         print("Reloading %s..." % (self.search_table))
         logid = self._check_locks("reload", datafile=searchfile)
         aborted = True
