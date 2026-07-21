@@ -6,9 +6,9 @@ and decoding the results.
 import binascii
 import json
 import datetime
+import math
 from psycopg.adapt import Dumper
 try:
-    from sage.all import ceil
     try:
         # this fails in sage 9.3
         from sage.rings.complex_mpfr import ComplexNumber, ComplexField
@@ -16,7 +16,7 @@ try:
         from sage.rings.complex_number import ComplexNumber, ComplexField
     from sage.rings.complex_double import ComplexDoubleElement
     from sage.rings.real_mpfr import RealLiteral, RealField, RealNumber
-    from sage.rings.integer import Integer
+    from sage.rings.integer import Integer, IntegerWrapper
     from sage.rings.rational import Rational
     from sage.rings.integer_ring import ZZ
     from sage.rings.rational_field import QQ
@@ -51,6 +51,31 @@ else:
         def __repr__(self):
             return self.literal
 
+    class LmfdbDecimalZero(IntegerWrapper):
+        """
+        An exact zero constructed from an all-zero decimal string ("0.000").
+
+        A zero stored with decimal places is still exactly zero, and an
+        exact integer coerces into a real field at that field's precision,
+        so sums with high-precision values lose nothing -- a floating zero
+        of any fixed precision would drag them down to it instead.  The
+        string used to construct it is kept so the value prints (and is
+        serialized) as it was stored, like LmfdbRealLiteral.
+
+        IntegerWrapper rather than Integer: plain Integer allocation hands
+        out pooled instances for small values, bypassing subclasses.
+        """
+
+        def __init__(self, literal):
+            IntegerWrapper.__init__(self, ZZ, 0)
+            self.literal = literal
+
+        def __repr__(self):
+            return self.literal
+
+        def __str__(self):
+            return self.literal
+
     class RealEncoder():
         def __init__(self, value):
             self._value = value
@@ -83,6 +108,32 @@ else:
             return str(obj).encode()
 
 
+def numeric_precision(value):
+    """
+    The bit precision needed to faithfully represent a decimal string:
+    log(10)/log(2) bits per significant digit, where the sign, the decimal
+    point and leading zeros carry no information.  (Counting every character,
+    as this function's predecessor did, manufactured phantom digits whenever
+    the value was printed at full precision.)  At least 2, the smallest
+    precision a RealField accepts.
+
+    INPUT:
+
+    - ``value`` -- a string representing a decimal number, as Postgres
+      delivers the numeric type
+
+    EXAMPLES::
+
+        sage: numeric_precision("0.00459244230167")  # 12 significant digits
+        40
+    """
+    digits = len(value.lstrip("+-").replace(".", "", 1).lstrip("0"))
+    # All-zero decimals never reach this in Sage mode: numeric_converter
+    # returns them as exact zeros, since no floating precision suits a zero.
+    # log(10)/log(2) = 3.3219280948873626
+    return max(math.ceil(digits * 3.3219280948873626), 2)
+
+
 def numeric_converter(value, cur=None):
     """
     Used for converting numeric values from Postgres to Python.
@@ -94,17 +145,21 @@ def numeric_converter(value, cur=None):
 
     OUTPUT:
 
-    - either a sage integer (if there is no decimal point) or a real number whose precision depends on the number of digits in value.
+    - either a sage integer (if there is no decimal point) or a real number whose precision depends on the number of significant digits in value.
     """
     if value is None:
         return None
     if "." in value:
         if SAGE_MODE:
-            # The following is a good guess for the bit-precision,
-            # but we use LmfdbRealLiterals to ensure that our number
-            # prints the same as we got it.
-            prec = ceil(len(value) * 3.322)
-            return LmfdbRealLiteral(RealField(prec), value)
+            if not value.strip("+-0."):
+                # An all-zero decimal is exactly zero, and an exact zero
+                # coerces into any real field at that field's precision --
+                # a floating zero of fixed precision would instead drag
+                # sums with higher-precision values down to it.
+                return LmfdbDecimalZero(value)
+            # A good guess for the bit-precision; we use LmfdbRealLiterals
+            # to ensure that our number prints the same as we got it.
+            return LmfdbRealLiteral(RealField(numeric_precision(value)), value)
         else:
             # Sage isn't installed, so we fall back on Python floats
             return float(value)

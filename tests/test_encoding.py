@@ -78,6 +78,51 @@ def test_numeric_converter_decimals(value, expected):
     assert numeric_converter(value) == expected
 
 
+@pytest.mark.parametrize("value,prec", [
+    # the g2c regulator from LMFDB/lmfdb#3569: 12 significant digits (40
+    # bits), where counting all 16 characters gave 54 bits and printed
+    # phantom digits
+    ("0.00459244230167", 40),
+    ("123.456", 20),
+    # trailing zeros were stored, hence are significant
+    ("1.500", 14),
+    # the sign, the decimal point and leading zeros carry no information
+    ("-0.5", 4),
+    ("0.5", 4),
+])
+def test_numeric_precision_counts_significant_digits(value, prec):
+    from psycodict.encoding import numeric_precision
+
+    assert numeric_precision(value) == prec
+
+
+@pytest.mark.skipif(SAGE_MODE, reason="with Sage, decimal zeros are exact integers")
+def test_decimal_zero_is_float_zero_without_sage():
+    assert numeric_converter("0.000") == 0.0
+    assert isinstance(numeric_converter("-0.0"), float)
+
+
+def test_decimal_zero_is_exact_and_does_not_degrade_sage_arithmetic():
+    # Sage coerces a sum to the lowest precision of its operands, so a
+    # floating zero of ANY fixed precision would drag higher-precision
+    # partners down to it (a 2-bit zero turned 123.456 + 0.000 into a
+    # 2-bit 130.).  An exact zero coerces into the partner's field instead.
+    sage_integer = pytest.importorskip("sage.rings.integer")
+    from psycodict.encoding import numeric_converter
+
+    z = numeric_converter("0.000")
+    assert isinstance(z, sage_integer.Integer)
+    assert z == 0
+    # the literal is preserved for printing and serialization
+    assert str(z) == "0.000"
+    assert repr(z) == "0.000"
+    for value in ("123.456", "1.23456789012345678901234567890"):
+        x = numeric_converter(value)
+        total = x + z
+        assert total.parent().precision() == x.parent().precision()
+        assert total == x
+
+
 def test_numeric_converter_none_and_unused_cursor():
     assert numeric_converter(None) is None
     assert numeric_converter(None, cur=object()) is None
