@@ -1609,3 +1609,23 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             exact=exact,
         )
         print(format_differences(diff, self, other))
+
+    def show_slow_report(self, logfile, top=20, cutoff=None):
+        """
+        Prints an analysis of a slow-query log file: which query shapes take
+        the most time, how much smaller the log would be with a higher
+        ``slowcutoff``, and which constrained columns lack a supporting index
+        (checked against the indexes recorded in ``meta_indexes``).
+
+        See :mod:`psycodict.slowlog` for the underlying functions, which can
+        also be used without a database connection.
+
+        INPUT:
+
+        - ``logfile`` -- the filename of a log written via the ``slowlogfile``
+          logging option
+        - ``top`` -- the number of query shapes to show
+        - ``cutoff`` -- only consider queries at least this slow, in seconds
+        """
+        from .slowlog import show_slow_report
+        show_slow_report(logfile, top=top, cutoff=cutoff, db=self)
