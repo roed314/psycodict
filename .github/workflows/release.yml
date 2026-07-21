@@ -1,0 +1,87 @@
+# Publish psycodict to PyPI when a GitHub release is published, using PyPI
+# Trusted Publishing (OpenID Connect).  No API token is stored in the
+# repository: the publish job proves its identity to PyPI with a short-lived
+# OIDC token minted by GitHub for the `pypi` environment.
+#
+# ONE-TIME PyPI SETUP (maintainer, before the first release):
+#
+#   1. On https://pypi.org, register a "pending publisher" so the first upload
+#      can create the project via trusted publishing.  Go to your account ->
+#      "Publishing", and add a new pending publisher with exactly these values:
+#          PyPI Project Name:  psycodict
+#          Owner:              roed314
+#          Repository name:    psycodict
+#          Workflow name:      release.yml
+#          Environment name:   pypi
+#      (If the project already exists on PyPI, add the trusted publisher under
+#       the project's Manage -> Publishing page instead.)
+#
+#   2. In this repository, go to Settings -> Environments and create an
+#      environment named "pypi" (matching the `environment:` below).  Optionally
+#      add required reviewers or a tag restriction there as an extra guard on
+#      who and what can publish.
+#
+# RELEASE FLOW:
+#
+#   Bump `version` in pyproject.toml and update CHANGELOG.md, merge to master,
+#   then create a GitHub Release with the tag `v1.0.0` (matching the version).
+#   Publishing that release triggers this workflow: the sdist and wheel are
+#   built, metadata-checked, and uploaded to PyPI.  Nothing is published on
+#   pushes, pull requests, or draft releases.
+
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+
+      # The same gate CI enforces, so a release can never upload metadata that
+      # PyPI would reject at the end of the process.
+      - name: Check metadata
+        run: twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Must match the environment named in the PyPI pending-publisher setup above.
+    environment: pypi
+    permissions:
+      # id-token: write lets the job mint the OIDC token that trusted
+      # publishing exchanges for a one-time PyPI upload token.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+      # No username/password/token inputs: trusted publishing authenticates
+      # via the OIDC identity of this `pypi` environment.
+      - uses: pypa/gh-action-pypi-publish@release/v1

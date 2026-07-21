@@ -1,55 +1,178 @@
-# psycodict: dictionary-based python interface to PostgreSQL databases
+# psycodict
 
-This project was split off from the [L-functions and modular forms database](https://www.lmfdb.org)
-so that other projects could use the SQL interface that we created for that project.
+A dictionary-based Python interface to PostgreSQL, extracted from the
+[L-functions and Modular Forms Database](https://www.lmfdb.org) (LMFDB) so that
+other projects can use the SQL interface built for it. Queries are Python
+dictionaries and results are Python dictionaries: you describe *what* you want
+as a `dict`, psycodict turns it into SQL, runs it, and hands the rows back as
+`dict`s. On top of that query language it provides the machinery a large,
+mostly read-only research database needs — bulk loading from files, cached
+statistics and counts, schema management, and tools for keeping copies of a
+database in sync.
 
-Built upon [psycopg2](https://pypi.org/project/psycopg2/), the core of the interface is the ability to create
-SELECT queries using a dictionary.  In addition, the package provides a number of other features that were useful for the LMFDB:
+## Install
 
- * Data management tools wrapping PostgreSQL's mechanisms for loading from and saving to files (see [DataManagement.md](DataManagement.md))
- * Statistics tables for storing statistics and counts (this is particularly useful in the LMFDB's context since the data changes rarely)
-
-The query language is specified in [QueryLanguage.md](QueryLanguage.md) and the read API (`search`, `lucky`, `count`, `random`, …) in [Searching.md](Searching.md).
-What the version number promises — the public API, database metadata compatibility, and the deprecation policy — is laid out in [Versioning.md](Versioning.md).
-
-# Install
+psycodict runs on [psycopg 3](https://www.psycopg.org/psycopg3/). psycopg is an
+optional dependency so that you can choose between the binary and pure-Python
+builds; install psycodict with one of the two extras:
 
 ```
-pip3 install -U "psycodict[pgbinary] @ git+https://github.com/roed314/psycodict.git"
-```
-or
-```
-pip3 install -U "psycodict[pgsource] @ git+https://github.com/roed314/psycodict.git"
+pip install "psycodict[pgbinary]"    # pulls in psycopg[binary]; no system libpq needed
+pip install "psycodict[pgsource]"    # pulls in psycopg; builds against your system libpq
 ```
 
-# Getting started
+## Quickstart
 
-You will first need to install [postgres](https://www.postgresql.org/) and create a [user](https://www.postgresql.org/docs/current/sql-createuser.html) and a [database](https://www.postgresql.org/docs/current/sql-createdatabase.html).  For example, you might execute the following commands in psql:
+psycodict reads its connection settings from a `config.ini` in the working
+directory (one is created with default values on first run if none exists).
+Point it at your server:
 
-    CREATE DATABASE database_name;
-    CREATE USER username;
-    ALTER USER psetpartners WITH password 'good password';
-    GRANT ALL PRIVILEGES ON DATABASE database_name TO username;
+```ini
+[postgresql]
+host = localhost
+port = 5432
+user = postgres
+password =
+dbname = mydb
+```
 
-# Running the tests
+Then create a table, insert some rows, and search — a query is a dict, and each
+result is a dict:
+
+```python
+from psycodict.database import PostgresDatabase
+
+# create=True bootstraps the meta tables the first time you connect to a fresh database
+db = PostgresDatabase(create=True)
+
+db.create_table(
+    "demo_primes",
+    [("n", "integer"), ("label", "text"), ("factors", "jsonb"), ("is_prime", "boolean")],
+    label_col="label",
+    sort=["n"],
+)
+
+db.demo_primes.insert_many([
+    {"n": 6,  "label": "6",  "factors": {"2": 1, "3": 1}, "is_prime": False},
+    {"n": 7,  "label": "7",  "factors": {"7": 1},         "is_prime": True},
+    {"n": 10, "label": "10", "factors": {"2": 1, "5": 1}, "is_prime": False},
+    {"n": 12, "label": "12", "factors": {"2": 2, "3": 1}, "is_prime": False},
+])
+
+for row in db.demo_primes.search(
+    {"is_prime": False, "n": {"$lte": 10}},
+    projection=["n", "factors"],
+):
+    print(row)
+```
+
+```
+{'n': 6, 'factors': {'2': 1, '3': 1}}
+{'n': 10, 'factors': {'2': 1, '5': 1}}
+```
+
+`search` returns every matching row; `lucky` returns the first match (or a
+single column of it), and `count` counts them:
+
+```python
+db.demo_primes.count({"is_prime": False})              # 3
+db.demo_primes.lucky({"n": 7}, projection="factors")   # {'7': 1}
+```
+
+## Features
+
+- **Dictionary query language.** Equality and null tests, ranges (`$lte`,
+  `$gte`, `$lt`, `$gt`), membership and containment (`$in`, `$nin`,
+  `$contains`), array and jsonb path access (`"ainvs.2"`), disjunction with
+  `$or`, cardinality with `$size`, comparisons between columns with `$col`, and
+  a raw-SQL escape hatch (`$raw`). Multi-table **joins** via `join=` on
+  `search`, `count` and `lucky` (inner, left, right or full), with
+  `"table.column"` qualification usable in queries, projections, sorts, `$col`
+  and `$raw`.
+- **Bulk data management.** Load and dump whole tables to and from files
+  (`copy_from` / `copy_to`), reload a table from a file and `revert` to the
+  previous contents if something is wrong, and group writes into `staged()`
+  transactional uploads with write exclusion and drift detection.
+- **Cached statistics and counts.** Counts and statistics tables let search
+  pages report totals and distributions without re-scanning a dataset that
+  rarely changes.
+- **Schema management.** Meta tables record every table, column, index and
+  constraint; their layout carries a versioned format stamp checked on connect
+  (an older-format database keeps working, with a warning, until migrated in
+  place with `PostgresDatabase(upgrade=True)`); partial indexes are supported,
+  and `db.refresh_tables()` picks up schema changes without a restart.
+- **Introspection.** Inspect running and blocked queries (`show_queries`,
+  `show_blocked`) and analyze the slow-query log (`psycodict.slowlog`).
+- **Change notifications.** LISTEN/NOTIFY-based schema-change notifications and
+  a small publish/subscribe layer.
+- **Database diffing.** `db.compare` and `db.show_differences` detect drift
+  between two databases.
+
+## Documentation
+
+- [QueryLanguage.md](https://github.com/roed314/psycodict/blob/master/QueryLanguage.md) — how Python dictionaries become SQL `WHERE` clauses.
+- [Searching.md](https://github.com/roed314/psycodict/blob/master/Searching.md) — the read-side API: `search`, `lucky`, `lookup`, `count`, projections, sorts and joins.
+- [DataManagement.md](https://github.com/roed314/psycodict/blob/master/DataManagement.md) — the write side: creating tables, loading data, reloading and reverting, statistics.
+- [MetadataFormats.md](https://github.com/roed314/psycodict/blob/master/MetadataFormats.md) — how the layout of the meta tables is versioned, cross-format compatibility, and the checklist for changing it.
+
+See the [CHANGELOG](https://github.com/roed314/psycodict/blob/master/CHANGELOG.md) for the release history.
+
+## Supported versions
+
+- Python 3.8 or newer.
+- PostgreSQL 13 through 18.
+- psycopg 3 (installed through the `pgbinary` or `pgsource` extra above).
+
+## Setting up PostgreSQL
+
+If you do not already have a server, install
+[PostgreSQL](https://www.postgresql.org/) and create a
+[user](https://www.postgresql.org/docs/current/sql-createuser.html) and a
+[database](https://www.postgresql.org/docs/current/sql-createdatabase.html).
+For example, in `psql`:
+
+```sql
+CREATE USER myuser WITH PASSWORD 'a good password';
+CREATE DATABASE mydb OWNER myuser;
+```
+
+Making `myuser` the database owner matters on PostgreSQL 15 and later:
+`GRANT ALL PRIVILEGES ON DATABASE` no longer implies the right to create
+objects in the `public` schema, where psycodict puts its (unqualified) tables.
+If the user is not the owner, grant that privilege explicitly — connected to
+`mydb` — instead:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA public TO myuser;
+```
+
+`PostgresDatabase(create=True)` bootstraps the meta tables on first connection,
+so the database only needs to exist and let `myuser` create tables in it — you
+do not have to create any schema by hand.
+
+## Running the tests
 
 Install the test dependencies and point the standard PostgreSQL environment
 variables at a database you do not mind being written to:
 
 ```
-pip3 install -e ".[pgbinary,test]"
+pip install -e ".[pgbinary,test]"
 createdb psycodict_test
 PGDATABASE=psycodict_test pytest
 ```
 
 The connection is configured through `PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD` and `PGDATABASE`, defaulting to `postgres@localhost:5432` and a
-database named `psycodict_test`.  The database only needs to be empty: the
-meta tables are bootstrapped on first connection, and every test creates its
-own randomly named tables and drops them afterwards.
+database named `psycodict_test`. The database only needs to be empty: the meta
+tables are bootstrapped on first connection, and every test creates its own
+randomly named tables and drops them afterwards.
 
 If no server is reachable the tests that need one are skipped, so
-`pytest tests/test_encoding.py tests/test_utils.py tests/test_config.py`
+
+```
+pytest tests/test_encoding.py tests/test_utils.py tests/test_config.py
+```
+
 works with no database at all.
 
 Two further sets of tests are opt-in:
@@ -69,3 +192,10 @@ turns "no database, skip" into a hard failure — which is what continuous
 integration wants, so that a misconfigured job cannot report success by
 quietly skipping everything.
 
+## Provenance
+
+psycodict was split out of the [LMFDB](https://www.lmfdb.org), where it grew as
+the project's `db` interface. It is written and maintained by David Roe and
+Edgar Costa, with contributions from the wider LMFDB community, and is
+distributed under the GNU General Public License, version 2 or later (see
+[LICENSE](LICENSE)).

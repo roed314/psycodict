@@ -16,10 +16,25 @@ requires-python = ">=3.9"
 authors = [{name = "David Roe", email = "roed.math@gmail.com"}, {name = "Edgar Costa", email = "edgarc@mit.edu"}]
 license = "GPL-2.0-or-later"
 keywords = ["postgres", "database", "interface"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
 
 [project.urls]
-homepage = "https://github.com/roed314/psycodict"
-repository = "https://github.com/roed314/psycodict"
+Homepage = "https://github.com/roed314/psycodict"
+Repository = "https://github.com/roed314/psycodict"
+Changelog = "https://github.com/roed314/psycodict/blob/master/CHANGELOG.md"
 
 [project.optional-dependencies]
 pgsource = ["psycopg>=3.1"]
@@ -43,7 +58,7 @@ filterwarnings = ["error::DeprecationWarning:psycodict.*"]
 target-version = "py39"
 
 [tool.ruff.lint.per-file-ignores]
-# The psycopg2 availability check in __init__.py deliberately runs before the
+# The psycopg availability check in __init__.py deliberately runs before the
 # imports that depend on it.
 "psycodict/__init__.py" = ["E402"]
 # Pre-existing findings, silenced so that adopting a linter does not smuggle
@@ -53,4 +68,3 @@ target-version = "py39"
 #   base.py:1024     F841  `ordered` assigned from a call kept for its side
 #                          effect (_order_columns mutates its argument)
 "psycodict/base.py" = ["E741", "F841"]
-
