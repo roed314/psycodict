@@ -1718,7 +1718,7 @@ class PostgresTable(PostgresBase):
                         from .base import _meta_cols_types_jsonb_idx
                         # using code from _reload_meta
                         meta_name = 'meta_tables'
-                        meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name)
+                        meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
                         # the column which will match search_table
                         table_name = _meta_table_name(meta_name)
                         table_name_idx = meta_cols.index(table_name)
@@ -1736,13 +1736,16 @@ class PostgresTable(PostgresBase):
                                     f"the search table name {self.search_table}"
                                 )
                             for col in ["id_ordered", "out_of_order"]:
-                                idx = jsonb_idx[col]
+                                idx = meta_cols.index(col)
                                 if line[idx] not in ['t', 'f']:
                                     raise RuntimeError(
-                                        f"columns {idx} (= {line[idx]}) "
+                                        f"column {idx} (= {line[idx]}) "
                                         f"in the file {metafile} is different from 't' or 'f'"
                                     )
-                            resort = line["id_ordered"] == 't' and line["out_of_order"] == 'f'
+                            resort = (
+                                line[meta_cols.index("id_ordered")] == 't'
+                                and line[meta_cols.index("out_of_order")] == 'f'
+                            )
                     else:
                         if not self._id_ordered: # this table doesn't need to be sorted
                             resort = False
