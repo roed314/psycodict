@@ -139,3 +139,43 @@ def test_check_locks_still_raises_for_writes(db, empty_table):
     finally:
         conn.rollback()
         conn.close()
+
+
+def test_show_blocked_ignores_compatible_bystanders(db, empty_table, capsys):
+    # A granted ACCESS SHARE does not conflict with a waiting SHARE, so its
+    # holder must not be reported as the blocker (the naive pg_locks
+    # self-join matched on resource identity alone and named bystanders).
+    name = empty_table.search_table
+    bystander = raw_connection()
+    holder = raw_connection()
+    waiter = raw_connection()
+    try:
+        bpid = bystander.info.backend_pid
+        hpid = holder.info.backend_pid
+        wpid = waiter.info.backend_pid
+        bystander.execute('LOCK TABLE "%s" IN ACCESS SHARE MODE' % name)
+        holder.execute('LOCK TABLE "%s" IN ROW EXCLUSIVE MODE' % name)
+
+        def blocked_lock():
+            try:
+                waiter.execute('LOCK TABLE "%s" IN SHARE MODE' % name)
+            except psycopg.Error:
+                pass
+
+        blocked = threading.Thread(target=blocked_lock)
+        blocked.start()
+        try:
+            assert wait_until(lambda: any(
+                row[0] == wpid and row[2] == hpid for row in db._get_blocked()
+            )), "the real blocker never showed up in _get_blocked"
+            pairs = [(row[0], row[2]) for row in db._get_blocked()]
+            assert (wpid, hpid) in pairs
+            assert (wpid, bpid) not in pairs
+        finally:
+            holder.rollback()
+            blocked.join(timeout=10)
+    finally:
+        bystander.rollback()
+        waiter.close()
+        holder.close()
+        bystander.close()
