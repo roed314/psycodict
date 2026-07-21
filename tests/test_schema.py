@@ -843,3 +843,28 @@ def test_missing_meta_version_tolerated_and_stamped_by_create(db, config):
         other.conn.close()
     cur = db._execute(SQL("SELECT version FROM meta_version"))
     assert cur.fetchone()[0] == META_VERSION
+
+
+def test_unstamped_database_is_treated_as_format_one(db, config, monkeypatch):
+    from psycodict import database as database_module
+    from psycodict.database import PostgresDatabase
+
+    try:
+        db._execute(SQL("DROP TABLE meta_version"))
+        monkeypatch.setattr(database_module, "META_VERSION", database_module.META_VERSION + 1)
+        # an unstamped (pre-stamp, format 1) database must not slip past a
+        # future format bump
+        with pytest.raises(RuntimeError, match="older"):
+            PostgresDatabase(config=config)
+        # create=True stamps the baseline it found -- not the new format --
+        # and then still refuses to run until migrated
+        with pytest.raises(RuntimeError, match="older"):
+            PostgresDatabase(config=config, create=True)
+        cur = db._execute(SQL("SELECT version FROM meta_version"))
+        assert cur.fetchone()[0] == 1
+    finally:
+        # undo before restoring, so the stamp goes back to the real version
+        monkeypatch.undo()
+        db._execute(SQL("DELETE FROM meta_version"))
+        db._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"),
+                    [database_module.META_VERSION])

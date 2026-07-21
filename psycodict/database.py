@@ -255,29 +255,36 @@ class PostgresDatabase(PostgresBase):
                     % (", ".join(rec[0] for rec in cur))
                 )
 
-        # Refuse to run when the database declares a metadata format that this
-        # version of psycodict does not understand.  Databases created before
-        # the stamp existed have no meta_version table; they are accepted as
-        # is, and connecting with create=True adds the stamp.
+        # Refuse to run when the database's metadata format doesn't match this
+        # version of psycodict.  A database with meta tables but no
+        # meta_version predates the stamp, which makes its format the
+        # pre-stamp baseline (1) -- treating it that way means a future
+        # format bump will reject it until it is migrated, rather than
+        # accepting it silently.  A database with no meta tables at all is
+        # fresh; the missing meta_tables is diagnosed below.
         if self._table_exists("meta_version"):
             row = self._execute(SQL("SELECT version FROM meta_version")).fetchone()
             stored = None if row is None else row[0]
-            if stored != META_VERSION:
-                if stored is None:
-                    hint = ("its meta_version table is empty; insert the "
-                            "correct version to assert compatibility")
-                elif stored > META_VERSION:
-                    hint = ("it uses metadata format %s, which is newer; "
-                            "upgrade psycodict" % stored)
-                else:
-                    hint = ("it uses metadata format %s, which is older; "
-                            "migrate the meta_* tables and update meta_version"
-                            % stored)
-                raise RuntimeError(
-                    "This database is not compatible with this version of "
-                    "psycodict (which expects metadata format %s): %s."
-                    % (META_VERSION, hint)
-                )
+        elif self._table_exists("meta_tables"):
+            stored = 1
+        else:
+            stored = META_VERSION
+        if stored != META_VERSION:
+            if stored is None:
+                hint = ("its meta_version table is empty; insert the "
+                        "correct version to assert compatibility")
+            elif stored > META_VERSION:
+                hint = ("it uses metadata format %s, which is newer; "
+                        "upgrade psycodict" % stored)
+            else:
+                hint = ("it uses metadata format %s, which is older; "
+                        "migrate the meta_* tables and update meta_version"
+                        % stored)
+            raise RuntimeError(
+                "This database is not compatible with this version of "
+                "psycodict (which expects metadata format %s): %s."
+                % (META_VERSION, hint)
+            )
 
         try:
             cur = self._execute(SQL(
@@ -525,10 +532,12 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         self._execute(SQL("CREATE TABLE {0} ({1})").format(Identifier(tbl), SQL(", ").join(parts)))
         self.grant_select(tbl)
 
-    def _create_meta_version(self):
+    def _create_meta_version(self, version=None):
+        if version is None:
+            version = META_VERSION
         with DelayCommit(self, silence=True):
             self._execute(SQL("CREATE TABLE meta_version (version integer NOT NULL)"))
-            self._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"), [META_VERSION])
+            self._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"), [version])
             self.grant_select("meta_version")
         print("Table meta_version created")
 
@@ -593,10 +602,16 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             ("meta_tables_hist", self._create_meta_tables_hist),
             ("meta_indexes_hist", self._create_meta_indexes_hist),
             ("meta_constraints_hist", self._create_meta_constraints_hist),
-            ("meta_version", self._create_meta_version),
         ]:
             if name not in existing:
                 creator()
+        if "meta_version" not in existing:
+            # A database that already had meta tables predates the version
+            # stamp, so it is stamped with the pre-stamp format (1); moving
+            # it to the current format is a deliberate migration, not a side
+            # effect of connecting.  A fresh database is created at the
+            # current format.
+            self._create_meta_version(META_VERSION if "meta_tables" not in existing else 1)
 
     def _create_meta_indexes_hist(self):
         self._create_meta_hist("meta_indexes")
