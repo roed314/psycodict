@@ -81,7 +81,7 @@ def test_connects_and_sees_the_lmfdb_tables(mirror):
 
 
 def test_mirror_is_read_only(mirror):
-    assert mirror.is_read_only()
+    assert mirror._is_read_only()
 
 
 def test_lookup_by_label(mirror):

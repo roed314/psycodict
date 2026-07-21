@@ -228,12 +228,12 @@ class PostgresBase():
     def __init__(self, loggername, db):
         # Have to record this object in the db so that we can reset the connection if necessary.
         # This function also sets self.conn
-        db.register_object(self)
+        db._register_object(self)
         self._db = db
 
         logging_options = db.config.options["logging"]
         self.slow_cutoff = logging_options["slowcutoff"]
-        self.logger = l = logging.getLogger(loggername)
+        self._logger = l = logging.getLogger(loggername)
         l.propagate = False
         # we only want 2 handlers
         l.handlers = []
@@ -324,7 +324,7 @@ class PostgresBase():
                 raise ValueError("buffered and commit are incompatible")
 
         try:
-            cur = self._db.cursor(buffered=buffered)
+            cur = self._db._cursor(buffered=buffered)
 
             t = time.time()
             if values_list:
@@ -362,9 +362,9 @@ class PostgresBase():
                         query = query.as_string(self.conn)
                     if isinstance(query, bytes): # PY3 compatibility
                         query = query.decode("utf-8")
-                    self.logger.info(query + " ran in \033[91m {0!s}s \033[0m".format(t))
+                    self._logger.info(query + " ran in \033[91m {0!s}s \033[0m".format(t))
                     if slow_note is not None:
-                        self.logger.info(
+                        self._logger.info(
                             "Replicate with db.%s.%s(%s)",
                             slow_note[0],
                             slow_note[1],
@@ -812,7 +812,7 @@ class PostgresBase():
         with open(filename, "w") as F:
             try:
                 F.write(header)
-                cur = self._db.cursor()
+                cur = self._db._cursor()
                 with cur.copy(copyto) as copy:
                     for data in copy:
                         F.write(bytes(data).decode())
@@ -916,7 +916,7 @@ class PostgresBase():
         else:
             options = SQL(" WITH (DELIMITER {0}, NULL {1})").format(Literal(sep), Literal(null))
         copy_sql = SQL("COPY {0}{1} FROM STDIN{2}").format(Identifier(table), cols, options)
-        cur = self._db.cursor()
+        cur = self._db._cursor()
         with cur.copy(copy_sql) as copy:
             while True:
                 chunk = F.read(1 << 20)

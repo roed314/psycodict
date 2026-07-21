@@ -193,7 +193,7 @@ def test_reconnecting_with_create_sees_the_same_tables(db, config):
 
     other = PostgresDatabase(config=config, create=True)
     try:
-        assert other.is_alive()
+        assert other._is_alive()
         assert sorted(other.tablenames) == sorted(db.tablenames)
     finally:
         other.conn.close()
@@ -268,7 +268,7 @@ def test_create_table_from_dict_of_types(db, transient):
 def test_create_table_adds_id_primary_key(db, empty_table):
     name = empty_table.search_table
     assert empty_table.col_type["id"] == "bigint"
-    assert empty_table.has_id
+    assert empty_table._has_id
     assert pkey_columns(db, name) == ["id"]
     assert db._constraint_exists(name + "_pkey", name)
 
@@ -779,7 +779,7 @@ def test_revert_indexes_restores_the_previous_version(empty_table, tmp_path, his
 
 
 def test_db_is_alive(db):
-    assert db.is_alive() is True
+    assert db._is_alive() is True
 
 
 def test_db_getitem_rejects_an_unknown_table(db):

@@ -702,7 +702,7 @@ class PostgresSearchTable(PostgresTable):
                 t = time.time()
         finally:
             if not silent and total > self.slow_cutoff:
-                self.logger.info("Search iterator for {0} {1} required a total of \033[91m{2!s}s\033[0m".format(self.search_table, query, total))
+                self._logger.info("Search iterator for {0} {1} required a total of \033[91m{2!s}s\033[0m".format(self.search_table, query, total))
             if isinstance(cur, pg_cursor):
                 cur.close()
                 if (

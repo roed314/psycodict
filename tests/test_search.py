@@ -212,7 +212,7 @@ def test_search_silent_suppresses_slow_query_log(filled_table, monkeypatch):
         def emit(self, record):
             records.append(record)
 
-    monkeypatch.setattr(filled_table.logger, "handlers", [Collector()])
+    monkeypatch.setattr(filled_table._logger, "handlers", [Collector()])
     monkeypatch.setattr(filled_table, "slow_cutoff", -1)  # every query is now slow
     assert list(filled_table.search({"n": 5}, "n", silent=True)) == [5]
     assert records == []
