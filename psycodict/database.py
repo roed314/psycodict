@@ -1298,3 +1298,106 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         """
         D = {rec[0]: rec[1] for rec in self._execute(SQL("SELECT tablename, tablespace FROM pg_tables"))}
         return {name: space if space else "" for (name, space) in D.items()}
+
+    def compare(self, other, tables=None, row_counts=True, null_counts=False, exact=False):
+        """
+        Returns the differences between the search tables of this database
+        and those of another one, such as a beta and a production server.
+
+        The comparison is read-only on both sides: only SELECT statements are
+        issued, and (unlike the ``count`` method of a table, which may cache
+        its results when count saving is enabled) nothing is recorded in the
+        counts tables or meta_tables of either database, so ``other`` may
+        safely be a production server.
+
+        INPUT:
+
+        - ``other`` -- another ``PostgresDatabase`` instance; you connect to
+          the second server yourself (see the examples below)
+        - ``tables`` -- a table name or list of table names (default None,
+          meaning every search table of either database); restricts every
+          part of the comparison to those tables
+        - ``row_counts`` -- boolean (default True).  Whether to compare the
+          number of rows in tables present in both databases
+        - ``null_counts`` -- boolean (default False).  Whether to compare the
+          number of NULL entries in each column shared by both sides.  This
+          requires a full scan of each compared table in each database, which
+          can take minutes for the largest LMFDB tables, so consider
+          restricting ``tables``
+        - ``exact`` -- boolean (default False).  By default row counts are
+          read from the total cached in meta_tables, which psycodict's write
+          paths maintain and ``count()`` reports; that is a single cheap
+          query per database, but it can be stale if a table was modified
+          from outside psycodict or its statistics were never refreshed.  Set
+          to True to run SELECT COUNT(*) on each compared table instead,
+          which is exact but slow on big tables (the counting scans run with
+          whatever statement timeout each connection has)
+
+        OUTPUT:
+
+        A dictionary with keys
+
+        - ``only_in_self``, ``only_in_other`` -- sorted lists of the names of
+          search tables present in only one of the databases
+        - ``schema`` -- a dictionary indexed by the tables present in both
+          databases whose schemas differ, with values dictionaries containing
+          whichever of the following differences occur: ``only_in_self`` and
+          ``only_in_other`` (lists of pairs ``(col, type)`` of columns
+          present on one side only), ``type_changed`` (a list of triples
+          ``(col, type_self, type_other)``, with types rendered in full so
+          that e.g. ``numeric(10,2)`` vs ``numeric(20,4)`` is reported) and
+          ``meta_changed`` (a list of
+          triples ``(item, value_self, value_other)`` recording disagreements
+          in the label_col, sort, id_ordered, include_nones or count_cutoff
+          settings from meta_tables)
+        - ``row_counts`` (if requested) -- ``{table: (rows_self,
+          rows_other)}``, only for the tables where the counts differ
+        - ``null_counts`` (if requested) -- ``{table: {col: (nulls_self,
+          nulls_other)}}``, only for the columns where the counts differ
+
+        EXAMPLES:
+
+        Comparing with a server described by a second configuration file::
+
+            sage: from psycodict.config import Configuration
+            sage: from psycodict.database import PostgresDatabase
+            sage: prod_config = Configuration(defaults={"config_file": "prod-config.ini"}, readargs=False)
+            sage: prod = PostgresDatabase(config=prod_config)
+            sage: db.compare(prod)["only_in_self"]
+            ['mf_newspaces_test']
+
+        Keyword arguments override the configuration, so a server that
+        differs only in its host can reuse this database's configuration::
+
+            sage: prod = PostgresDatabase(config=db.config, host="proddb.lmfdb.xyz")
+            sage: db.compare(prod, tables="mf_newspaces", null_counts=True)
+            {'only_in_self': [], 'only_in_other': [], 'schema': {}, 'row_counts': {}, 'null_counts': {}}
+        """
+        from .dbdiff import compare_databases
+        return compare_databases(
+            self, other,
+            tables=tables,
+            row_counts=row_counts,
+            null_counts=null_counts,
+            exact=exact,
+        )
+
+    def show_differences(self, other, tables=None, row_counts=True, null_counts=False, exact=False):
+        """
+        Prints a readable report of the differences between the search tables
+        of this database and those of another one.
+
+        Sections without differences are omitted; if the databases agree,
+        prints "No differences found".  See ``compare`` for the meaning of
+        the arguments, the cost of the optional comparisons, and the
+        guarantee that both databases are only read from.
+        """
+        from .dbdiff import compare_databases, format_differences
+        diff = compare_databases(
+            self, other,
+            tables=tables,
+            row_counts=row_counts,
+            null_counts=null_counts,
+            exact=exact,
+        )
+        print(format_differences(diff, self, other))
