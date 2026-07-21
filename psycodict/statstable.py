@@ -212,6 +212,17 @@ class PostgresStatsTable(PostgresBase):
         self.search_table = st = table.search_table
         self.stats = st + "_stats"
         self.counts = st + "_counts"
+        self._init_total(total)
+
+    def _init_total(self, total=None):
+        """
+        Set the cached row count ``self.total`` from the given value, usually
+        the ``total`` column of ``meta_tables``, computing it if that cache
+        is empty.
+
+        Called at startup and by ``PostgresTable._refresh``; compare
+        ``_set_total``, which stores the result of a recount.
+        """
         if total is None:
             total = self.quick_count({}, startup=True)
             if total is None:
