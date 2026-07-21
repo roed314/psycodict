@@ -693,7 +693,11 @@ class PostgresBase():
         """
         tests = [(r"_old[\d]+$", "_oldN"), (r"_tmp$", "_tmp"), ("_pkey$", "_pkey")]
         if not skip_dep:
-            tests.append((r"_dep[\d]+_$", "_depN"))
+            # _rename_if_exists appends "_dep<N>" (no trailing underscore), so
+            # the guard must be anchored the same way as its _oldN sibling; the
+            # stray trailing "_" here meant it never matched a real deprecated
+            # name and the check was dead.
+            tests.append((r"_dep[\d]+$", "_depN"))
         for match, message in tests:
             # re.search, not re.match: these patterns are $-anchored
             # suffixes, and match() would only ever find them at the start

@@ -626,9 +626,15 @@ def test_create_index_rejects_a_name_already_in_use(empty_table):
         empty_table.create_index(["n"], name=empty_table.search_table + "_label")
 
 
-def test_create_index_rejects_restricted_suffixes(empty_table):
+@pytest.mark.parametrize("suffix", ["_tmp", "_pkey", "_old0", "_old7", "_dep0", "_dep3"])
+def test_create_index_rejects_restricted_suffixes(empty_table, suffix):
+    # These suffixes are reserved for the reload/swap machinery
+    # (``_tmp``/``_pkey``/``_oldN``) and its deprecation renaming (``_depN``);
+    # a user-chosen index name ending in any of them would collide with a name
+    # psycodict generates internally.  ``_depN`` in particular was slipping
+    # through until its guard's regex anchor was corrected.
     with pytest.raises(ValueError):
-        empty_table.create_index(["label"], name=empty_table.search_table + "_lbl_tmp")
+        empty_table.create_index(["label"], name=empty_table.search_table + "_lbl" + suffix)
 
 
 def test_drop_index_permanently_removes_the_meta_row(empty_table):
