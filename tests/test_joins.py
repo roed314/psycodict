@@ -358,3 +358,42 @@ def test_join_usage_errors(jtables):
     # a qualified key without join falls back to the path interpretation
     with pytest.raises(ValueError, match="not a column"):
         curves.search({"%s.deg" % F: 2}, 0, limit=1)
+
+
+def test_join_projection_and_sort_accept_paths(jtables):
+    curves, fields, groups = jtables
+    F = fields.search_table
+    join = FK(fields)
+    rec = curves.search(
+        {"label": "c1"},
+        ["label", "%s.data.nested.k" % F, "%s.coeffs.1" % F, "data.rank"],
+        join=join, limit=1,
+    )[0]
+    assert rec == {"label": "c1", "%s.data.nested.k" % F: 1,
+                   "%s.coeffs.1" % F: 1, "data.rank": 1}
+    # sort by a jsonb path on the joined table
+    assert curves.search({}, 0, join=join, sort=["%s.data.nested.k" % F, "n"], limit=10) == \
+        ["c5", "c1", "c2", "c4", "c3", "c8"]
+    with pytest.raises(ValueError, match="not a column"):
+        curves.search({}, ["%s.missing.0" % F], join=join, limit=1)
+
+
+def test_unjoined_projection_still_rejects_paths(filled_table):
+    # dotted paths in projections outside joins are a separate, pre-existing
+    # limitation (only array slicers are supported there)
+    with pytest.raises(ValueError, match="not"):
+        filled_table.search({}, ["data.s"], limit=1)
+
+
+def test_join_analyze(jtables, capsys):
+    curves, fields, groups = jtables
+    F = fields.search_table
+    curves.analyze({"%s.deg" % F: 2}, ["label", "%s.r2" % F], join=FK(fields), limit=5)
+    out = capsys.readouterr().out
+    assert "JOIN" in out
+    assert "cost=" in out
+    assert "Execution Time" in out
+    curves.analyze({"%s.deg" % F: 2}, 0, join=FK(fields), limit=5, explain_only=True)
+    out = capsys.readouterr().out
+    assert "cost=" in out
+    assert "Execution Time" not in out

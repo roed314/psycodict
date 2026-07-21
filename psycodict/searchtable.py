@@ -148,6 +148,32 @@ class PostgresSearchTable(PostgresTable):
             return "%s::" + col_type + "[]"
         return "%s"
 
+    def _column_composable(self, colspec, tname=None):
+        """
+        Turns a column specifier -- a column name, optionally with an array
+        slicer (``vec[2]``) or a dotted path (``data.nested.k``, ``ainvs.1``)
+        -- into a Composable for use in a SELECT or ORDER BY, validated
+        against this table's columns and qualified with the table name
+        ``tname`` when given.
+        """
+        if "." in colspec:
+            path = [int(p) if p.isdigit() else p for p in colspec.split(".")]
+            base = path[0]
+            if base != "id" and base not in self.search_cols:
+                raise ValueError("%s is not a column of %s" % (base, self.search_table))
+            if self.col_type.get(base) == "jsonb":
+                parts = [SQL("->{0}").format(Literal(p)) for p in path[1:]]
+            else:
+                parts = [SQL("[{0}]").format(Literal(p)) for p in path[1:]]
+            ident = Identifier(base) if tname is None else Identifier(tname, base)
+            return SQL("{0}{1}").format(ident, SQL("").join(parts))
+        if colspec != "id" and colspec.split("[", 1)[0] not in self.search_cols:
+            raise ValueError("%s is not a column of %s" % (colspec, self.search_table))
+        wrapped = IdentifierWrapper(colspec)
+        if tname is not None:
+            wrapped = _qualify(wrapped, tname)
+        return wrapped
+
     def _col_identifier(self, name, join_context=None):
         """
         Wraps a column name given as the value of a ``$col`` special key,
@@ -1197,9 +1223,7 @@ class PostgresSearchTable(PostgresTable):
                 table, colspec = joined[prefix], rest
             else:
                 table, colspec = self, key
-            if colspec != "id" and colspec.split("[", 1)[0] not in table.search_cols:
-                raise ValueError("%s is not a column of %s" % (colspec, table.search_table))
-            cols.append(_qualify(IdentifierWrapper(colspec), table.search_table))
+            cols.append(table._column_composable(colspec, table.search_table))
         return tuple(keys), cols
 
     def _join_sort(self, query, limit, offset, sort, joined):
@@ -1218,15 +1242,48 @@ class PostgresSearchTable(PostgresTable):
                     tname, colspec, table = prefix, rest, joined[prefix]
                 else:
                     tname, colspec, table = self.search_table, name, self
-                if colspec != "id" and colspec.split("[", 1)[0] not in table.search_cols:
-                    raise ValueError("%s is not a column of %s" % (colspec, table.search_table))
-                ident = _qualify(IdentifierWrapper(colspec), tname)
+                ident = table._column_composable(colspec, tname)
                 L.append(ident if asc == 1 else SQL("{0} DESC NULLS LAST").format(ident))
             return SQL(" ORDER BY {0}").format(SQL(", ").join(L))
         sort_composed, has_sort, _ = self._process_sort(query, limit, offset, sort)
         if has_sort:
             return SQL(" ORDER BY {0}").format(_qualify(sort_composed, self.search_table))
         return SQL("")
+
+    def _join_selecter(self, query, projection, join, limit=None, offset=0, sort=None, sort_limit=None):
+        """
+        Builds the SELECT statement for a joined query; shared by ``search``,
+        ``lucky`` and ``analyze``.
+
+        INPUT: as for ``search``, except that ``limit`` is applied verbatim
+        (``_join_search`` passes its inflated count-estimation prelimit),
+        while ``sort_limit`` is the caller's limit, used only by the
+        default-sort heuristics (defaults to ``limit``).
+
+        OUTPUT:
+
+        - a tuple of strings, the keys for result dictionaries
+        - the SELECT statement, as an SQL Composable
+        - the list of values to substitute into it
+        """
+        joined, frm = self._parse_join(join)
+        search_cols, cols = self._parse_join_projection(projection, joined)
+        qstr, values = self._parse_dict(query, join_context=joined)
+        if qstr is None:
+            where, values = SQL(""), []
+        else:
+            where = SQL(" WHERE {0}").format(qstr)
+        if sort_limit is None:
+            sort_limit = limit
+        olo = self._join_sort(query, sort_limit, offset, sort, joined)
+        if limit is not None:
+            olo = SQL("{0} LIMIT %s").format(olo)
+            values.append(limit)
+            if offset != 0:
+                olo = SQL("{0} OFFSET %s").format(olo)
+                values.append(offset)
+        selecter = SQL("SELECT {0} FROM {1}{2}{3}").format(SQL(", ").join(cols), frm, where, olo)
+        return search_cols, selecter, values
 
     def _join_search(self, query, projection, join, limit=None, offset=0, sort=None, info=None, silent=False):
         """
@@ -1235,30 +1292,19 @@ class PostgresSearchTable(PostgresTable):
         """
         if offset < 0:
             raise ValueError("Offset cannot be negative")
-        joined, frm = self._parse_join(join)
-        search_cols, cols = self._parse_join_projection(projection, joined)
-        qstr, values = self._parse_dict(query, join_context=joined)
-        if qstr is None:
-            where, values = SQL(""), []
-        else:
-            where = SQL(" WHERE {0}").format(qstr)
-        olo = self._join_sort(query, limit, offset, sort, joined)
         if limit is None:
             prelimit = None
         else:
             prelimit = max(limit, self._count_cutoff - offset)
-            olo = SQL("{0} LIMIT %s").format(olo)
-            values.append(prelimit)
-            if offset != 0:
-                olo = SQL("{0} OFFSET %s").format(olo)
-                values.append(offset)
-        selecter = SQL("SELECT {0} FROM {1}{2}{3}").format(SQL(", ").join(cols), frm, where, olo)
+        search_cols, selecter, values = self._join_selecter(
+            query, projection, join, limit=prelimit, offset=offset, sort=sort, sort_limit=limit
+        )
         cur = self._execute(
             selecter,
             values,
             silent=silent,
             buffered=(prelimit is None),
-            slow_note=(self.search_table, "analyze", query, repr(projection), prelimit, offset),
+            slow_note=(self.search_table, "analyze", query, repr(projection), prelimit, offset, "join=%s" % (join,)),
         )
         if limit is None:
             if info is not None:
@@ -1291,20 +1337,9 @@ class PostgresSearchTable(PostgresTable):
         The implementation of ``lucky`` when ``join`` is provided; see the
         documentation there.
         """
-        joined, frm = self._parse_join(join)
-        search_cols, cols = self._parse_join_projection(projection, joined)
-        qstr, values = self._parse_dict(query, join_context=joined)
-        if qstr is None:
-            where, values = SQL(""), []
-        else:
-            where = SQL(" WHERE {0}").format(qstr)
-        olo = self._join_sort(query, 1, offset, sort, joined)
-        olo = SQL("{0} LIMIT %s").format(olo)
-        values.append(1)
-        if offset != 0:
-            olo = SQL("{0} OFFSET %s").format(olo)
-            values.append(offset)
-        selecter = SQL("SELECT {0} FROM {1}{2}{3}").format(SQL(", ").join(cols), frm, where, olo)
+        search_cols, selecter, values = self._join_selecter(
+            query, projection, join, limit=1, offset=offset, sort=sort
+        )
         cur = self._execute(selecter, values)
         if cur.rowcount > 0:
             rec = cur.fetchone()
