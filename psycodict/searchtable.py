@@ -379,7 +379,14 @@ class PostgresSearchTable(PostgresTable):
             elif key == "$contains":
                 cmd = SQL("{0} @> %s")
                 if col_type != "jsonb":
-                    value = [value]
+                    # The parameter of @> is the array of required elements: a
+                    # list already is one (and serializes flat, so that the
+                    # empty list emits '{}' -- wrapping it would emit '{{}}',
+                    # which PostgreSQL before 17 rejects as malformed), while
+                    # a scalar is a single required element, wrapped here.
+                    # This mirrors how $containedin passes its list through.
+                    if not isinstance(value, (list, tuple)):
+                        value = [value]
             elif key == "$containedin":
                 # jsonb_path_ops modifiers for the GIN index doesn't support this query
                 cmd = SQL("{0} <@ %s")
