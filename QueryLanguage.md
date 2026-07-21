@@ -3,7 +3,7 @@
 
 Psycodict's query language defines a process for converting Python dictionaries into SQL `WHERE` clauses.  It is not complete: many SQL clauses are not possible to express in the language.  Rather, it aims to enable the iterative creation of queries based on input from a search page correspoding to a table, such as [this example](https://www.lmfdb.org/EllipticCurve/Q/).
 
-It is designed to interface with PostgreSQL, though it could be modified to work with other SQL dialects.
+It is designed to interface with PostgreSQL, though it could be modified to work with other SQL dialects.  This document covers reading data; for creating tables and getting data into them, see [DataManagement.md](DataManagement.md).
 
 ## Overall structure
 
