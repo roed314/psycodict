@@ -137,7 +137,8 @@ def test_join_left(jtables):
     # unmatched rows surface NULLs for the joined columns
     assert curves.search({}, "%s.deg" % F, join=left, limit=10) == [2, 2, 2, 3, 4, None, None, 2]
     rec = curves.search({"label": "c6"}, ["label", "%s.deg" % F], join=left, limit=1)[0]
-    assert rec == {"label": "c6"}  # None values are dropped from dictionaries
+    # the unmatched row's joined column comes back as None
+    assert rec == {"label": "c6", "%s.deg" % F: None}
     # the usual LEFT JOIN idiom for "has no match"
     assert curves.search({"%s.label" % F: None}, 0, join=left, limit=10) == ["c6", "c7"]
 

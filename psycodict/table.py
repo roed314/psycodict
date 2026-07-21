@@ -133,7 +133,7 @@ class PostgresTable(PostgresBase):
         out_of_order=False,
         stats_valid=True,
         total=None,
-        include_nones=False,
+        include_nones=True,
         data_types=None,
     ):
         self.search_table = search_table
@@ -142,7 +142,9 @@ class PostgresTable(PostgresBase):
         self._id_ordered = id_ordered
         self._out_of_order = out_of_order
         self._stats_valid = stats_valid
-        self._include_nones = include_nones
+        # None (a meta_tables row from before the column existed) means the
+        # default, which is to include None values in search results
+        self._include_nones = True if include_nones is None else include_nones
         PostgresBase.__init__(self, search_table, db)
         self.col_type = {}
         self.has_id = False

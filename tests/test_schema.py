@@ -232,7 +232,7 @@ def test_meta_tables_defaults_are_applied_to_new_rows(db, empty_table):
     assert row["stats_valid"] is True
     assert row["total"] == 0
     assert row["important"] is False
-    assert row["include_nones"] is False
+    assert row["include_nones"] is True
 
 
 ##################################################################
@@ -868,3 +868,18 @@ def test_unstamped_database_is_treated_as_format_one(db, config, monkeypatch):
         db._execute(SQL("DELETE FROM meta_version"))
         db._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"),
                     [database_module.META_VERSION])
+
+
+def test_include_nones_stored_explicitly_and_copied(db, table_factory):
+    # False must survive both creation and create_table_like, since the
+    # default flipped to True
+    src = table_factory(include_nones=False)
+    row = meta_tables_row(db, src.search_table)
+    assert row["include_nones"] is False
+    copy_name = src.search_table + "copy"
+    db.create_table_like(copy_name, src)
+    try:
+        assert meta_tables_row(db, copy_name)["include_nones"] is False
+        assert db[copy_name]._include_nones is False
+    finally:
+        db.drop_table(copy_name, force=True)

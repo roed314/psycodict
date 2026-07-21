@@ -98,7 +98,10 @@ def test_insert_many_roundtrips_double_precision_and_boolean(empty_table):
 
 def test_insert_many_omitted_columns_become_null(empty_table):
     empty_table.insert_many([{"n": 1, "label": "sparse"}])
-    assert empty_table.lucky({"n": 1}, projection=1) == {"n": 1, "label": "sparse"}
+    assert empty_table.lucky({"n": 1}, projection=1) == {
+        "n": 1, "label": "sparse", "data": None, "num": None,
+        "vec": None, "mat": None, "x": None, "flag": None,
+    }
     assert empty_table.count({"data": None}) == 1
     assert empty_table.count({"vec": None}) == 1
 
@@ -107,7 +110,10 @@ def test_insert_many_explicit_none_becomes_null(empty_table):
     empty_table.insert_many([
         {"n": 1, "label": "a", "num": None, "vec": None, "x": None, "flag": None}
     ])
-    assert empty_table.lucky({"n": 1}, projection=1) == {"n": 1, "label": "a"}
+    assert empty_table.lucky({"n": 1}, projection=1) == {
+        "n": 1, "label": "a", "data": None, "num": None,
+        "vec": None, "mat": None, "x": None, "flag": None,
+    }
     assert empty_table.count({"num": None}) == 1
     assert empty_table.count({"vec": None}) == 1
     assert empty_table.count({"flag": None}) == 1
