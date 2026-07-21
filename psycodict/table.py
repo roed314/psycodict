@@ -1000,6 +1000,12 @@ class PostgresTable(PostgresBase):
         """
         # Fail before the expensive dump below rather than deep inside update_from_file
         self._forbid_reindex_false(kwds.get("reindex"), kwds.get("inplace"))
+        if not kwds.get("inplace"):
+            # A non-inplace rewrite ends in update_from_file, which repeats
+            # this check; running it here as well means that a leftover from
+            # an unfinished reload is reported before ``func`` is run on
+            # every row of the table.
+            self._check_tmp_leftovers([self.search_table])
         data_cols = projection = ["id"] + self.search_cols
         # It would be nice to just use Postgres' COPY TO here, but it would then be hard
         # to give func access to the data to process.
@@ -1616,10 +1622,10 @@ class PostgresTable(PostgresBase):
         ``_tmp`` (or ``_tmp_pkey`` for primary keys) attached to the live
         search, counts and stats tables.  The next reload then fails partway
         through, after the expensive data loading.  This is called at the
-        start of ``reload`` and of a non-inplace ``update_from_file`` so that
-        the failure happens before any work is done, with a ValueError whose
-        message lists each offending object together with SQL commands that
-        rename or drop it.
+        start of ``reload`` and of a non-inplace ``rewrite`` or
+        ``update_from_file`` so that the failure happens before any work is
+        done, with a ValueError whose message lists each offending object
+        together with SQL commands that rename or drop it.
 
         INPUT:
 

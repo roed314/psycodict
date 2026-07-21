@@ -5,9 +5,10 @@ Tests for ``PostgresTable._check_tmp_leftovers`` (LMFDB/lmfdb#3708).
 A crashed or interrupted reload can leave indexes, constraints or whole
 tables whose names end in ``_tmp`` attached to the live tables; the next
 reload used to collide with them partway through, after the expensive data
-loading.  ``reload`` and the non-inplace ``update_from_file`` (and therefore
-``rewrite``) now fail up front with a ValueError that names each leftover and
-gives copy-pasteable SQL to rename or drop it.
+loading.  ``reload`` and the non-inplace ``update_from_file`` and ``rewrite``
+now fail up front with a ValueError that names each leftover and gives
+copy-pasteable SQL to rename or drop it; ``rewrite`` checks before running
+its callback over the table rather than after.
 
 The stray objects are created with raw SQL: the public ``create_index`` and
 ``create_constraint`` refuse names ending in ``_tmp``, which is exactly why
@@ -167,11 +168,16 @@ def test_check_tolerates_a_reused_tmp_counts_table(db, filled_table):
 def test_rewrite_blocks_on_a_stray_tmp_index(db, filled_table):
     # rewrite goes through update_from_file, which clones the search table
     # and rebuilds _tmp indexes just like reload, so it gets the same check.
+    # rewrite also runs the check itself, before dumping func(rec) for every
+    # row to the data file: the failure must come before func is ever called,
+    # not after an hours-long pass over a large table.
     name = filled_table.search_table
     stray = name + "_strayr_tmp"
     db._execute(SQL("CREATE INDEX {0} ON {1} (n)").format(Identifier(stray), Identifier(name)))
+    calls = []
 
     def bump(record):
+        calls.append(record["n"])
         record["num"] = record["n"] + 1
         return record
 
@@ -180,7 +186,29 @@ def test_rewrite_blocks_on_a_stray_tmp_index(db, filled_table):
     message = str(exc.value)
     assert stray in message
     assert "RENAME" in message
+    assert calls == []
     assert filled_table.lucky({"n": 5}, projection="num") == 57
     db._execute(SQL("DROP INDEX {0}").format(Identifier(stray)))
     filled_table.rewrite(bump)
+    assert len(calls) == 200
+    assert filled_table.lucky({"n": 5}, projection="num") == 6
+
+
+def test_inplace_rewrite_ignores_a_stray_tmp_index(db, filled_table):
+    # An inplace rewrite (inplace is passed through to update_from_file)
+    # updates the search table directly, without cloning it or rebuilding
+    # indexes under _tmp names, so leftovers cannot collide with it and the
+    # check must not block it.
+    name = filled_table.search_table
+    stray = name + "_strayi_tmp"
+    db._execute(SQL("CREATE INDEX {0} ON {1} (n)").format(Identifier(stray), Identifier(name)))
+    calls = []
+
+    def bump(record):
+        calls.append(record["n"])
+        record["num"] = record["n"] + 1
+        return record
+
+    filled_table.rewrite(bump, inplace=True)
+    assert len(calls) == 200
     assert filled_table.lucky({"n": 5}, projection="num") == 6
