@@ -14,6 +14,10 @@ table.
 """
 import pytest
 from psycopg import DataError, IntegrityError
+from psycopg.sql import SQL, Identifier
+
+from psycodict.database import PostgresDatabase
+from psycodict.utils import LockError
 
 from conftest import sample_row
 
@@ -238,6 +242,67 @@ def test_staged_leftover_tmp_is_reported_and_drop_tmp_recovers(db, filled_table)
 
 
 ##################################################################
+# concurrent writes to the live table                            #
+##################################################################
+
+
+def test_live_writes_blocked_while_staged(db, config, filled_table):
+    name = filled_table.search_table
+    # A separate database connection, as a concurrent uploader would have.
+    other = PostgresDatabase(config=config)
+    try:
+        other_table = other[name]
+        with pytest.raises(RuntimeError, match="boom"):
+            with filled_table.staged() as staged:
+                staged.insert_many([sample_row(200)])
+                # psycodict writes to the live table are refused, from the
+                # staging connection and from any other, so that they cannot
+                # be silently discarded by the swap.
+                with pytest.raises(LockError, match="staged"):
+                    filled_table.update({"n": 0}, {"label": "lost"})
+                with pytest.raises(LockError, match="drop_tmp"):
+                    other_table.insert_many([sample_row(300)])
+                # Reads on the live table are unaffected.
+                assert filled_table.lucky({"n": 0}, projection="label") == "l0"
+                raise RuntimeError("boom")
+        # Once the context is aborted the copy is gone and writes work again.
+        other_table.insert_many([sample_row(300)])
+        assert filled_table.lucky({"n": 300}, projection="id") == 200
+        assert filled_table.lucky({"n": 0}, projection="label") == "l0"
+    finally:
+        other.conn.close()
+
+
+def test_raw_sql_drift_aborts_the_swap(db, config, filled_table):
+    name = filled_table.search_table
+    other = PostgresDatabase(config=config)
+    try:
+        with pytest.raises(RuntimeError, match="changed during staging"):
+            with filled_table.staged() as staged:
+                staged.update({"n": 1}, {"label": "staged-edit"})
+                # A raw insert from another connection slips past the guard
+                # in _check_locks; the commit-time check refuses the swap.
+                other._execute(
+                    SQL("INSERT INTO {0} (id, n, label) VALUES (%s, %s, %s)").format(Identifier(name)),
+                    [200, 200, "raw"],
+                )
+        # The live table is intact, including the raw row, and nothing was
+        # swapped in.
+        assert _num_rows(filled_table) == 201
+        assert filled_table.lucky({"n": 1}, projection="label") == "l1"
+        assert filled_table.lucky({"n": 200}, projection="label") == "raw"
+        assert db[name] is filled_table
+        # The staged work is kept for repair, as after a failed swap;
+        # drop_tmp discards it.
+        for ext in ["", "_counts", "_stats"]:
+            assert filled_table._table_exists(name + ext + "_tmp")
+        filled_table.drop_tmp()
+        assert _tmp_leftovers(filled_table) == []
+    finally:
+        other.conn.close()
+
+
+##################################################################
 # sort order and id integrity after the swap                     #
 ##################################################################
 
@@ -320,3 +385,84 @@ def test_staged_blocks_schema_changes(db, filled_table):
     # The failed calls did not poison the context: the swap still happens.
     assert _num_rows(db[name]) == 200
     assert "extra_note" not in db[name].search_cols
+
+
+def _has_pkey(db, tablename):
+    cur = db._execute(
+        SQL("SELECT COUNT(*) FROM pg_constraint WHERE conrelid = %s::regclass AND contype = 'p'"),
+        [tablename],
+    )
+    return cur.fetchone()[0] == 1
+
+
+def test_staged_blocks_pkey_and_meta_tampering(db, filled_table):
+    name = filled_table.search_table
+    with filled_table.staged() as staged:
+        # The commit only rebuilds what meta_indexes and meta_constraints
+        # record, which does not include the primary key, so a drop_pkeys
+        # here would strip it from the swapped-in table for good; and the
+        # meta reload/revert methods would write meta_* rows keyed on the
+        # scratch name.
+        for blocked in [
+            lambda: staged.drop_pkeys(),
+            lambda: staged.restore_pkeys(),
+            lambda: staged.reload_meta("nofile"),
+            lambda: staged.reload_indexes("nofile"),
+            lambda: staged.reload_constraints("nofile"),
+            lambda: staged.revert_meta(),
+            lambda: staged.revert_indexes(),
+            lambda: staged.revert_constraints(),
+        ]:
+            with pytest.raises(ValueError, match="not supported on a staged table"):
+                blocked()
+        staged.insert_many([sample_row(200)])
+    # The swapped-in live table still has its primary key.
+    table = db[name]
+    assert _num_rows(table) == 201
+    assert _has_pkey(db, name)
+    assert name + "_pkey" in table._list_built_indexes()
+
+
+def test_staged_bulk_insert_over_reindex_threshold_keeps_pkey(db, filled_table):
+    # More than 1000 rows makes insert_many default to dropping the primary
+    # key around the insert and rebuilding it afterward; on the staged
+    # handle that pair is blocked, so the handle forces reindex off and the
+    # key must survive to the swap.
+    name = filled_table.search_table
+    with filled_table.staged() as staged:
+        staged.insert_many([sample_row(i) for i in range(200, 1401)])
+    table = db[name]
+    assert _num_rows(table) == 1401
+    assert table.max_id() == 1400
+    assert _has_pkey(db, name)
+
+
+##################################################################
+# per-column storage settings survive the swap                   #
+##################################################################
+
+
+def test_staged_swap_preserves_column_storage(db, filled_table):
+    name = filled_table.search_table
+    version = int(db._execute(
+        SQL("SELECT current_setting('server_version_num')")
+    ).fetchone()[0])
+    db._execute(SQL("ALTER TABLE {0} ALTER COLUMN label SET STORAGE EXTERNAL").format(Identifier(name)))
+    if version >= 140000:
+        db._execute(SQL("ALTER TABLE {0} ALTER COLUMN label SET COMPRESSION pglz").format(Identifier(name)))
+
+    def att(prop):
+        cur = db._execute(
+            SQL("SELECT {0} FROM pg_attribute WHERE attrelid = %s::regclass AND attname = %s").format(Identifier(prop)),
+            [name, "label"],
+        )
+        return cur.fetchone()[0]
+
+    with filled_table.staged() as staged:
+        staged.update({"n": 0}, {"label": "stored"})
+    # The swapped-in table is the staged clone, so a bare CREATE TABLE LIKE
+    # would have silently reset these to the defaults.
+    assert att("attstorage") == "e"
+    if version >= 140000:
+        assert att("attcompression") == "p"
+    assert db[name].lucky({"n": 0}, projection="label") == "stored"

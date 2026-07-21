@@ -883,7 +883,32 @@ class PostgresTable(PostgresBase):
         To this end, it has a return value (defaulting to None) that is passed into the eventual
         _log_db_change in the functions that call this, and it takes a datafile as input to
         support checking the size on disk (nothing is done with this datafile by default).
+
+        While a staged copy of the table exists (see ``staged``), changes to
+        the live table are refused: the copy was taken when the context was
+        entered, so anything written to the live table afterward would be
+        silently discarded when the copy is swapped into place.  This covers
+        writes made through psycodict's API only; raw SQL from another
+        connection bypasses it, with the count check at the end of ``staged``
+        as a partial backstop.
         """
+        # Skip the staged guard when a suffix is given (the operation targets
+        # the suffixed scratch table, not the live one) and for
+        # create_table_like, which only reads this table.  Note that the
+        # staged handle itself is unaffected: its search_table already ends
+        # in _tmp, so it checks for a doubly suffixed table here.  reload is
+        # deliberately not exempted, since it would collide with the staged
+        # copy partway through; failing here gives it a clear message.
+        if not suffix and changetype != "create_table_like" and self._table_exists(self.search_table + "_tmp"):
+            raise LockError(
+                "A staged copy of %s exists (%s_tmp): a staged() context or a "
+                "reload is in progress, and writes to the live table would be "
+                "lost when the copy is swapped into place.  Exit the staged "
+                "context first, or if the copy is left over from an "
+                "interrupted operation, discard it with db.%s.drop_tmp() and "
+                "try again."
+                % (self.search_table, self.search_table, self.search_table)
+            )
         if changetype in ["upsert", "update"]:
             locktypes = "update"
         elif changetype in ["insert_many", "copy_from"]:
@@ -1931,8 +1956,15 @@ class PostgresTable(PostgresBase):
 
     # Methods disabled on the staged handle yielded by ``staged``: changing
     # the schema of the staged copy would desynchronize it from the meta_*
-    # rows describing the live table (which the swap does not touch), and the
-    # reload machinery does not compose with an active staged context.
+    # rows describing the live table (which the swap does not touch), the
+    # reload machinery does not compose with an active staged context, and
+    # an unpaired drop_pkeys would strip the primary key from the table that
+    # the swap installs (the commit only rebuilds what meta_indexes and
+    # meta_constraints record, which does not include the primary key).
+    # drop_indexes and restore_indexes are deliberately not here: they only
+    # act on what meta_indexes and meta_constraints record for the handle's
+    # (suffixed) name, which is nothing, and the write methods call them
+    # internally when reindex is set, so they must stay working no-ops.
     _staged_unsupported = (
         "add_column",
         "drop_column",
@@ -1942,6 +1974,8 @@ class PostgresTable(PostgresBase):
         "create_constraint",
         "drop_constraint",
         "restore_constraint",
+        "drop_pkeys",
+        "restore_pkeys",
         "set_sort",
         "set_label",
         "set_importance",
@@ -1949,6 +1983,12 @@ class PostgresTable(PostgresBase):
         "reload_final_swap",
         "reload_revert",
         "cleanup_from_reload",
+        "reload_indexes",
+        "reload_meta",
+        "reload_constraints",
+        "revert_indexes",
+        "revert_meta",
+        "revert_constraints",
         "drop_tmp",
         "staged",
     )
@@ -1987,6 +2027,15 @@ class PostgresTable(PostgresBase):
         Schema changes through the staged handle are disabled.  If the swap
         itself fails, the staged tables are left in place so that no work is
         lost; ``drop_tmp`` discards them.
+
+        While the context is open, writes to the live table through
+        psycodict's API (``insert_many``, ``update``, ``delete``, ..., from
+        this or any other connection) raise ``LockError``, since the swap
+        would silently discard them.  Raw SQL bypasses that guard; as a
+        backstop, the commit refuses to swap if the live table's row count
+        or maximum id changed while the context was open.  In-place updates
+        change neither number and escape the backstop, so raw-SQL writers
+        must simply stay away from a table while it is being staged.
 
         EXAMPLES::
 
@@ -2055,6 +2104,11 @@ class PostgresTable(PostgresBase):
                     Identifier(self.search_table),
                 )
                 total = self._execute(inserter).rowcount
+                # Reading the copy rather than the live table pins down
+                # exactly what was copied, even if the live table moves
+                # between the statements; the commit-time drift check
+                # compares the live table against this.
+                source_max_id = self.max_id(self.search_table + suffix)
                 # The primary key keeps id lookups (max_id, upserts, updates
                 # by id) fast during staging and catches id collisions as
                 # they happen; the other indexes are built at commit time as
@@ -2088,6 +2142,10 @@ class PostgresTable(PostgresBase):
             # is what the swap and cleanup machinery renames; repoint it.
             staged.stats.counts = self.stats.counts + suffix
             staged.stats.stats = self.stats.stats + suffix
+            # What the live table held when the copy was taken, for the
+            # commit-time check that it did not change during staging
+            staged._staged_source_count = total
+            staged._staged_source_max_id = source_max_id
             for methodname in self._staged_unsupported:
                 setattr(staged, methodname, self._staged_blocked(methodname))
             # The staged table is already a scratch copy, so updating it from
@@ -2102,6 +2160,18 @@ class PostgresTable(PostgresBase):
                 return unstaged_update_from_file(datafile, label_col=label_col, inplace=True, **kwds)
 
             staged.update_from_file = update_from_file
+            # With reindex set, insert_many drops the primary key around the
+            # insert and rebuilds it afterward; on the staged handle that
+            # pair is blocked (an unpaired drop would survive the swap, see
+            # _staged_unsupported), and the copy carries no other indexes to
+            # drop, so force it off rather than letting the automatic
+            # reindex=None default trip over the block on large inserts.
+            unstaged_insert_many = staged.insert_many
+
+            def insert_many(data, resort=False, reindex=None, restat=True):
+                return unstaged_insert_many(data, resort=resort, reindex=False, restat=restat)
+
+            staged.insert_many = insert_many
             aborted = False
             return staged, logid
         finally:
@@ -2125,6 +2195,34 @@ class PostgresTable(PostgresBase):
                 # and meta_constraints, as reload does just before its swap
                 self.restore_indexes(suffix=suffix)
                 self._create_counts_indexes(suffix=suffix)
+                # Backstop against writes that reached the live table anyway
+                # (raw SQL bypasses the guard in _check_locks): if the row
+                # count or the maximum id moved since the copy was taken,
+                # the swap would silently discard those rows into the _old
+                # backup.  Checked after the index builds to keep the window
+                # between check and swap small.  In-place updates change
+                # neither number and are not caught here; the _check_locks
+                # guard is the primary defense.
+                live_count = self.stats._slow_count({}, record=False)
+                live_max_id = self.max_id()
+                if (live_count != staged._staged_source_count
+                        or live_max_id != staged._staged_source_max_id):
+                    raise RuntimeError(
+                        "The live table %s changed during staging: it held "
+                        "%s rows with max id %s when the staged copy was "
+                        "taken, but now holds %s rows with max id %s.  "
+                        "Refusing to swap, since the swap would discard "
+                        "those changes.  The staged tables are kept; "
+                        "db.%s.drop_tmp() discards them."
+                        % (
+                            self.search_table,
+                            staged._staged_source_count,
+                            staged._staged_source_max_id,
+                            live_count,
+                            live_max_id,
+                            self.search_table,
+                        )
+                    )
                 # The staged writes could not update the meta_tables row (it
                 # is keyed on the live name), so transfer the order flag and
                 # invalidate the statistics: the swapped-in counts and stats
