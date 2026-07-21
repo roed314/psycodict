@@ -16,6 +16,7 @@ import uuid
 import pytest
 
 from psycopg.errors import UndefinedColumn, UndefinedTable
+from psycopg.sql import SQL
 
 import conftest
 
@@ -178,3 +179,17 @@ def test_single_table_refresh(db, second_db, table_factory):
     assert "extra_col" in table.search_cols
     assert table.col_type["extra_col"] == "text"
     assert "extra_col" not in untouched.search_cols
+
+
+def test_refresh_coalesces_legacy_null_include_nones(db, table_factory):
+    # A meta_tables row predating the include_nones column reads as SQL NULL.
+    # _refresh must coalesce it to True (the include_nones default), matching
+    # the table constructor; otherwise refresh_tables() would silently flip
+    # such a table back to the old omit-Nones behavior.
+    table = table_factory()
+    db._execute(
+        SQL("UPDATE meta_tables SET include_nones = NULL WHERE name = %s"),
+        [table.search_table],
+    )
+    table._refresh()
+    assert table._include_nones is True

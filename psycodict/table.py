@@ -211,7 +211,12 @@ class PostgresTable(PostgresBase):
         self._id_ordered = id_ordered
         self._out_of_order = out_of_order
         self._stats_valid = stats_valid
-        self._include_nones = include_nones
+        # A legacy meta_tables row predating the include_nones column reads as
+        # SQL NULL; treat it as True, matching the constructor, so that a later
+        # refresh_tables() does not silently flip such a table back to the old
+        # omit-Nones behavior.  (The coalescing in the constructor arrives with
+        # PR #103; keeping the two in step is the point of doing it here too.)
+        self._include_nones = True if include_nones is None else include_nones
         self.search_cols, self.col_type, self.has_id = self._column_types(self.search_table, data_types=data_types)
         self._set_sort(sort)
         self.stats._init_total(total)
