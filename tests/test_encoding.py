@@ -96,6 +96,7 @@ def test_numeric_precision_counts_significant_digits(value, prec):
     assert numeric_precision(value) == prec
 
 
+@pytest.mark.skipif(SAGE_MODE, reason="with Sage, decimal zeros are exact integers")
 def test_decimal_zero_is_float_zero_without_sage():
     assert numeric_converter("0.000") == 0.0
     assert isinstance(numeric_converter("-0.0"), float)
