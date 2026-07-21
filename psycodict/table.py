@@ -947,6 +947,9 @@ class PostgresTable(PostgresBase):
         self,
         func,
         query={},
+        # Keyword-only so that old positional calls (which had reindex fifth,
+        # before restat) fail loudly instead of silently binding to restat.
+        *,
         resort=True,
         restat=True,
         tostr_func=None,
@@ -966,7 +969,8 @@ class PostgresTable(PostgresBase):
         scratch, all of its indexes are always recreated; there is thus no
         ``reindex`` option, and asking for ``reindex=False`` raises an error
         (unless ``inplace=True`` is passed through to ``update_from_file``,
-        which edits rows on the live table instead).
+        which edits rows on the live table instead).  All arguments other than
+        ``func`` and ``query`` must be passed by keyword.
 
         INPUT:
 
@@ -1051,6 +1055,9 @@ class PostgresTable(PostgresBase):
         self,
         datafile,
         label_col=None,
+        # Keyword-only so that callers must name reindex (whose default and
+        # meaning changed) rather than reaching it positionally.
+        *,
         inplace=False,
         resort=None,
         reindex=None,
@@ -1067,7 +1074,8 @@ class PostgresTable(PostgresBase):
         actively used.  Since the replacement table is built from scratch, all
         of its indexes are always recreated, whatever ``reindex`` says; with
         ``inplace=True`` the rows are instead edited on the live table and
-        ``reindex`` controls how the indexes are handled.
+        ``reindex`` controls how the indexes are handled.  Arguments after
+        ``label_col`` must be passed by keyword.
 
         INPUT:
 
