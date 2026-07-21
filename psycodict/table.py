@@ -928,12 +928,29 @@ class PostgresTable(PostgresBase):
         # Sort and set self._out_of_order
         pass
 
+    def _forbid_reindex_false(self, reindex, inplace):
+        """
+        Raise an error on a request to skip index rebuilding during an update
+        that swaps in a new table, which cannot be honored; see the docstrings
+        of ``rewrite`` and ``update_from_file``.
+        """
+        if reindex is False and not inplace:
+            raise ValueError(
+                "reindex=False is impossible when updating by swapping in a new "
+                "table (the default): the replacement table is built from scratch "
+                "(so that reload_revert is available) and its indexes must be "
+                "recreated.  Pass inplace=True (which cannot be undone with "
+                "reload_revert) to update rows without rebuilding indexes."
+            )
+
     def rewrite(
         self,
         func,
         query={},
+        # Keyword-only so that old positional calls (which had reindex fifth,
+        # before restat) fail loudly instead of silently binding to restat.
+        *,
         resort=True,
-        reindex=None,
         restat=True,
         tostr_func=None,
         datafile=None,
@@ -945,18 +962,27 @@ class PostgresTable(PostgresBase):
 
         Note that if you want to add new columns, you must explicitly call add_column() first.
 
+        The modified records are written to a file and loaded into a brand-new
+        table, which is then swapped in for the current one, so that the change
+        can be undone with ``reload_revert`` and no locks are taken on a table
+        that is being actively used.  Since the replacement table is built from
+        scratch, all of its indexes are always recreated; there is thus no
+        ``reindex`` option, and asking for ``reindex=False`` raises an error
+        (unless ``inplace=True`` is passed through to ``update_from_file``,
+        which edits rows on the live table instead).  All arguments other than
+        ``func`` and ``query`` must be passed by keyword.
+
         INPUT:
 
         - ``func`` -- a function that takes a record (dictionary) as input and returns the modified record
         - ``query`` -- a query dictionary; only rows satisfying this query will be changed
         - ``resort`` -- whether to resort the table after running the rewrite
-        - ``reindex`` -- whether to reindex the table after running the rewrite (default is determined by whether the number of rows changed is at least 1000)
         - ``restat`` -- whether to recompute statistics after running the rewrite
         - ``tostr_func`` -- a function to be used when writing data to the temp file
             defaults to copy_dumps from encoding
         - ``datafile`` -- a filename to use for the temp file holding the data
         - ``progress_count`` -- (default 10000) how frequently to print out status reports as the rewrite proceeds
-        - ``**kwds`` -- any other keyword arguments are passed on to the ``reload`` method
+        - ``**kwds`` -- any other keyword arguments (such as ``inplace`` or ``sep``) are passed on to the ``update_from_file`` method
 
         EXAMPLES:
 
@@ -970,6 +996,8 @@ class PostgresTable(PostgresBase):
             ....:     return rec
             sage: db.artin_reps.rewrite(add_signs)
         """
+        # Fail before the expensive dump below rather than deep inside update_from_file
+        self._forbid_reindex_false(kwds.get("reindex"), kwds.get("inplace"))
         data_cols = projection = ["id"] + self.search_cols
         # It would be nice to just use Postgres' COPY TO here, but it would then be hard
         # to give func access to the data to process.
@@ -1016,7 +1044,6 @@ class PostgresTable(PostgresBase):
                 datafile.name,
                 label_col="id",
                 resort=resort,
-                reindex=reindex,
                 restat=restat,
                 logging=dict(operation="rewrite", query=query, projection=projection),
                 **kwds
@@ -1028,9 +1055,12 @@ class PostgresTable(PostgresBase):
         self,
         datafile,
         label_col=None,
+        # Keyword-only so that callers must name reindex (whose default and
+        # meaning changed) rather than reaching it positionally.
+        *,
         inplace=False,
         resort=None,
-        reindex=True,
+        reindex=None,
         restat=True,
         logging={"operation":"file_update"},
         **kwds
@@ -1038,17 +1068,27 @@ class PostgresTable(PostgresBase):
         """
         Updates this table from data stored in a file.
 
+        By default the updated rows are merged into a brand-new table, which is
+        then swapped in for the current one, so that the change can be undone
+        with ``reload_revert`` and no locks are taken on a table that is being
+        actively used.  Since the replacement table is built from scratch, all
+        of its indexes are always recreated, whatever ``reindex`` says; with
+        ``inplace=True`` the rows are instead edited on the live table and
+        ``reindex`` controls how the indexes are handled.  Arguments after
+        ``label_col`` must be passed by keyword.
+
         INPUT:
 
         - ``datafile`` -- a file with header lines (unlike ``reload``, does not need to include all columns) and rows containing data to be updated.
         - ``label_col`` -- a column specifying which row(s) of the table should be updated corresponding to each row of the input file.  This will usually be the label for the table, in which case it can be omitted.
         - ``inplace`` -- whether to do the update in place.  If set, the operation cannot be undone with ``reload_revert``.
         - ``resort`` -- whether this table should be resorted after updating (default is to resort when the sort columns intersect the updated columns)
-        - ``reindex`` -- whether the indexes on this table should be dropped and recreated during update (default is to recreate only the indexes that touch the updated columns, and only if inplace and the number of rows edited is at least 1000)
+        - ``reindex`` -- only meaningful when ``inplace`` is set: whether to drop the indexes touching the updated columns before the update and recreate them afterward, which is faster when many rows change (by default this is done when more than 1000 rows are updated).  Without ``inplace``, all indexes are necessarily recreated on the replacement table, so ``reindex=True`` is redundant and ``reindex=False`` raises an error.
         - ``restat`` -- whether to recompute stats for the table
         - ``logging`` -- a dictionary of keyword arguments for log_db_change
         - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
         """
+        self._forbid_reindex_false(reindex, inplace)
         logid = self._check_locks(logging["operation"], datafile=datafile)
         logging["aborted"] = True
         try:
@@ -1574,6 +1614,15 @@ class PostgresTable(PostgresBase):
     ):
         """
         Safely and efficiently replaces this table with the contents of one or more files.
+
+        The data is loaded into a brand-new table, which is then swapped in for
+        the current one, so that the change can be undone with ``reload_revert``
+        and no locks are taken on a table that is being actively used.  The
+        primary key, indexes and constraints are always recreated on the new
+        table, after the data is loaded (building them afterward is faster than
+        maintaining them during the load).  There is deliberately no ``reindex``
+        option: the replacement table starts without indexes, so they can only
+        be rebuilt, never preserved.
 
         INPUT:
 
