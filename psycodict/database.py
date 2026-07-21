@@ -956,6 +956,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     include_nones,
                 ],
             )
+            self._notify_schema_change(name)  # rides this transaction
         new_table = self._search_table_class_(
             self,
             name,
@@ -1028,6 +1029,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 print("Dropped {0}".format(tbl))
             self.tablenames.remove(name)
             delattr(self, name)
+            self._notify_schema_change(name)  # rides this transaction
 
     def rename_table(self, old_name, new_name):
         """
@@ -1131,6 +1133,11 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             self.tablenames.append(new_name)
             self.tablenames.remove(old_name)
             self.tablenames.sort()
+            # A rename touches both names: the old one is gone, the new one
+            # appeared.  Announce both so a listener can drop the stale
+            # metadata and pick up the new table (rides this transaction).
+            self._notify_schema_change(old_name)
+            self._notify_schema_change(new_name)
 
     def copy_to(self, search_tables, data_folder, fail_on_error=True, **kwds):
         """
@@ -1629,3 +1636,72 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         """
         from .slowlog import show_slow_report
         show_slow_report(logfile, top=top, cutoff=cutoff, db=self)
+
+    # ---------------------------------------------------------------------
+    # LISTEN/NOTIFY support (see psycodict/notifications.py for the design).
+    # ---------------------------------------------------------------------
+
+    def notify(self, channel, payload=""):
+        """
+        Send a PostgreSQL notification on ``channel`` with the given payload.
+
+        The notification is sent with ``pg_notify`` on the main connection,
+        through ``_execute``, so it is *transactional*: PostgreSQL delivers it
+        when the surrounding transaction commits and drops it on rollback.
+        Called on its own (outside a ``DelayCommit``) it commits immediately and
+        so is delivered at once; called inside a ``DelayCommit`` it rides that
+        transaction and is delivered (or dropped) with it.
+
+        INPUT:
+
+        - ``channel`` -- the channel name; must be a plain identifier (letters,
+          digits and underscores, not starting with a digit)
+        - ``payload`` -- a string payload (default ``""``); received verbatim by
+          listeners
+
+        Subscribe with :meth:`listener` (or the standalone
+        :class:`~psycodict.notifications.NotificationListener`).
+        """
+        from .notifications import validate_channel_name
+        validate_channel_name(channel)
+        self._execute(SQL("SELECT pg_notify(%s, %s)"), [channel, payload])
+
+    def _notify_schema_change(self, tablename):
+        """
+        Announce that ``tablename``'s schema changed, on the schema channel.
+
+        Used by the schema-changing operations (create/drop/rename table,
+        add/drop column, reload swap).  Because it goes through :meth:`notify`
+        on the main connection, the announcement is part of the same
+        transaction as the change itself.
+        """
+        from .notifications import SCHEMA_CHANNEL
+        self.notify(SCHEMA_CHANNEL, tablename)
+
+    def listener(self, channels=None):
+        """
+        Return a :class:`~psycodict.notifications.NotificationListener`.
+
+        The listener opens its *own* ``autocommit`` connection from this
+        database's configuration and ``LISTEN``s on ``channels`` (default: the
+        schema channel ``"psycodict_schema"`` alone).  It is pull-based: call
+        ``poll(timeout)`` for a bounded batch, or iterate ``listen()``; use it
+        as a context manager to close the connection when done.
+
+        The intended follow-up use is a long-running website process that keeps
+        a listener on ``"psycodict_schema"`` and, whenever a table name arrives,
+        refreshes that table's cached metadata so newly created columns and
+        reloaded tables become visible without a restart.  That refresh
+        mechanism is proposed in a separate PR; psycodict ships the notification
+        plumbing here without depending on it, so the two can land in either
+        order.
+
+        INPUT:
+
+        - ``channels`` -- a channel name or iterable of them; ``None`` (default)
+          means the schema channel only
+        """
+        from .notifications import NotificationListener, SCHEMA_CHANNEL
+        if channels is None:
+            channels = (SCHEMA_CHANNEL,)
+        return NotificationListener(self.config, channels)
