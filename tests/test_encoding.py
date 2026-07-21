@@ -89,13 +89,28 @@ def test_numeric_converter_decimals(value, expected):
     # the sign, the decimal point and leading zeros carry no information
     ("-0.5", 4),
     ("0.5", 4),
-    # no significant digits at all: RealField's minimum precision
-    ("0.000", 2),
+    # a decimal zero is exact at any precision, and a generous one keeps it
+    # from dragging down the precision of arithmetic partners
+    ("0.000", 53),
+    ("-0.0", 53),
 ])
 def test_numeric_precision_counts_significant_digits(value, prec):
     from psycodict.encoding import numeric_precision
 
     assert numeric_precision(value) == prec
+
+
+def test_zero_does_not_degrade_sage_arithmetic():
+    # Sage coerces a sum to the lowest precision of its operands, so a
+    # low-precision zero would turn 123.456 + 0.000 into a 2-bit 130.
+    pytest.importorskip("sage.rings.real_mpfr")
+    from psycodict.encoding import numeric_converter
+
+    x = numeric_converter("123.456")
+    z = numeric_converter("0.000")
+    total = x + z
+    assert total.parent().precision() >= x.parent().precision()
+    assert total == x
 
 
 def test_numeric_converter_none_and_unused_cursor():

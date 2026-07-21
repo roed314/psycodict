@@ -103,6 +103,12 @@ def numeric_precision(value):
         40
     """
     digits = len(value.lstrip("+-").replace(".", "", 1).lstrip("0"))
+    if digits == 0:
+        # A decimal zero ("0.000") is exact in binary at any precision, so a
+        # generous default costs nothing -- while a tiny one would poison
+        # arithmetic: Sage coerces to the lowest precision of the operands,
+        # so a 2-bit zero would turn x + 0 into a 2-bit result.
+        return 53
     # log(10)/log(2) = 3.3219280948873626
     return max(math.ceil(digits * 3.3219280948873626), 2)
 
