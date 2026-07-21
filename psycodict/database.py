@@ -170,6 +170,11 @@ class PostgresDatabase(PostgresBase):
         self._nocommit_stack = 0
         self._silenced = False
         self._objects = []
+        # The connection overrides passed here take precedence over config for
+        # every connection this database opens, including the separate one a
+        # listener() opens (otherwise it could subscribe on a different server
+        # or database than the sender writes to).
+        self._connect_kwargs = dict(kwargs)
         self.conn = self._new_connection(**kwargs)
         PostgresBase.__init__(self, "db_all", self)
         if self._user == "webserver":
@@ -1704,4 +1709,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         from .notifications import NotificationListener, SCHEMA_CHANNEL
         if channels is None:
             channels = (SCHEMA_CHANNEL,)
-        return NotificationListener(self.config, channels)
+        # Pass the same connection overrides the database itself was opened
+        # with, so the listener's dedicated connection reaches the same server
+        # and database as the sender.
+        return NotificationListener(self.config, channels, **self._connect_kwargs)

@@ -305,3 +305,23 @@ def test_standalone_listener_matches_the_factory(notif_db):
     with NotificationListener(notif_db.config, channels=channel) as listener:
         notif_db.notify(channel, "direct")
         assert listener.poll(WAIT) == [(channel, "direct")]
+
+
+def test_listener_honors_connection_overrides(notif_config):
+    # Connection overrides passed to PostgresDatabase(...) must also reach the
+    # listener's dedicated connection; otherwise a caller who overrode e.g. the
+    # database or host would have the listener subscribe somewhere other than
+    # where the sender writes.  application_name is an observable stand-in that
+    # needs no second database to test.
+    from psycodict.database import PostgresDatabase
+
+    marker = "psycodict_listener_marker"
+    db = PostgresDatabase(config=notif_config, application_name=marker)
+    try:
+        with db.listener() as listener:
+            got = listener._conn.execute(
+                "SELECT current_setting('application_name')"
+            ).fetchone()[0]
+        assert got == marker
+    finally:
+        db.conn.close()
