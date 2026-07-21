@@ -212,3 +212,22 @@ def test_inplace_rewrite_ignores_a_stray_tmp_index(db, filled_table):
     filled_table.rewrite(bump, inplace=True)
     assert len(calls) == 200
     assert filled_table.lucky({"n": 5}, projection="num") == 6
+
+
+def test_scratch_tables_are_exempt(db, empty_table):
+    # A table object whose own name ends in _tmp (a scratch copy, e.g. a
+    # staged() handle) legitimately owns _tmp-named objects; the check must
+    # not flag them.  No live table can be named this way, since
+    # create_table forbids the suffix.
+    import copy
+
+    name = empty_table.search_table + "_tmp"
+    db._execute(SQL('CREATE TABLE {0} (id bigint, n integer)').format(Identifier(name)))
+    try:
+        db._execute(SQL('ALTER TABLE {0} ADD CONSTRAINT {1} PRIMARY KEY (id)').format(
+            Identifier(name), Identifier(name + "_pkey")))
+        scratch = copy.copy(empty_table)
+        scratch.search_table = name
+        assert scratch._check_tmp_leftovers([name]) is None
+    finally:
+        db._execute(SQL("DROP TABLE {0}").format(Identifier(name)))

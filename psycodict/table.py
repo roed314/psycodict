@@ -1635,6 +1635,12 @@ class PostgresTable(PostgresBase):
             the caller reuses an existing ``_tmp`` table (the counts and
             stats tables when no data file is given) must not be included.
         """
+        if self.search_table.endswith("_tmp"):
+            # This object is itself a scratch copy (e.g. a staged() handle):
+            # its own objects legitimately carry _tmp names, and no live
+            # table can end in _tmp (_check_restricted_suffix forbids it),
+            # so there is nothing to protect here.
+            return
         tables = [self.search_table]
         if self.stats.saving:
             tables.extend([self.stats.counts, self.stats.stats])
