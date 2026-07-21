@@ -509,6 +509,45 @@ def test_reload_with_a_metafile(db, filled_table, tmp_path):
     assert _num_rows(db[name]) == 200
 
 
+def test_reload_with_a_metafile_and_resort(db, filled_table, tmp_path):
+    # Regression: the metafile branch of the resort logic indexed the csv row
+    # and the jsonb position tuple with column *names*, so any
+    # reload(metafile=..., resort=True) raised TypeError.
+    name = filled_table.search_table
+    searchfile = str(tmp_path / "search.txt")
+    metafile = str(tmp_path / "meta.txt")
+    filled_table.copy_to(searchfile, metafile=metafile)
+    filled_table.reload(searchfile, metafile=metafile, resort=True)
+    assert _num_rows(db[name]) == 200
+
+
+def test_reload_of_an_idless_file_with_a_metafile(db, filled_table, tmp_path):
+    # Same regression as above through the default path: a searchfile without
+    # ids turns resort on automatically.
+    name = filled_table.search_table
+    searchfile = str(tmp_path / "search.txt")
+    metafile = str(tmp_path / "meta.txt")
+    filled_table.copy_to(searchfile, include_id=False, metafile=metafile)
+    filled_table.reload(searchfile, metafile=metafile)
+    table = db[name]
+    assert _num_rows(table) == 200
+    assert table.lucky({"n": 5}, projection="label") == "l5"
+
+
+def test_reload_resort_rejects_a_malformed_metafile(filled_table, tmp_path):
+    from psycodict.base import _meta_tables_cols
+
+    searchfile = str(tmp_path / "search.txt")
+    metafile = str(tmp_path / "meta.txt")
+    filled_table.copy_to(searchfile, metafile=metafile)
+    fields = _read(metafile).rstrip("\n").split("|")
+    fields[_meta_tables_cols.index("id_ordered")] = "x"
+    with open(metafile, "w") as F:
+        F.write("|".join(fields) + "\n")
+    with pytest.raises(RuntimeError, match="different from 't' or 'f'"):
+        filled_table.reload(searchfile, metafile=metafile, resort=True)
+
+
 ##################################################################
 # resort, rewrite and the schema helpers                         #
 ##################################################################
