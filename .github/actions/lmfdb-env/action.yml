@@ -47,11 +47,12 @@ runs:
         sage -pip install -r ci-requirements.txt
 
     # Editable, so that the next step can prove which psycodict is loaded by
-    # looking at the import path.  --no-deps because psycopg2 arrived with
-    # LMFDB's requirements and psycodict's own dependencies are all extras.
+    # looking at the import path.  The pgbinary extra must come from here:
+    # LMFDB's requirements line (psycodict[pgbinary] @ git+...) was removed
+    # above, and it was the only thing providing the psycopg driver.
     - name: Install psycodict from this checkout
       shell: bash
-      run: sage -pip install --no-deps --force-reinstall -e ./psycodict
+      run: sage -pip install --force-reinstall -e "./psycodict[pgbinary]"
 
     # Run from the LMFDB checkout, not the workspace root: the root holds a
     # directory named psycodict/, which Python imports as a namespace package

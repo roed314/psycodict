@@ -52,7 +52,11 @@ def setup_connection(conn):
     conn.adapters.register_dumper(Array, ArrayDumper)
     set_json_loads(Json.loads, conn)
     try:
-        from sage.all import Integer, RealNumber
+        # RealNumber must come from real_mpfr: sage.all.RealNumber is the
+        # create_RealNumber factory function (not a class), and dumpers can
+        # only be registered on classes
+        from sage.rings.integer import Integer
+        from sage.rings.real_mpfr import RealNumber
         from .encoding import RealLiteralDumper, SageIntegerDumper, LmfdbRealLiteral
     except ImportError:
         pass
