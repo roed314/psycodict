@@ -282,6 +282,8 @@ class PostgresSearchTable(PostgresTable):
                 key = "$not"
                 value = {"$or": value}
         if key in ["$or", "$and"]:
+            if not isinstance(value, (list, tuple)):
+                raise ValueError("%s requires a list of dictionaries" % key)
             pairs = [
                 self._parse_dict(clause, outer=col, outer_type=col_type,
                                  join_context=join_context)
@@ -319,6 +321,9 @@ class PostgresSearchTable(PostgresTable):
                 cmd = SQL("{0} IS NULL").format(col)
             value = []
         elif key == "$notcontains":
+            if not value:
+                # excluding nothing is no constraint at all
+                return None, None
             if col_type == "jsonb":
                 cmd = SQL(" AND ").join(SQL("NOT {0} @> %s").format(col) * len(value))
                 value = [Json(v) for v in value]
@@ -1171,7 +1176,8 @@ class PostgresSearchTable(PostgresTable):
                 nres = offset + cur.rowcount
             else:
                 exact_count = True
-            results = cur.fetchmany(limit)
+            # fetchmany(0) would fall back to arraysize and return a row
+            results = cur.fetchmany(limit) if limit else []
             results = list(self._search_iterator(results, search_cols, projection, query=query, silent=silent))
         if info is not None:
             if offset >= nres > 0:
@@ -1406,7 +1412,8 @@ class PostgresSearchTable(PostgresTable):
             return self._search_iterator(cur, search_cols, projection, query=query, silent=silent)
         exact_count = cur.rowcount < prelimit and (offset == 0 or cur.rowcount > 0)
         nres = offset + cur.rowcount
-        results = cur.fetchmany(limit)
+        # fetchmany(0) would fall back to arraysize and return a row
+        results = cur.fetchmany(limit) if limit else []
         results = list(self._search_iterator(results, search_cols, projection, query=query, silent=silent))
         if info is not None:
             if offset >= nres > 0:

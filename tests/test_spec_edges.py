@@ -148,18 +148,11 @@ def test_overlaps_empty_matches_nothing(spec_table):
     assert spec_table.search({"vec": {"$overlaps": []}}, "n", limit=20) == []
 
 
-def test_notcontains_empty_list_is_a_bug_emitting_empty_sql(db, spec_table):
-    # BUG (report-only): $notcontains joins one clause per excluded value, so
-    # an empty list yields an *empty* SQL fragment that is not None.  That
-    # produces "WHERE  ORDER BY ..." and Postgres raises a syntax error.  Every
-    # other empty-collection operator degrades to true/false; this one does
-    # not.  Pinned as the current (broken) behavior for 1.0; see final report.
-    assert _sql(db, spec_table, {"vec": {"$notcontains": []}}) == ""
-    with pytest.raises(psycopg.errors.SyntaxError):
-        spec_table.search({"vec": {"$notcontains": []}}, "n", limit=20)
-    # The jsonb path is broken the same way.
-    with pytest.raises(psycopg.errors.SyntaxError):
-        spec_table.search({"data": {"$notcontains": []}}, "n", limit=20)
+def test_notcontains_empty_list_matches_everything(spec_table):
+    # Excluding nothing is no constraint: consistent with $nin [] and the
+    # vacuous-truth reading of "must not contain any entry of []".
+    assert spec_table.search({"vec": {"$notcontains": []}}, "n", limit=20) == list(range(10))
+    assert spec_table.search({"data": {"$notcontains": []}}, "n", limit=20) == list(range(10))
 
 
 # ===========================================================================
@@ -221,12 +214,13 @@ def test_empty_string_key_raises(spec_table):
         spec_table._parse_dict({"": 1})
 
 
-def test_or_given_a_dict_instead_of_list_raises_attributeerror(spec_table):
-    # BUG-ADJACENT (report-only): $or/$and expect a list; handed a dict the
-    # code iterates its keys (strings) and calls _parse_dict on a str, raising
-    # a bare AttributeError rather than a helpful message.  Pinned as-is.
-    with pytest.raises(AttributeError):
+def test_or_given_a_dict_instead_of_list_raises_valueerror(spec_table):
+    # $or/$and take a list of dictionaries; anything else gets a clear error
+    # instead of the bare AttributeError this used to raise.
+    with pytest.raises(ValueError, match="list of dictionaries"):
         spec_table._parse_dict({"$or": {"n": 1}})
+    with pytest.raises(ValueError, match="list of dictionaries"):
+        spec_table._parse_dict({"$and": "nonsense"})
 
 
 def test_unknown_column_and_operator_raise_valueerror(spec_table):
@@ -354,12 +348,13 @@ def test_limit_zero_on_empty_query_returns_empty(spec_table):
     assert info["number"] == 10
 
 
-def test_limit_zero_on_nonempty_query_returns_one_row(spec_table):
-    # BUG-ish (report-only): for an uncached query the SQL prelimit is the
-    # 1000-row count cutoff, not 0, and results = cur.fetchmany(0).  psycopg3's
-    # fetchmany(0) falls back to arraysize (1), so *one* row leaks through even
-    # though the caller asked for zero.  Contrast the empty-query case above.
-    assert spec_table.search({"n": {"$lt": 5}}, "n", limit=0) == [0]
+def test_limit_zero_on_nonempty_query_returns_empty(spec_table):
+    # limit=0 returns no rows even when the SQL prelimit fetched some for
+    # count estimation (psycopg3's fetchmany(0) would fall back to arraysize).
+    assert spec_table.search({"n": {"$lt": 5}}, "n", limit=0) == []
+    info = {}
+    assert spec_table.search({"n": {"$lt": 5}}, "n", limit=0, info=info) == []
+    assert info["number"] == 5
 
 
 def test_offset_past_end_without_info_returns_empty(spec_table):
