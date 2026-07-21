@@ -50,9 +50,9 @@ class PostgresSearchTable(PostgresTable):
           - If 2, projects to all columns (a historical alias for 1, from when tables
             could be split into a search table and an extras table).
           - If 3, as 1 but with id included
-          - If a dictionary, can specify columns to include by giving True values, or columns to exclude by giving False values.
-          - If a list, specifies which columns to include.
-          - If a string, projects onto just that column; searches will return the value rather than a dictionary.
+          - If a dictionary, can specify columns to include by giving True values, or columns to exclude by giving False values.  Entries must be plain columns; path specifiers are not accepted here (they raise the not-a-column error).
+          - If a list, specifies which columns to include.  Entries may be plain columns, array slicers (``vec[2]``) or dotted [path specifiers](#column-part-specifiers) (``data.s``, ``vec.1``), the same forms accepted by joined queries; only the base column is validated, and the entry string is used verbatim as the key of the returned result dictionaries.
+          - If a string, projects onto just that column (which may itself be a slicer or path); searches will return the value rather than a dictionary.
 
         OUTPUT:
 
@@ -110,7 +110,16 @@ class PostgresSearchTable(PostgresTable):
                 projection = [projection]
             include_id = False
             for col in projection:
-                colname = col.split("[", 1)[0]
+                # Determine the base column, matching _column_composable's
+                # validation: for a dotted path the base is the segment before
+                # the first ".", otherwise the name before any array slicer.
+                # The full entry is kept verbatim (as the SELECT expression and
+                # the result-dictionary key); _column_composable revalidates and
+                # builds the SQL at query time.
+                if "." in col:
+                    colname = col.split(".", 1)[0]
+                else:
+                    colname = col.split("[", 1)[0]
                 if colname in self.search_cols:
                     search_cols.append(col)
                 elif col == "id":
@@ -587,7 +596,21 @@ class PostgresSearchTable(PostgresTable):
                 raw = ["id"]
             return sort, has_sort, raw
         else:
-            return self._sort_str(sort), bool(sort), sort
+            # An explicit, user-provided sort.  Unlike the table's default sort
+            # (built once by _sort_str and requiring plain columns), entries here
+            # may be array slicers or dotted paths, so we build each ordering
+            # term with _column_composable.  For a plain column name this emits
+            # the same bare Identifier as _sort_str, and DESC keeps the same
+            # ``DESC NULLS LAST`` form.
+            L = []
+            for col in sort:
+                if isinstance(col, str):
+                    L.append(self._column_composable(col))
+                elif col[1] == 1:
+                    L.append(self._column_composable(col[0]))
+                else:
+                    L.append(SQL("{0} DESC NULLS LAST").format(self._column_composable(col[0])))
+            return SQL(", ").join(L), bool(sort), sort
 
     def _build_query(self, query, limit=None, offset=0, sort=None, raw=None, one_per=None, raw_values=None):
         """
@@ -834,7 +857,7 @@ class PostgresSearchTable(PostgresTable):
                 raise ValueError("raw is not supported with join")
             return self._join_lucky(query, projection, join, offset=offset, sort=sort)
         search_cols = self._parse_projection(projection)
-        cols = SQL(", ").join(map(IdentifierWrapper, search_cols))
+        cols = SQL(", ").join(self._column_composable(c) for c in search_cols)
         qstr, values = self._build_query(query, 1, offset, sort=sort, raw=raw, raw_values=raw_values)
         selecter = SQL("SELECT {0} FROM {1}{2}").format(cols, Identifier(self.search_table), qstr)
         cur = self._execute(selecter, values)
@@ -968,13 +991,21 @@ class PostgresSearchTable(PostgresTable):
         if raw is not None:
             split_ors = False
         if split_ors or one_per:
+            # split_ors and one_per manipulate the fetched records in Python,
+            # keyed by the sort and projection names (extracting sort columns,
+            # DISTINCT ON, merging and re-sorting).  That machinery assumes the
+            # names are plain columns, so path specifiers are not supported here.
+            if any("." in c for c in search_cols):
+                raise ValueError("path specifiers in the projection are not supported with split_ors or one_per")
             # We need to be able to extract the sort columns, so they need to be added
             _, _, raw_sort = self._process_sort(query, limit, offset, sort)
             raw_sort = [((col, 1) if isinstance(col, str) else col) for col in raw_sort]
             sort_cols = [col[0] for col in raw_sort]
+            if any("." in col for col in sort_cols):
+                raise ValueError("path specifiers in the sort are not supported with split_ors or one_per")
             sort_only = tuple(col for col in sort_cols if col not in search_cols)
             search_cols = search_cols + sort_only
-        cols = SQL(", ").join(map(IdentifierWrapper, search_cols))
+        cols = SQL(", ").join(self._column_composable(c) for c in search_cols)
         tbl = Identifier(self.search_table)
         nres = None if (one_per or limit is None) else self.stats.quick_count(query)
 
@@ -1558,7 +1589,7 @@ class PostgresSearchTable(PostgresTable):
                 random.seed(repeatable)
             return random.sample(results, count)
         elif mode in ["SYSTEM", "BERNOULLI"]:
-            cols = SQL(", ").join(map(Identifier, search_cols))
+            cols = SQL(", ").join(self._column_composable(c) for c in search_cols)
             if repeatable is None:
                 repeatable = SQL("")
                 values = [100 * ratio]

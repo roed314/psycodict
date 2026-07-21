@@ -37,6 +37,8 @@ The value associated to a column or column-part can be another dictionary, all o
 
 For columns that have an [array](https://www.postgresql.org/docs/current/arrays.html) or [jsonb](https://www.postgresql.org/docs/current/datatype-json.html) type, you can access a part of the column by appending a path specifier.  For example, to get the `n`th entry of a one dimensional array append `.n` to the name of the column.  In general, a key containing a "." will be interpreted as specifying a path; the first part will be treated as the name of the column, later parts will be translated to `->n` (for jsonb columns) or `[n]` (for array columns).
 
+Path specifiers are also accepted in the projection and sort passed to `search`, `lucky`, `analyze` and `random_sample` (the same forms as in [joined queries](#joined-queries)), so `search({}, ["data.s"], sort=["data.s"])` projects and sorts on the path; the result dictionaries use the projection entries verbatim as keys.  The dictionary form of a projection and the table's default sort order (set by `create_table`/`set_sort`) still require plain columns.
+
 ## Top-level special keys
 
 There are three valid top-level special keys: `$or`, `$and` and `$not`. The first two cases take a list of dictionaries as the value, parse them as full queries, and then join them using `OR` or `AND` respectively.  The last takes a single dictionary as the value and negates the resulting clause.
