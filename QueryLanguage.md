@@ -1,3 +1,4 @@
+# The query language
 
 ## Introduction
 

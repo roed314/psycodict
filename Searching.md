@@ -30,7 +30,7 @@ database and a table variable such as `nf = db.nf_fields`.
 
 - [Stability](#stability)
 - [`search`](#search)
-  - [Parameters](#search-parameters)
+  - [Parameters](#parameters)
   - [Return type: iterator vs. list](#return-type-iterator-vs-list)
   - [Projections](#projections)
   - [Sorting](#sorting)

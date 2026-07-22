@@ -136,3 +136,12 @@ secrets.ini
 # Local database configuration (may contain a password): copy
 # config.ini.example to config.ini and edit.  Should not be committed.
 config.ini
+# Guides copied into docs/ at build time by docs/conf.py
+docs/README.md
+docs/QueryLanguage.md
+docs/Searching.md
+docs/DataManagement.md
+docs/MetadataFormats.md
+docs/Versioning.md
+docs/CONTRIBUTING.md
+docs/SECURITY.md

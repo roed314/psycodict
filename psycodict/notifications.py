@@ -149,7 +149,8 @@ class NotificationListener:
     - ``config`` -- a :class:`~psycodict.config.Configuration`; the
       ``postgresql`` options are used to open the dedicated connection
     - ``channels`` -- a channel name, or an iterable of them (default:
-      ``("psycodict_schema",)``); each is validated and ``LISTEN``ed on
+      ``("psycodict_schema",)``); each is validated and subscribed with
+      ``LISTEN``
     - ``**connect_kwargs`` -- extra keyword arguments passed on to
       ``psycopg.connect`` (e.g. keepalive settings), overriding the
       configuration where they overlap
