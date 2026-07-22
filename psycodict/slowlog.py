@@ -527,6 +527,71 @@ def _percentile(buckets, total, p):
     return buckets[-1][0]
 
 
+class _LeaderPool:
+    """
+    Tracks the (up to) ``cap`` shapes with the largest key seen so far, where
+    each shape's key only ever increases (total time or max duration here).
+    ``members`` is the current set; ``cap=None`` keeps every shape.
+
+    Implemented as a lazy-deletion min-heap by key: a member's key growing
+    pushes a fresh entry, and stale entries (superseded, or for an evicted
+    shape) are discarded when they surface at the top or during ``compact``.
+    """
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.members = set()
+        self._heap = []       # (key, seq, shape); may hold stale entries
+        self._live = {}       # shape -> seq of its current (live) heap entry
+        self._seq = 0
+
+    def _push(self, shape, key):
+        self._seq += 1
+        self._live[shape] = self._seq
+        heappush(self._heap, (key, self._seq, shape))
+
+    def _purge_stale(self):
+        while self._heap:
+            _, seq, shape = self._heap[0]
+            if shape in self.members and self._live.get(shape) == seq:
+                break
+            heappop(self._heap)
+
+    def offer(self, shape, key):
+        """
+        Record that ``shape`` now has this key; return the shape evicted to
+        make room, or None.  ``members`` is updated in place.
+        """
+        if self.cap is None:
+            self.members.add(shape)
+            return None
+        if shape in self.members:
+            self._push(shape, key)
+            return None
+        if len(self.members) < self.cap:
+            self.members.add(shape)
+            self._push(shape, key)
+            return None
+        self._purge_stale()
+        if self._heap and key >= self._heap[0][0]:
+            evicted = heappop(self._heap)[2]
+            self.members.discard(evicted)
+            self._live.pop(evicted, None)
+            self.members.add(shape)
+            self._push(shape, key)
+            return evicted
+        return None
+
+    def compact(self):
+        # Keep the heap O(cap) by dropping accumulated stale entries.
+        if self.cap is not None and len(self._heap) > 4 * self.cap + 64:
+            self._heap = [
+                (key, seq, shape) for (key, seq, shape) in self._heap
+                if shape in self.members and self._live.get(shape) == seq
+            ]
+            heapify(self._heap)
+
+
 def slow_query_report(logfile, top=20, cutoff=None, db=None):
     """
     Analyze a slow-query log file, grouping queries by shape.
@@ -584,13 +649,16 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
     This dictionary grows with the number of DISTINCT shapes -- bounded in
     practice by the variety of queries the application issues, not by the
     length of the log.  The large per-shape strings (``example`` and
-    ``replicate``), by contrast, are retained only for a candidate set of
-    about ``4 * top`` shapes, the current leaders by total time; when a
-    shape drops out of the candidate set its example is discarded, and if
-    it later climbs back the next record of that shape refills it.  The
-    example of a reported shape is therefore the slowest of the records
-    that arrived while the shape was retained -- normally, but not always,
-    its globally slowest record.  Every reported shape has an example, and
+    ``replicate``), by contrast, are retained only for a bounded candidate
+    set: the current leaders by total time (up to ``4 * top`` shapes)
+    together with the current leaders by max duration (up to another
+    ``4 * top``), so that both the by-total and the by-mean rankings have
+    reproducible examples.  When a shape drops out of both pools its example
+    is discarded, and if it later climbs back the next record of that shape
+    refills it.  The example of a reported shape is therefore the slowest of
+    the records that arrived while the shape was retained -- normally, but
+    not always, its globally slowest record.  Every reported shape has an
+    example, and
     with ``top=None`` all shapes retain theirs.
     """
     stats = {}
@@ -600,13 +668,14 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
     total_time = 0.0
     max_duration = None
     # Example retention (see the docstring): full example/replicate strings
-    # are kept only for the ``cap`` current leaders by total time.  Each
-    # retaining shape has exactly one live entry in ``heap`` (marked by its
-    # ``_seq``); older entries are stale and dropped when encountered.
+    # are kept only for a bounded candidate set -- the ``cap`` current leaders
+    # by total time (for the by-total ranking) UNION the ``cap`` leaders by
+    # max duration (so the rare, very slow shapes that top the by-mean ranking
+    # are reproducible too).  A shape keeps its example while it is in either
+    # pool.
     cap = None if top is None else 4 * top
-    holders = set()  # shapes currently retaining an example
-    heap = []  # (total at push time, seq, shape)
-    seq = 0
+    pool_total = _LeaderPool(cap)
+    pool_max = _LeaderPool(cap)
     for rec in parse_slow_log(logfile, stats=stats):
         records += 1
         duration = rec["duration"]
@@ -643,46 +712,27 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
             data["tables"].add(rec["table"])
         if duration > data["max"]:
             data["max"] = duration
-        if shape in holders:
-            if duration >= data["_exdur"]:
-                # the example and its replicate hint always come from the
-                # same record: a slower record without a hint replaces both
+        # Offer the shape to both retention pools (by total, by max); a shape
+        # keeps its example while it is a member of either.  A shape evicted
+        # from one pool loses its example only if it is not in the other.
+        evicted_total = pool_total.offer(shape, data["total"])
+        evicted_max = pool_max.offer(shape, data["max"])
+        for evicted in (evicted_total, evicted_max):
+            if (evicted is not None
+                    and evicted not in pool_total.members
+                    and evicted not in pool_max.members):
+                ev = shapes[evicted]
+                ev["example"] = ev["replicate"] = None
+                ev.pop("_exdur", None)
+        if shape in pool_total.members or shape in pool_max.members:
+            # Fill on first admission, and thereafter keep the slowest record
+            # (its example and replicate hint always come from one record).
+            if "_exdur" not in data or duration >= data["_exdur"]:
                 data["example"] = rec["query"]
                 data["replicate"] = rec["replicate"]
                 data["_exdur"] = duration
-            if cap is not None:
-                seq += 1
-                data["_seq"] = seq
-                heappush(heap, (data["total"], seq, shape))
-        else:
-            admit = cap is None or len(holders) < cap
-            if not admit and cap:
-                # drop heap entries no longer describing a retained shape
-                while heap:
-                    _, seq0, shape0 = heap[0]
-                    if shape0 in holders and seq0 == shapes[shape0]["_seq"]:
-                        break
-                    heappop(heap)
-                if heap and data["total"] >= heap[0][0]:
-                    _, _, evicted = heappop(heap)
-                    holders.discard(evicted)
-                    ev = shapes[evicted]
-                    ev["example"] = ev["replicate"] = None
-                    del ev["_exdur"], ev["_seq"]
-                    admit = True
-            if admit:
-                holders.add(shape)
-                data["example"] = rec["query"]
-                data["replicate"] = rec["replicate"]
-                data["_exdur"] = duration
-                if cap is not None:
-                    seq += 1
-                    data["_seq"] = seq
-                    heappush(heap, (data["total"], seq, shape))
-        if cap is not None and len(heap) > 4 * cap + 64:
-            # compact the stale entries away, keeping the heap O(cap)
-            heap = [(shapes[s]["total"], shapes[s]["_seq"], s) for s in holders]
-            heapify(heap)
+        pool_total.compact()
+        pool_max.compact()
 
     considered = records - skipped
     buckets = sorted((value, counts[0]) for value, counts in histogram.items())
@@ -714,10 +764,9 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
     # Two rankings of the same per-shape aggregates: by total time (the biggest
     # cumulative cost) and by mean time (the slowest per call, regardless of how
     # often it ran).  Among shapes tied on the sort key, prefer those retaining
-    # an example.  Example/replicate strings are retained for the total-time
-    # leaders (see the docstring), so a shape that ranks high on mean only
-    # because of a rare very slow call may have no example -- its aggregates
-    # still appear.
+    # an example.  Examples are retained for the leaders by total AND by max
+    # duration (see the docstring), so the by-mean leaders -- the rare, very
+    # slow shapes -- are reproducible too.
     top_shapes = sorted(
         shapes.values(), key=lambda data: (-data["total"], data["example"] is None)
     )[:top]

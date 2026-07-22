@@ -518,6 +518,33 @@ def test_shapes_by_mean_ranking(tmp_path):
         assert "_exdur" not in d and "_seq" not in d
 
 
+def test_mean_leader_keeps_example_via_max_retention(tmp_path):
+    # A rare, very slow shape tops the mean ranking but not the total ranking,
+    # so the total-time retention pool would drop its example.  The max-time
+    # pool keeps it, so the by-mean entry is still reproducible.
+    logfile = str(tmp_path / "rareslow.log")
+    with open(logfile, "w") as F:
+        def q(tbl, nval, dur):
+            F.write('2020-01-01 12:00:00,000 - SELECT "x" FROM "%s" WHERE "n" = %d ran in %ss\n'
+                    % (tbl, nval, dur))
+        q("rareslow", 1, "30.0")            # 1 call, total 30, max 30
+        for f in range(6):                  # 6 shapes, total 40 each, max 2
+            for i in range(20):
+                q("fill%d" % f, i, "2.0")
+
+    report = slow_query_report(logfile, top=1)  # cap = 4 per pool
+    by_total = report["shapes"]
+    by_mean = report["shapes_by_mean"]
+    # the total ranking leads with a frequent "fill" shape, not rareslow
+    assert by_total[0]["tables"][0].startswith("fill")
+    assert "rareslow" not in {d["tables"][0] for d in by_total}
+    # the mean ranking leads with rareslow -- and it kept its example, because
+    # its max duration made it a max-pool leader even though its total did not
+    bm = by_mean[0]
+    assert bm["tables"] == ["rareslow"] and bm["count"] == 1 and bm["max"] == 30.0
+    assert bm["example"] == 'SELECT "x" FROM "rareslow" WHERE "n" = 1'
+
+
 def test_example_replicate_atomic(tmp_path):
     # The example and its replicate hint must always come from the same
     # record: when a hintless slower record replaces a hinted faster one,
