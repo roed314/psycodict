@@ -55,6 +55,38 @@ notifications sent while it was disconnected are, per PostgreSQL semantics,
 lost -- ``LISTEN`` only receives notifications sent after it was issued).
 Keeping v1 free of silent auto-reconnect magic makes that loss visible to the
 caller rather than hiding it.
+
+Forking
+-------
+
+A listener, like any libpq connection, must not be used across ``fork()``:
+parent and child would share one socket, so each would receive an
+unpredictable subset of the notification stream, and an explicit ``close()``
+in either process sends a protocol Terminate message over the shared socket,
+killing the other process's subscription as well.  Create each listener in
+the process that will poll it -- under a pre-forking web server (e.g.
+``gunicorn --preload``) that means each worker builds its own listener after
+the fork, for example lazily on first use, with ``os.getpid()`` recorded at
+creation time to detect an inherited one.  A process that does find itself
+holding a listener from before a fork should simply abandon the object: drop
+the reference *without* calling ``close``.  That is safe -- psycopg
+deliberately skips the protocol shutdown when a connection object is
+garbage-collected in a process other than the one that created it, precisely
+to protect the parent's copy.
+
+Hot standbys
+------------
+
+Notifications do not traverse replication.  ``NOTIFY`` is not WAL-logged, so
+nothing is delivered on physical replicas (nor by logical replication, which
+publishes only data changes); moreover a server in recovery refuses the
+subscription itself -- ``LISTEN`` raises ``cannot execute LISTEN during
+recovery`` (SQLSTATE ``25006``), so building a listener against a hot
+standby fails outright.  Treat that error as permanent for the server rather
+than retrying: a process whose queries go to a standby must fall back to
+refreshing on a schedule or on error, or subscribe on the primary (bearing
+in mind that a notification can then arrive before the corresponding change
+has replayed on the standby).
 """
 import re
 
@@ -107,6 +139,10 @@ class NotificationListener:
         with db.listener() as listener:
             for channel, payload in listener.listen(timeout=60):
                 ...
+
+    A listener is bound to the process that created it and cannot subscribe
+    on a server in recovery; see *Forking* and *Hot standbys* in the module
+    docstring before using one in a forking application or against a replica.
 
     INPUT:
 

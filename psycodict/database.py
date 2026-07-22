@@ -1701,6 +1701,11 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         plumbing here without depending on it, so the two can land in either
         order.
 
+        Under a pre-forking web server each worker must build its own listener
+        after the fork, and a server in recovery (a hot standby) refuses
+        ``LISTEN`` outright; see the *Forking* and *Hot standbys* sections of
+        :mod:`psycodict.notifications`.
+
         INPUT:
 
         - ``channels`` -- a channel name or iterable of them; ``None`` (default)
