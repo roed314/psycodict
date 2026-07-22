@@ -85,14 +85,20 @@ it never reads them.
 > has created or migrated (format ≥ 1).**  If it has already happened, what is
 > recoverable depends on which paths the pre-1.0 client ran.  Its
 > `restore_index` only rebuilds the physical index, leaving the predicate
-> recorded in `meta_indexes`: drop the wrongly-full index, then run
+> recorded in `meta_indexes`: drop the wrongly-full index -- with plain SQL
+> (`DROP INDEX`) or `drop_index(name, permanent=False)`, **not** the default
+> `drop_index(name)`, whose `permanent=True` deletes the metadata row,
+> predicate and all, and leaves nothing for the rebuild -- then run
 > `restore_index` from a 1.0 client to rebuild it correctly.  (Restoring
 > without dropping first keeps the bad index behind under a `_depN` name --
 > and a unique index kept that way still over-constrains writes.)  The
 > pre-1.0 metadata *reload and revert* paths, however, rewrite the
 > `meta_indexes` rows with the six pre-1.0 columns, destroying the recorded
 > predicate -- after that the partial index cannot be reconstructed from the
-> database itself, only from a metadata backup (see *Rolling back* below).  This matters only during a
+> database itself, only from a `meta_indexes` backup or `copy_to_indexes`
+> export taken *after* the partial index was created.  (The pre-migration
+> backup of *Rolling back* below cannot help here: it predates the
+> `whereclause` column, so it never contained the predicate.)  This matters only during a
 > mixed-version rollout; once every process has been upgraded to 1.0+ there is
 > nothing to watch for.  (The alternative — leaving a tombstone in the old
 > `meta_version` table so pre-1.0 clients refuse — was declined in favor of the
@@ -125,8 +131,9 @@ pg_dump -F c -f pre_migration.dump $DBNAME
 ```
 
 To roll back, recreate the database from the dump — restoring over the
-existing database would stop on existing-object errors and leave the new
-`meta_format` stamp in place:
+existing database does not work: `pg_restore` hits existing-object errors
+(and by default keeps going past them, leaving a half-restored mixture)
+with the new `meta_format` stamp still in place:
 
 ```sh
 pg_restore -d postgres --clean --create --exit-on-error pre_migration.dump
@@ -134,10 +141,13 @@ pg_restore -d postgres --clean --create --exit-on-error pre_migration.dump
 #               && pg_restore -d $DBNAME pre_migration.dump
 ```
 
-run as a role allowed to drop and recreate the database.  **This restores the
-whole database to the moment of the dump — application data included** — so
-quiesce writes for the migration window and roll back immediately or not at
-all.
+run as a role allowed to drop and recreate the database.  Dropping a
+database requires that **no one is connected to it** — stop every client
+first (psycodict connections are long-lived); `dropdb --force` terminates
+lingering sessions, while `pg_restore --clean` has no equivalent, so with
+that form close them beforehand.  **This restores the whole database to the
+moment of the dump — application data included** — so quiesce writes for the
+migration window and roll back immediately or not at all.
 
 If writes cannot be stopped or lost, the surgical variant is to back up only
 the six meta tables:
@@ -150,7 +160,11 @@ pg_dump -F c -f pre_migration_meta.dump \
 ```
 
 and to roll back by replacing them, leaving the application tables (and any
-writes since the dump) untouched:
+committed writes since the dump) untouched.  This still needs a brief pause
+of every psycodict client: the tables are dropped and restored in separate
+commands, and a client active in between sees missing relations.  The
+difference from the whole-database restore is what survives the pause --
+here every write made since the dump -- not that clients can stay connected:
 
 ```sh
 psql -c 'DROP TABLE meta_tables, meta_tables_hist, meta_indexes,
