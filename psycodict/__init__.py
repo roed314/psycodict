@@ -3,26 +3,32 @@
 This module provides an interface to Postgres supporting
 the kinds of queries needed by the LMFDB.
 
+The examples in this package's docstrings are real transcripts, run as
+doctests by ``tests/test_doctests.py`` against two small tables of LMFDB
+data that it creates: ``test_fields`` (22 selected number fields of
+degree at most 3) and ``test_curves`` (a dozen elliptic curves over three
+of those fields).
+
 EXAMPLES::
 
-    sage: from lmfdb import db
-    sage: db
+    >>> from psycodict.database import PostgresDatabase
+    >>> db = PostgresDatabase()  # configuration found via $PSYCODICT_CONFIG / config.ini
+    >>> db
     Interface to Postgres database
-    sage: len(db.tablenames)
-    53
-    sage: db.tablenames[0]
-    'artin_field_data'
-    sage: db.artin_field_data
-    Interface to Postgres table artin_field_data
+    >>> 'test_fields' in db.tablenames
+    True
+    >>> nf = db.test_fields
+    >>> nf
+    Interface to Postgres table test_fields
 
 You can search using the methods ``search``, ``lucky`` and ``lookup``::
 
-    sage: G = db.gps_groups.lookup('8.2')
-    sage: G['exponent']
-    4
-
-- ``count_table`` -- a string or None.  If provided, gives the name of a table that caches counts for searches on the search table.  These counts are relevant when many results are returned, allowing the search pages to report the number of records even when it would take Postgres a long time to compute this count.
-
+    >>> nf.lookup('2.0.23.1', 'class_number')
+    3
+    >>> nf.lucky({'degree': 2, 'disc_sign': 1, 'disc_abs': 5}, projection=0)
+    '2.2.5.1'
+    >>> list(nf.search({'ramps': {'$contains': [2]}}, projection=0))
+    ['2.0.4.1', '2.0.8.1', '2.2.8.1', '2.2.12.1', '3.1.44.1', '3.1.76.1']
 """
 
 # Single source of truth for the package version: pyproject.toml reads it via

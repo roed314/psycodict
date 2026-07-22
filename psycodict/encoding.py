@@ -137,7 +137,7 @@ def numeric_precision(value):
 
     EXAMPLES::
 
-        sage: numeric_precision("0.00459244230167")  # 12 significant digits
+        >>> numeric_precision("0.00459244230167")  # 12 significant digits
         40
     """
     digits = len(value.lstrip("+-").replace(".", "", 1).lstrip("0"))

@@ -89,24 +89,23 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: ec = db.ec_padic
-            sage: ec._parse_projection(0)
+            >>> nf = db.test_fields
+            >>> nf._parse_projection(0)
             ('label',)
-            sage: ec._parse_projection(1)
-            ('lmfdb_iso', 'p', 'prec', 'val', 'unit')
-            sage: ec._parse_projection({"val":True, "unit":True})
-            ('val', 'unit')
+            >>> nf._parse_projection(1)
+            ('class_group', 'class_number', 'degree', 'disc_abs', 'disc_sign', 'label', 'r2', 'ramps')
+            >>> nf._parse_projection({"degree": True, "class_number": True})
+            ('class_number', 'degree')
 
         If you want the "id" column, you can list it explicitly::
 
-            sage: ec._parse_projection(["id", "lmfdb_iso"])
-            ('id', 'lmfdb_iso')
+            >>> nf._parse_projection(["id", "label", "ramps"])
+            ('id', 'label', 'ramps')
 
-        You can specify a dictionary with columns to exclude:
+        You can specify a dictionary with columns to exclude::
 
-            sage: ec._parse_projection({"prec":False})
-            ('lmfdb_iso', 'p', 'val', 'unit')
+            >>> nf._parse_projection({"class_group": False})
+            ('class_number', 'degree', 'disc_abs', 'disc_sign', 'label', 'r2', 'ramps')
         """
         search_cols = []
         if projection == 0:
@@ -296,21 +295,17 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: statement, vals = db.nf_fields._parse_special("$lte", 5, "degree")
-            ('"degree" <= %s', [5])
-            sage: statement, vals = db.nf_fields._parse_special("$or", [{"degree":{"$lte":5}},{"class_number":{"$gte":3}}], None)
-            sage: statement.as_string(db.conn), vals
-            ('("degree" <= %s OR "class_number" >= %s)', [5, 3])
-            sage: statement, vals = db.nf_fields._parse_special("$or", [{"$lte":5}, {"$gte":10}], "degree")
-            sage: statement.as_string(db.conn), vals
-            ('("degree" <= %s OR "degree" >= %s)', [5, 10])
-            sage: statement, vals = db.nf_fields._parse_special("$and", [{"$gte":5}, {"$lte":10}], "degree")
-            sage: statement.as_string(db.conn), vals
-            ('("degree" >= %s AND "degree" <= %s)', [5, 10])
-            sage: statement, vals = db.nf_fields._parse_special("$contains", [2,3,5], "ramps")
-            sage: statement.as_string(db.conn), vals
-            ('"ramps" @> %s', [[2, 3, 5]])
+            >>> from psycodict import Identifier
+            >>> nf = db.test_fields
+            >>> statement, vals = nf._parse_special("$lte", 3, Identifier("degree"), "smallint")
+            >>> statement.as_string(db.conn), vals
+            ('"degree" <= %s', [3])
+            >>> statement, vals = nf._parse_special("$or", [{"degree": {"$lte": 2}}, {"class_number": {"$gte": 3}}], None, None)
+            >>> statement.as_string(db.conn), vals
+            ('("degree" <= %s OR "class_number" >= %s)', [2, 3])
+            >>> statement, vals = nf._parse_special("$contains", [2, 3], Identifier("ramps"), "integer[]")
+            >>> statement.as_string(db.conn), vals
+            ('"ramps" @> %s::integer[]', [[2, 3]])
         """
         if col_type is not None and col_type.endswith("[]"):
             # SQL does not correctly parse the =ANY(...) construction with array types, so we convert to an equivalent OR construction
@@ -534,13 +529,11 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: db.nf_fields._parse_dict({})
-            []
-            sage: db.lfunc_lfunctions._parse_values({'bad_lfactors':[1,2]})[1][0]
-            '[1, 2]'
-            sage: db.char_dirichlet._parse_values({'modulus':3})
+            >>> nf = db.test_fields
+            >>> nf._parse_values({'degree': 3})
             [3]
+            >>> nf._parse_values({'class_group': [3]})
+            [Json([3])]
         """
 
         # None stays None even for jsonb columns, so that it is stored as SQL
@@ -573,17 +566,17 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: statement, vals = db.nf_fields._parse_dict({"degree":2, "class_number":6})
-            sage: statement.as_string(db.conn), vals
-            ('"class_number" = %s AND "degree" = %s', [6, 2])
-            sage: statement, vals = db.nf_fields._parse_dict({"degree":{"$gte":4,"$lte":8}, "r2":1})
-            sage: statement.as_string(db.conn), vals
-            ('"r2" = %s AND "degree" <= %s AND "degree" >= %s', [1, 8, 4])
-            sage: statement, vals = db.nf_fields._parse_dict({"degree":2, "$or":[{"class_number":1,"r2":0},{"disc_sign":1,"disc_abs":{"$lte":10000},"class_number":{"$lte":8}}]})
-            sage: statement.as_string(db.conn), vals
-            ('("class_number" = %s AND "r2" = %s OR "disc_sign" = %s AND "class_number" <= %s AND "disc_abs" <= %s) AND "degree" = %s', [1, 0, 1, 8, 10000, 2])
-            sage: db.nf_fields._parse_dict({})
+            >>> nf = db.test_fields
+            >>> statement, vals = nf._parse_dict({"degree": 2, "class_number": 3})
+            >>> statement.as_string(db.conn), vals
+            ('"degree" = %s AND "class_number" = %s', [2, 3])
+            >>> statement, vals = nf._parse_dict({"degree": {"$gte": 2, "$lte": 3}, "r2": 1})
+            >>> statement.as_string(db.conn), vals
+            ('"degree" >= %s AND "degree" <= %s AND "r2" = %s', [2, 3, 1])
+            >>> statement, vals = nf._parse_dict({"degree": 2, "$or": [{"class_number": 1, "r2": 0}, {"disc_sign": 1, "disc_abs": {"$lte": 10}}]})
+            >>> statement.as_string(db.conn), vals
+            ('"degree" = %s AND ("class_number" = %s AND "r2" = %s OR "disc_sign" = %s AND "disc_abs" <= %s)', [2, 1, 0, 1, 10])
+            >>> nf._parse_dict({})
             (None, None)
         """
         if outer is not None and not isinstance(D, dict):
@@ -777,22 +770,22 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: statement, vals = db.nf_fields._build_query({"degree":2, "class_number":6})
-            sage: statement.as_string(db.conn), vals
-            (' WHERE "class_number" = %s AND "degree" = %s ORDER BY "degree", "disc_abs", "disc_sign", "label"', [6, 2])
-            sage: statement, vals = db.nf_fields._build_query({"class_number":1}, 20)
-            sage: statement.as_string(db.conn), vals
-            (' WHERE "class_number" = %s ORDER BY "id" LIMIT %s', [1, 20])
+            >>> nf = db.test_fields
+            >>> statement, vals = nf._build_query({"degree": 2, "class_number": 3})
+            >>> statement.as_string(db.conn), vals
+            (' WHERE "degree" = %s AND "class_number" = %s ORDER BY "degree", "disc_abs", "label"', [2, 3])
+            >>> statement, vals = nf._build_query({"class_number": 1}, 4)
+            >>> statement.as_string(db.conn), vals
+            (' WHERE "class_number" = %s ORDER BY "degree", "disc_abs", "label" LIMIT %s', [1, 4])
 
         A ``raw_values`` list passed in by the caller is not mutated, even
         though the limit and offset are appended to the returned values::
 
-            sage: raw_values = []
-            sage: statement, vals = db.nf_fields._build_query({}, 20, raw="degree = 2", raw_values=raw_values)
-            sage: statement.as_string(db.conn), vals
-            (' WHERE degree = 2 ORDER BY "degree", "disc_abs", "disc_sign", "iso_number" LIMIT %s', [20])
-            sage: raw_values
+            >>> raw_values = []
+            >>> statement, vals = nf._build_query({}, 4, raw="degree = 2", raw_values=raw_values)
+            >>> statement.as_string(db.conn), vals
+            (' WHERE degree = 2 ORDER BY "degree", "disc_abs", "label" LIMIT %s', [4])
+            >>> raw_values
             []
         """
         if raw_values is None:
@@ -968,27 +961,20 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: nf = db.nf_fields
-            sage: nf.lucky({'degree':int(2),'disc_sign':int(1),'disc_abs':int(5)},projection=0)
+            >>> nf = db.test_fields
+            >>> nf.lucky({'degree': 2, 'disc_sign': 1, 'disc_abs': 5}, projection=0)
             '2.2.5.1'
-            sage: nf.lucky({'label':'6.6.409587233.1'},projection=1)
+            >>> nf.lucky({'label': '3.3.49.1'})
             {'class_group': [],
              'class_number': 1,
-             'cm': False,
-             'coeffs': [2, -31, 30, 11, -13, -1, 1],
-             'degree': 6,
-             'disc_abs': 409587233,
-             'disc_rad': 409587233,
+             'degree': 3,
+             'disc_abs': 49,
              'disc_sign': 1,
-             'galt': 16,
-             'label': '6.6.409587233.1',
-             'oldpolredabscoeffs': None,
+             'label': '3.3.49.1',
              'r2': 0,
-             'ramps': [11, 53, 702551],
-             'used_grh': False}
-            sage: nf.lucky({'label':'6.6.409587233.1'},projection=['regulator'])
-            {'regulator':455.191694993}
+             'ramps': [7]}
+            >>> nf.lucky({'label': '2.0.47.1'}, projection='class_group')
+            [5]
         """
         if join is not None:
             if raw is not None or raw_values is not None:
@@ -1076,41 +1062,32 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: nf = db.nf_fields
-            sage: info = {}
-            sage: nf.search({'degree':int(2),'class_number':int(1),'disc_sign':int(-1)}, projection=0, limit=4, info=info)
+            >>> nf = db.test_fields
+            >>> info = {}
+            >>> nf.search({'degree': 2, 'disc_sign': -1}, projection=0, limit=4, info=info)
             ['2.0.3.1', '2.0.4.1', '2.0.7.1', '2.0.8.1']
-            sage: info['number'], info['exact_count']
-            (9, True)
-            sage: info = {}
-            sage: nf.search({'degree':int(6)}, projection=['label','class_number','galt'], limit=4, info=info)
-            [{'class_number': 1, 'galt': 5, 'label': '6.0.9747.1'},
-             {'class_number': 1, 'galt': 11, 'label': '6.0.10051.1'},
-             {'class_number': 1, 'galt': 11, 'label': '6.0.10571.1'},
-             {'class_number': 1, 'galt': 5, 'label': '6.0.10816.1'}]
-            sage: info['number'], info['exact_count']
-            (5522600, True)
-            sage: info = {}
-            sage: nf.search({'ramps':{'$contains':[int(2),int(7)]}}, limit=4, info=info)
-            [{'label': '2.2.28.1', 'ramps': [2, 7]},
-             {'label': '2.0.56.1', 'ramps': [2, 7]},
-             {'label': '2.2.56.1', 'ramps': [2, 7]},
-             {'label': '2.0.84.1', 'ramps': [2, 3, 7]}]
-            sage: info['number'], info['exact_count']
-            (1000, False)
+            >>> info['number'], info['exact_count']
+            (8, True)
+
+        Without a limit, an iterator is returned::
+
+            >>> list(nf.search({'degree': 3, 'r2': 0}, projection=['label', 'disc_abs', 'ramps']))
+            [{'label': '3.3.49.1', 'disc_abs': 49, 'ramps': [7]},
+             {'label': '3.3.81.1', 'disc_abs': 81, 'ramps': [3]}]
+            >>> list(nf.search({'ramps': {'$contains': [2]}}, projection=0))
+            ['2.0.4.1', '2.0.8.1', '2.2.8.1', '2.2.12.1', '3.1.44.1', '3.1.76.1']
 
         Columns of other tables can be searched on and projected onto by
         joining the tables::
 
-            sage: db.ec_nfcurves.search(
-            ....:     {"rank": 1, "nf_fields.r2": 1},
-            ....:     ["label", "nf_fields.degree"],
-            ....:     join=[("field_label", "nf_fields.label")],
-            ....:     limit=3)
-            [{'label': '2.0.1003.1-9.1-c1', 'nf_fields.degree': 2},
-             {'label': '2.0.1003.1-9.1-c2', 'nf_fields.degree': 2},
-             {'label': '2.0.1003.1-9.1-d1', 'nf_fields.degree': 2}]
+            >>> db.test_curves.search(
+            ...     {"rank": 1, "test_fields.degree": 2},
+            ...     ["label", "test_fields.disc_abs"],
+            ...     join=[("field_label", "test_fields.label")],
+            ...     limit=3)
+            [{'label': '2.2.13.1-51.2-a1', 'test_fields.disc_abs': 13},
+             {'label': '2.2.13.1-51.2-a2', 'test_fields.disc_abs': 13},
+             {'label': '2.2.13.1-51.3-a1', 'test_fields.disc_abs': 13}]
         """
         if join is not None:
             if raw is not None or raw_values is not None:
@@ -1574,14 +1551,16 @@ class PostgresSearchTable(PostgresTable):
 
         A dictionary with keys the column names requested by the projection.
 
-        Note, the example below uses loc_algebras which is no longer a column
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: nf = db.nf_fields
-            sage: rec = nf.lookup('8.0.374187008.1')
-            sage: rec['loc_algebras']['13']
-            'x^2-13,x^2-x+2,x^4+x^2-x+2'
+            >>> nf = db.test_fields
+            >>> rec = nf.lookup('2.0.23.1')
+            >>> rec['class_number'], rec['class_group']
+            (3, [3])
+            >>> nf.lookup('2.0.47.1', 'class_number')
+            5
+            >>> nf.lookup('4.0.117.1') is None
+            True
         """
         if label_col is None:
             label_col = self._label_col
@@ -1604,10 +1583,11 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: nf = db.nf_fields
-            sage: nf.exists({'class_number':int(7)})
+            >>> nf = db.test_fields
+            >>> nf.exists({'class_number': 5})
             True
+            >>> nf.exists({'degree': 4})
+            False
         """
         return self.lucky(query, projection="id") is not None
 
@@ -1655,10 +1635,10 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: nf = db.nf_fields
-            sage: nf.random()
-            '2.0.294787.1'
+            >>> nf = db.test_fields
+            >>> label = nf.random()
+            >>> nf.label_exists(label)
+            True
         """
         if pick_first:
             colvals = self.distinct(pick_first, query)
@@ -1822,9 +1802,10 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: db.nf_fields.max('class_number')
-            1892503075117056
+            >>> db.test_fields.max('disc_abs')
+            87
+            >>> db.test_fields.max('disc_abs', {'degree': 2})
+            47
         """
         return self.stats.max(col, constraint)
 
@@ -1839,9 +1820,8 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: db.ec_mwbsd.min('area')
-            0.00000013296713869846309987200099760
+            >>> db.test_fields.min('disc_abs')
+            1
         """
         return self.stats.min(col, constraint)
 
@@ -1891,10 +1871,13 @@ class PostgresSearchTable(PostgresTable):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: nf = db.nf_fields
-            sage: nf.count({'degree':int(6),'galt':int(7)})
-            244006
+            >>> nf = db.test_fields
+            >>> nf.count({'degree': 2})
+            12
+            >>> nf.count()
+            22
+            >>> sorted(nf.count({'disc_sign': -1}, groupby=['degree']).items())
+            [((2,), 8), ((3,), 7)]
         """
         if join is not None:
             if groupby is not None:

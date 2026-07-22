@@ -114,43 +114,52 @@ class PostgresStatsTable(PostgresBase):
     but they hopefully provide an example of how to add statistics that can be generalized to
     other tables.
 
-    Adding statistics on torsion structure::
+    Adding statistics on degree::
 
-        sage: db.ec_nfcurves.stats.add_stats(['torsion_structure'])
+        >>> nf = db.test_fields
+        >>> nf.stats.add_stats(['degree'])
+        True
 
-    This make counts available::
+    This makes counts available::
 
-        sage: db.ec_nfcurves.stats.quick_count({'torsion_structure': [2,4]})
-        5100
-        sage: torsion_structures = db.ec_nfcurves.stats.column_counts('torsion_structure')
-        sage: torsion_structures[4,4]
-        14
+        >>> nf.stats.quick_count({'degree': 2})
+        12
+        >>> degrees = nf.stats.column_counts('degree')
+        >>> degrees[3]
+        9
 
-    Adding statistics on norm_conductor, grouped by signature::
+    Adding numerical statistics on disc_abs, grouped by degree::
 
-        sage: db.ec_nfcurves.stats.add_numstats('norm_conductor', ['signature'])
+        >>> nf.stats.add_numstats('disc_abs', ['degree'])
 
     Once added, we can later retrieve the statistics::
 
-        sage: normstats = db.ec_nfcurves.stats.numstats('conductor_norm', ['signature'])
+        >>> dstats = nf.stats.numstats('disc_abs', ['degree'])
 
-    And find the maximum conductor norm for a curve in the LMFDB over a totally real cubic field::
+    And find the largest absolute discriminant of a cubic field in the table::
 
-        sage: normstats[3,0]['max']
-        2059
+        >>> dstats[3,]['max']
+        87
 
     You can also find this directly, but if you need the same kind of statistic many times
     then the ``numstats`` method will be faster::
 
-        sage: db.ec_nfcurves.stats.max('conductor_norm', {'signature': [3,0]})
-        2059
+        >>> nf.stats.max('disc_abs', {'degree': 3})
+        87
 
-    You can see what additional counts are stored using the ``extra_counts`` method::
+    Counts recorded outside an ``add_stats`` call (for example by search
+    pages displaying the number of results) are "extra" counts; recording
+    them is opt-in, requiring ``saving`` on the stats table and
+    ``record=True`` in the call.  You can see what extra counts are stored
+    using the ``extra_counts`` method::
 
-        sage: list(db.mf_newforms.stats.extra_counts())[0]
-        ('dim',)
-        sage: db.mf_newforms.stats.extra_counts()[('dim',)]
-        [(({'$gte': 10, '$lte': 20},), 39288)]
+        >>> nf.stats.saving = True
+        >>> nf.stats.count({'class_number': 3}, record=True)
+        1
+        >>> sorted(nf.stats.extra_counts())
+        [('class_number',)]
+        >>> nf.stats.extra_counts()[('class_number',)]
+        [((3,), 1)]
 
     SCHEMA:
 
@@ -206,16 +215,17 @@ class PostgresStatsTable(PostgresBase):
 
     EXAMPLES::
 
-        sage: db.mf_newforms.stats.add_bucketed_counts(['level', 'weight'], {'level': ['1','2-10','11-100','101-1000','1001-2000', '2001-4000','4001-6000','6001-8000','8001-10000'], 'weight': ['1','2','3','4','5-8','9-16','17-32','33-64','65-316']})
+        >>> nf = db.test_fields
+        >>> nf.stats.add_bucketed_counts(['disc_abs'], {'disc_abs': ['1-9', '10-49', '50-90']})
 
     You can now count certain ranges::
 
-        sage: db.mf_newforms.stats.quick_count({'level':{'$gte':101, '$lte':1000}, 'weight':4})
-        12281
+        >>> nf.stats.quick_count({'disc_abs': {'$gte': 10, '$lte': 49}})
+        10
 
     But only those specified by the buckets::
 
-        sage: db.mf_newforms.stats.quick_count({'level':{'$gte':201, '$lte':800}, 'weight':2}) is None
+        >>> nf.stats.quick_count({'disc_abs': {'$gte': 20, '$lte': 40}}) is None
         True
 
     INPUT:
@@ -490,10 +500,9 @@ class PostgresStatsTable(PostgresBase):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: nf = db.nf_fields
-            sage: nf.stats.count({'degree':int(6),'galt':int(7)})
-            244006
+            >>> nf = db.test_fields
+            >>> nf.stats.count({'degree': 2, 'r2': 1})
+            8
         """
         if groupby is None:
             nres = self.quick_count(query)
@@ -816,9 +825,8 @@ class PostgresStatsTable(PostgresBase):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: db.nf_fields.stats.max('class_number')
-            1892503075117056
+            >>> db.test_fields.stats.max('class_number')
+            5
         """
         if col == "id":
             # We just use the count in this case
@@ -853,9 +861,8 @@ class PostgresStatsTable(PostgresBase):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: db.ec_mwbsd.stats.min('area')
-            0.00000013296713869846309987200099760
+            >>> db.test_fields.stats.min('disc_abs')
+            1
         """
         if col not in self.table.search_cols:
             raise ValueError("%s not a column of %s" % (col, self.search_table))

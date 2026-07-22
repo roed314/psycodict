@@ -179,15 +179,14 @@ class PostgresDatabase(PostgresBase):
 
     EXAMPLES::
 
-        sage: from lmfdb import db
-        sage: db
+        >>> db
         Interface to Postgres database
-        sage: db.conn
-        <connection object at 0x...>
-        sage: db.tablenames[:3]
-        ['artin_field_data', 'artin_reps', 'av_fqisog']
-        sage: db.av_fqisog
-        Interface to Postgres table av_fqisog
+        >>> db.conn
+        <psycopg.Connection [IDLE] (host=... database=...) at 0x...>
+        >>> 'test_fields' in db.tablenames
+        True
+        >>> db.test_fields
+        Interface to Postgres table test_fields
     """
     # Override the following to use a different class for search tables
     _search_table_class_ = PostgresSearchTable
@@ -1829,18 +1828,18 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         Comparing with a server described by a second configuration file::
 
-            sage: from psycodict.config import Configuration
-            sage: from psycodict.database import PostgresDatabase
-            sage: prod_config = Configuration(defaults={"config_file": "prod-config.ini"}, readargs=False)
-            sage: prod = PostgresDatabase(config=prod_config)
-            sage: db.compare(prod)["only_in_self"]
+            >>> from psycodict.config import Configuration
+            >>> from psycodict.database import PostgresDatabase
+            >>> prod_config = Configuration(defaults={"config_file": "prod-config.ini"}, readargs=False)  # doctest: +SKIP
+            >>> prod = PostgresDatabase(config=prod_config)  # doctest: +SKIP
+            >>> db.compare(prod)["only_in_self"]  # doctest: +SKIP
             ['mf_newspaces_test']
 
         Keyword arguments override the configuration, so a server that
         differs only in its host can reuse this database's configuration::
 
-            sage: prod = PostgresDatabase(config=db.config, host="proddb.lmfdb.xyz")
-            sage: db.compare(prod, tables="mf_newspaces", null_counts=True)
+            >>> prod = PostgresDatabase(config=db.config, host="proddb.lmfdb.xyz")  # doctest: +SKIP
+            >>> db.compare(prod, tables="mf_newspaces", null_counts=True)  # doctest: +SKIP
             {'only_in_self': [], 'only_in_other': [], 'schema': {}, 'row_counts': {}, 'null_counts': {}}
         """
         from .dbdiff import compare_databases

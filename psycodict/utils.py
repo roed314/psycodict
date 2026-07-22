@@ -137,21 +137,21 @@ def IdentifierWrapper(name, convert=True):
 
     EXAMPLES::
 
-        sage: IdentifierWrapper('name')
+        >>> IdentifierWrapper('name')
         Identifier('name')
-        sage: print(IdentifierWrapper('name[:10]').as_string(db.conn))
+        >>> print(IdentifierWrapper('name[:10]').as_string(db.conn))
         "name"[:10]
-        sage: print(IdentifierWrapper('name[1:10]').as_string(db.conn))
+        >>> print(IdentifierWrapper('name[1:10]').as_string(db.conn))
         "name"[2:10]
-        sage: print(IdentifierWrapper('name[1:10]', convert = False).as_string(db.conn))
+        >>> print(IdentifierWrapper('name[1:10]', convert=False).as_string(db.conn))
         "name"[1:10]
-        sage: print(IdentifierWrapper('name[1:10:3]').as_string(db.conn))
+        >>> print(IdentifierWrapper('name[1:10:3]').as_string(db.conn))
         "name"[2:10:3]
-        sage: print(IdentifierWrapper('name[1:10:3][0:2]').as_string(db.conn))
+        >>> print(IdentifierWrapper('name[1:10:3][0:2]').as_string(db.conn))
         "name"[2:10:3][1:2]
-        sage: print(IdentifierWrapper('name[1:10:3][0::1]').as_string(db.conn))
+        >>> print(IdentifierWrapper('name[1:10:3][0::1]').as_string(db.conn))
         "name"[2:10:3][1::1]
-        sage: print(IdentifierWrapper('name[1:10:3][0]').as_string(db.conn))
+        >>> print(IdentifierWrapper('name[1:10:3][0]').as_string(db.conn))
         "name"[2:10:3][1]
     """
     if "[" not in name:

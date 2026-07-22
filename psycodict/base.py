@@ -827,24 +827,20 @@ class PostgresBase():
 
         EXAMPLES::
 
-            sage: db._column_types('non_existant')
+            >>> db._column_types('nonexistent')
             ([], {}, False)
-            sage: db._column_types('test_table')
-            (['dim',
-              'label',
-              'discriminant',
-              'bad_primes',
-              'new_column1',
-              'new_label',
-              'bar'],
-             {'bad_primes': 'jsonb',
-              'bar': 'text',
-              'dim': 'smallint',
-              'discriminant': 'numeric',
-              'id': 'bigint',
-              'label': 'text',
-              'new_column1': 'text',
-              'new_label': 'text'},
+            >>> db._column_types('test_fields')
+            (['class_group', 'class_number', 'degree', 'disc_abs',
+              'disc_sign', 'label', 'r2', 'ramps'],
+             {'id': 'bigint',
+              'class_number': 'integer',
+              'disc_abs': 'integer',
+              'degree': 'smallint',
+              'disc_sign': 'smallint',
+              'r2': 'smallint',
+              'ramps': 'integer[]',
+              'class_group': 'jsonb',
+              'label': 'text'},
              True)
         """
         has_id = False
