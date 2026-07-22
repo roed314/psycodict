@@ -17,9 +17,11 @@
 #       the project's Manage -> Publishing page instead.)
 #
 #   2. In this repository, go to Settings -> Environments and create an
-#      environment named "pypi" (matching the `environment:` below).  Optionally
-#      add required reviewers or a tag restriction there as an extra guard on
-#      who and what can publish.
+#      environment named "pypi" (matching the `environment:` below), and add
+#      yourself as a required reviewer: publishing then always takes a second,
+#      deliberate approval click after the tag push, so a stray tag or a
+#      compromised push cannot upload on its own.  A tag-pattern restriction
+#      (v*) is a further optional guard.
 #
 # RELEASE FLOW:
 #
@@ -91,9 +93,40 @@ jobs:
           name: dist
           path: dist/
 
+  # Install what was just built -- both artifacts, in clean environments --
+  # before anything is published: a wheel or sdist that cannot even install
+  # and import should fail here, not on PyPI's side of the upload.
+  smoke:
+    name: Smoke-test the distributions
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install and import the wheel
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist/*.whl "psycopg[binary]>=3.2.4"
+          /tmp/wheel-venv/bin/python -c "import psycodict; print('wheel ok:', psycodict.__version__)"
+          /tmp/wheel-venv/bin/pip check
+
+      - name: Install and import the sdist
+        run: |
+          python -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/pip install dist/*.tar.gz "psycopg[binary]>=3.2.4"
+          /tmp/sdist-venv/bin/python -c "import psycodict; print('sdist ok:', psycodict.__version__)"
+          /tmp/sdist-venv/bin/pip check
+
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     # Must match the environment named in the PyPI pending-publisher setup above.
     environment: pypi
@@ -109,5 +142,8 @@ jobs:
           path: dist/
 
       # No username/password/token inputs: trusted publishing authenticates
-      # via the OIDC identity of this `pypi` environment.
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # via the OIDC identity of this `pypi` environment.  Pinned to a full
+      # commit SHA rather than the mutable release/v1 branch, since this is
+      # the one action holding publishing authority; bump the SHA (and the
+      # version comment) deliberately.
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
