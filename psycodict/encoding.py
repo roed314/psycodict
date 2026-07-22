@@ -77,10 +77,17 @@ else:
             return self.literal
 
     class RealEncoder():
+        """
+        A wrapper rendering a Sage RealNumber/RealLiteral as its literal
+        text (the exact decimal string it was created from, when available).
+        """
         def __init__(self, value):
             self._value = value
 
         def getquoted(self):
+            """
+            The wrapped real number's literal text.
+            """
             if isinstance(self._value, RealLiteral):
                 return self._value.literal
             else:
@@ -96,6 +103,9 @@ else:
         as psycopg2's client-side interpolation did.
         """
         def dump(self, obj):
+            """
+            Render the real number as its literal text.
+            """
             if isinstance(obj, RealLiteral):
                 return obj.literal.encode()
             return str(obj).encode()
@@ -105,6 +115,9 @@ else:
         Dumps a Sage Integer as its decimal text (replacing psycopg2's AsIs).
         """
         def dump(self, obj):
+            """
+            Render the integer as decimal text.
+            """
             return str(obj).encode()
 
 
