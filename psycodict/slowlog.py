@@ -535,7 +535,8 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
 
     - ``logfile`` -- the filename of a slow-query log (as configured by the
       ``slowlogfile`` logging option), or an open file object
-    - ``top`` -- the number of query shapes to include, ordered by total time
+    - ``top`` -- the number of query shapes to include in each ranking (there
+      are two: by total time and by mean time)
     - ``cutoff`` -- only consider queries at least this slow (in seconds).
       This simulates raising ``slowcutoff``: the report shows what the log
       would have contained with that threshold.
@@ -572,6 +573,9 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
       retained for this shape; see below), ``replicate`` (the hint-line
       call of that same example record, if it had one) and ``suggestions``
       (a list of strings; see the module documentation).
+    - ``shapes_by_mean`` -- the same kind of list, the top shapes ordered by
+      mean time instead of total time (the two lists overlap and share their
+      dictionaries).
 
     Memory use: the per-shape numeric aggregates (``count``, ``total``,
     ``max``, ``tables`` and the shape string itself) are exact and are kept
@@ -707,13 +711,27 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
                 "percent": 100.0 * kept_lines / considered_lines,
             })
 
-    # among shapes tied on total time, prefer those retaining an example,
-    # so that every reported shape has one (there are at least ``top``
-    # retaining shapes whenever at least ``top`` shapes were seen)
+    # Two rankings of the same per-shape aggregates: by total time (the biggest
+    # cumulative cost) and by mean time (the slowest per call, regardless of how
+    # often it ran).  Among shapes tied on the sort key, prefer those retaining
+    # an example.  Example/replicate strings are retained for the total-time
+    # leaders (see the docstring), so a shape that ranks high on mean only
+    # because of a rare very slow call may have no example -- its aggregates
+    # still appear.
     top_shapes = sorted(
         shapes.values(), key=lambda data: (-data["total"], data["example"] is None)
     )[:top]
-    for data in top_shapes:
+    top_by_mean = sorted(
+        shapes.values(),
+        key=lambda data: (-data["total"] / data["count"], data["example"] is None),
+    )[:top]
+    # Finalize each shape once, even if it appears in both rankings (they share
+    # the same underlying dicts, and _suggestions may hit the database).
+    finalized = set()
+    for data in (*top_shapes, *top_by_mean):
+        if data["shape"] in finalized:
+            continue
+        finalized.add(data["shape"])
         data.pop("_exdur", None)
         data.pop("_seq", None)
         data["mean"] = data["total"] / data["count"]
@@ -731,6 +749,7 @@ def slow_query_report(logfile, top=20, cutoff=None, db=None):
         "percentiles": percentiles,
         "thresholds": thresholds,
         "shapes": top_shapes,
+        "shapes_by_mean": top_by_mean,
     }
 
 
@@ -1060,8 +1079,7 @@ def show_slow_report(logfile, top=20, cutoff=None, db=None):
                 "    %10s %12s %12s %11.1f%%"
                 % (_fmt_duration(row["cutoff"]), row["records"], row["lines"], row["percent"])
             )
-    print("Top %s query shapes by total time:" % len(report["shapes"]))
-    for i, data in enumerate(report["shapes"], 1):
+    def print_shape(i, data):
         tables = ", ".join(data["tables"])
         print(
             "#%s: %s times, total %.3fs (mean %.3fs, max %.3fs)%s"
@@ -1075,3 +1093,12 @@ def show_slow_report(logfile, top=20, cutoff=None, db=None):
             print("    replicate: %s" % _abbreviate(data["replicate"], 500))
         for suggestion in data["suggestions"]:
             print("    * %s" % suggestion)
+
+    print("Top %s query shapes by total time:" % len(report["shapes"]))
+    for i, data in enumerate(report["shapes"], 1):
+        print_shape(i, data)
+    by_mean = report.get("shapes_by_mean", [])
+    if by_mean:
+        print("Top %s query shapes by mean time:" % len(by_mean))
+        for i, data in enumerate(by_mean, 1):
+            print_shape(i, data)

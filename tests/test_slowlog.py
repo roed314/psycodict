@@ -490,6 +490,34 @@ def test_top_bounds_example_retention(tmp_path):
     assert fa["example"] == 'SELECT "x" FROM "aaa" WHERE "n" = 1'
 
 
+def test_shapes_by_mean_ranking(tmp_path):
+    # Mean and total time can disagree: a rare very-slow shape has the higher
+    # mean, a frequent moderately-slow shape the higher total.  shapes ranks by
+    # total, shapes_by_mean by mean; both list the same (shared) dicts.
+    logfile = str(tmp_path / "means.log")
+    with open(logfile, "w") as F:
+        def q(tbl, nval, dur):
+            F.write('2020-01-01 12:00:00,000 - SELECT "x" FROM "%s" WHERE "n" = %d ran in %ss\n'
+                    % (tbl, nval, dur))
+        q("rare", 1, "10.0")            # total 10, mean 10
+        for i in range(5):
+            q("common", i, "3.0")       # total 15, mean 3
+
+    report = slow_query_report(logfile, top=10)
+    by_total = report["shapes"]
+    by_mean = report["shapes_by_mean"]
+    # by total the frequent shape leads; by mean the rare slow one does
+    assert [d["tables"][0] for d in by_total] == ["common", "rare"]
+    assert [d["tables"][0] for d in by_mean] == ["rare", "common"]
+    assert [d["total"] for d in by_total] == sorted((d["total"] for d in by_total), reverse=True)
+    assert [d["mean"] for d in by_mean] == sorted((d["mean"] for d in by_mean), reverse=True)
+    # the two rankings reorder the very same dictionaries, each fully finalized
+    assert {id(d) for d in by_mean} == {id(d) for d in by_total}
+    for d in by_mean:
+        assert isinstance(d["tables"], list) and "mean" in d and "suggestions" in d
+        assert "_exdur" not in d and "_seq" not in d
+
+
 def test_example_replicate_atomic(tmp_path):
     # The example and its replicate hint must always come from the same
     # record: when a hintless slower record replaces a hinted faster one,
@@ -536,6 +564,7 @@ def test_show_slow_report(slow_setup, capsys):
     out = capsys.readouterr().out
     assert "parsed records" in out
     assert "query shapes by total time" in out
+    assert "query shapes by mean time" in out
     assert "cutoff" in out
     assert table.search_table in out
     assert '"n" = ?' in out
