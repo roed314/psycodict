@@ -89,6 +89,30 @@ def test_sum_of_numeric_column_is_exact(filled_table):
     assert not isinstance(total, float)
 
 
+def test_sum_does_not_cache_without_saving(filled_table):
+    # sum() must honor the saving flag like max()/min()/count(): with the
+    # default saving = False it computes the value but writes nothing to the
+    # stats cache.  (Previously sum() recorded unconditionally.)
+    st = filled_table.stats
+    constraint = {"flag": True}
+    assert st.sum("n", constraint=constraint) == sum(
+        i for i in range(200) if i % 3 == 0
+    )
+    ccols, cvals = st._split_dict(constraint)
+    assert st._quick_statistic("n", ccols, cvals, kind="sum") is None
+
+
+def test_sum_caches_when_saving(saving_table):
+    # With saving enabled the computed sum is persisted, so a second lookup is
+    # served from the stats cache.
+    st = saving_table.stats
+    constraint = {"flag": True}
+    expected = sum(i for i in range(200) if i % 3 == 0)
+    assert st.sum("n", constraint=constraint) == expected
+    ccols, cvals = st._split_dict(constraint)
+    assert st._quick_statistic("n", ccols, cvals, kind="sum") == expected
+
+
 def test_max_of_text_column(filled_table):
     # Text ordering, not numeric: "l99" is the largest label.
     assert filled_table.stats.max("label") == "l99"
@@ -161,6 +185,25 @@ def test_search_with_info_still_records_its_count(saving_table):
     saving_table.search({"n": {"$lt": 80}}, "n", info=info)
     assert info["number"] == 80
     assert saving_table.stats.quick_count({"n": {"$lt": 80}}) == 80
+
+
+def test_random_does_not_cache_count_without_saving(filled_table):
+    # The uncached-count branch of random() materializes the match set to
+    # sample from it and learns the count along the way.  With saving = False
+    # it must not persist that count (matching count()); previously it wrote
+    # unconditionally.
+    query = {"n": {"$lt": 50}}
+    assert filled_table.stats.quick_count(query) is None
+    assert filled_table.random(query) is not None  # 50 rows match
+    assert filled_table.stats.quick_count(query) is None
+
+
+def test_random_caches_count_when_saving(saving_table):
+    # With saving enabled the count learned as a side effect is persisted.
+    query = {"n": {"$lt": 50}}
+    assert saving_table.stats.quick_count(query) is None
+    assert saving_table.random(query) is not None
+    assert saving_table.stats.quick_count(query) == 50
 
 
 def test_null_counts_ignores_columns_without_nulls(filled_table):

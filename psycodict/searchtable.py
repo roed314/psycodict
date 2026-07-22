@@ -1651,7 +1651,11 @@ class PostgresSearchTable(PostgresTable):
                 else:
                     # An arbitrary projection might be large, so we get ids
                     L = list(self.search(query, "id", sort=[]))
-                self.stats._record_count(query, len(L))
+                # Cache the count we just computed, but only when count-saving
+                # is enabled -- matching count()/count_distinct(), which never
+                # write to the cache tables while ``saving`` is False.
+                if self.stats.saving:
+                    self.stats._record_count(query, len(L))
                 if len(L) == 0:
                     return None
                 res = random.choice(L)

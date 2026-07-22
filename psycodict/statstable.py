@@ -857,7 +857,7 @@ class PostgresStatsTable(PostgresBase):
         m = self._quick_statistic(col, ccols, cvals, kind="sum")
         if m is None:
             m = self._slow_statistic(col, constraint, kind="sum")
-            if record:
+            if record and self.saving:
                 self._record_statistic(col, ccols, cvals, m, kind="sum")
         return m
 
