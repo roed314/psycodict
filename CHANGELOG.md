@@ -22,7 +22,9 @@ migration note.
   psycopg2, and it re-exports `SQL`, `Identifier`, `Placeholder`, `Literal`,
   `Composable` and `Composed` from `psycodict` so callers need not import a
   driver directly. *Migration:* install with the `pgbinary` or `pgsource` extra
-  (`pip install "psycodict[pgbinary]"`), and import the SQL composition classes
+  (`pip install "psycodict[pgbinary]"`; psycopg 3.2.4 or newer -- the
+  notification listener relies on psycopg 3.2 APIs and on 3.2.4's
+  notification-delivery fix), and import the SQL composition classes
   from `psycodict` rather than `psycopg2.sql`. (#88)
 - **The old `join_search` method is removed.** *Migration:* pass `join=` to
   `search` (or `count` / `lucky`) instead; see the joins section of

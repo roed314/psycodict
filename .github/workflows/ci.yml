@@ -72,16 +72,19 @@ jobs:
         run: pytest tests/test_encoding.py tests/test_utils.py tests/test_config.py -v
 
   database:
-    name: PostgreSQL ${{ matrix.postgres }} (py${{ matrix.python }})
+    name: PostgreSQL ${{ matrix.postgres }} (py${{ matrix.python }}${{ matrix.psycopg && format(', psycopg {0}', matrix.psycopg) || '' }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       # Rather than the full cross product, pin the corners: the oldest
       # supported pair, the newest pair, and the combination LMFDB actually
       # deploys.  Add a row here when a new PostgreSQL major is released.
+      # The extra oldest-pair row pins psycopg to the declared minimum
+      # (pyproject's pgbinary/pgsource floor), so the floor stays honest.
       matrix:
         include:
           - {python: "3.9", postgres: "13"}
+          - {python: "3.9", postgres: "13", psycopg: "3.2.4"}
           - {python: "3.11", postgres: "15"}
           - {python: "3.12", postgres: "16"}
           - {python: "3.13", postgres: "17"}
@@ -120,6 +123,10 @@ jobs:
 
       - name: Install
         run: python -m pip install -e ".[pgbinary,test]"
+
+      - name: Pin psycopg to the declared minimum
+        if: matrix.psycopg
+        run: python -m pip install "psycopg[binary]==${{ matrix.psycopg }}"
 
       - name: Show server version
         run: psql -c "SELECT version()"
