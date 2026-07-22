@@ -622,9 +622,76 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
     def _create_meta_tables_hist(self):
         self._create_meta_hist("meta_tables")
 
+    def _clone_storage_settings(self, new_name, table):
+        """
+        Copy per-column storage settings (the state set by ``ALTER COLUMN ...
+        SET STORAGE`` and ``SET COMPRESSION``) from the search table of
+        ``table`` to the newly created table ``new_name``.
+
+        Creating a table from column types alone silently resets these to the
+        type defaults, so a copy of a source with customized column storage
+        would store its rows differently from the source (compressing values
+        the source keeps external, or vice versa) and the two tables would
+        differ in size even though they hold the same data.  This is the one
+        way ``create_table_like`` could produce a copy whose on-disk size
+        disagrees with its source (see LMFDB/lmfdb#6775): the row copy itself
+        preserves toast compression byte for byte.
+
+        INPUT:
+
+        - ``new_name`` -- the name of the new table, already created
+        - ``table`` -- a PostgresSearchTable object giving the source table
+        """
+        server_version = self._execute(
+            SQL("SELECT current_setting('server_version_num')::int")
+        ).fetchone()[0]
+        # Column level compression settings (attcompression) appeared in
+        # postgres 14; on older servers there is only attstorage to copy.
+        if server_version >= 140000:
+            selecter = SQL(
+                "SELECT attname, attstorage, attcompression FROM pg_attribute "
+                "WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped"
+            )
+        else:
+            selecter = SQL(
+                "SELECT attname, attstorage, '' FROM pg_attribute "
+                "WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped"
+            )
+
+        def settings(tname):
+            return {rec[0]: (rec[1], rec[2]) for rec in self._execute(selecter, [tname])}
+
+        source = settings(table.search_table)
+        target = settings(new_name)
+        # The keywords are whitelisted here, so it's okay to use string
+        # formatting to insert them into the SQL commands below.
+        storage_keywords = {"p": "PLAIN", "e": "EXTERNAL", "m": "MAIN", "x": "EXTENDED"}
+        compression_keywords = {"p": "pglz", "l": "lz4"}
+        with DelayCommit(self, silence=True):
+            for col, (storage, compression) in source.items():
+                if col not in target:
+                    continue
+                target_storage, target_compression = target[col]
+                if storage != target_storage and storage in storage_keywords:
+                    self._execute(
+                        SQL(
+                            "ALTER TABLE {0} ALTER COLUMN {1} SET STORAGE "
+                            + storage_keywords[storage]
+                        ).format(Identifier(new_name), Identifier(col))
+                    )
+                if compression != target_compression and compression in compression_keywords:
+                    self._execute(
+                        SQL(
+                            "ALTER TABLE {0} ALTER COLUMN {1} SET COMPRESSION "
+                            + compression_keywords[compression]
+                        ).format(Identifier(new_name), Identifier(col))
+                    )
+
     def create_table_like(self, new_name, table, tablespace=None, data=False, indexes=False):
         """
-        Copies the schema from an existing table, but none of the data, indexes or stats.
+        Creates a new table with the same schema as an existing one, including
+        each column's storage and compression settings.  By default neither
+        data, indexes nor stats are copied.
 
         INPUT:
 
@@ -664,6 +731,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             # keep the source's behavior rather than the current default
             include_nones=table._include_nones,
         )
+        # Copy the column storage settings before any data, so that rows are
+        # stored (kept external, compressed, ...) the same way as the source's.
+        self._clone_storage_settings(new_name, table)
         if data:
             logid = table._check_locks("create_table_like")
             aborted = True
@@ -681,6 +751,10 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             for idata in table.list_indexes(verbose=False).values():
                 self[new_name].create_index(**idata)
         if data:
+            # The bulk insert leaves the new table without planner statistics
+            # until autovacuum notices it; analyze right away so that queries
+            # against the copy (including the stats refresh below) plan sanely.
+            self._execute(SQL("ANALYZE {0}").format(Identifier(new_name)))
             self[new_name].stats.refresh_stats()
 
     def create_table(
