@@ -379,11 +379,13 @@ def test_join_projection_and_sort_accept_paths(jtables):
         curves.search({}, ["%s.missing.0" % F], join=join, limit=1)
 
 
-def test_unjoined_projection_still_rejects_paths(filled_table):
-    # dotted paths in projections outside joins are a separate, pre-existing
-    # limitation (only array slicers are supported there)
+def test_unjoined_projection_accepts_paths(filled_table):
+    # dotted paths in projections (and sorts) outside joins are now supported,
+    # matching joined queries; see tests/test_projection_paths.py for the full
+    # coverage.  The base column is still validated.
+    assert filled_table.search({"n": 3}, ["data.s"], limit=1) == [{"data.s": "v3"}]
     with pytest.raises(ValueError, match="not"):
-        filled_table.search({}, ["data.s"], limit=1)
+        filled_table.search({}, ["missing.s"], limit=1)
 
 
 def test_join_analyze(jtables, capsys):

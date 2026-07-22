@@ -269,7 +269,7 @@ class PostgresTable(PostgresBase):
             _, selecter, values = self._join_selecter(query, projection, join, limit=limit, offset=offset, sort=sort)
         else:
             search_cols = self._parse_projection(projection)
-            cols = SQL(", ").join(map(IdentifierWrapper, search_cols))
+            cols = SQL(", ").join(self._column_composable(c) for c in search_cols)
             if limit is None:
                 qstr, values = self._build_query(query, sort=sort)
             else:
