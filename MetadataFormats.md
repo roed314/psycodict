@@ -149,7 +149,7 @@ that form close them beforehand.  **This restores the whole database to the
 moment of the dump — application data included** — so quiesce writes for the
 migration window and roll back immediately or not at all.
 
-If writes cannot be stopped or lost, the surgical variant is to back up only
+If committed writes cannot be lost, the surgical variant is to back up only
 the six meta tables:
 
 ```sh
