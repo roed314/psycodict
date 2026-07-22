@@ -68,7 +68,8 @@ or a list depending on `limit` (see below).
   Default `1` (all search columns).
 - **`limit`** — an integer maximum number of rows, or `None` (default).  `None`
   returns an iterator over *all* matches; an integer returns a list.  This
-  choice governs the return type — see below.
+  choice governs the return type — see below.  A negative limit raises
+  `ValueError`.
 - **`offset`** — a non-negative integer (default `0`); the number of leading
   rows to skip.  A negative offset raises `ValueError`.
 - **`sort`** — the sort order, or `None` (default) for the table's default
@@ -154,11 +155,14 @@ Rules and errors:
 - A falsy projection other than `0` (e.g. `[]`, `{}`, `""`) raises
   `ValueError("You must specify at least one key.")`.
 - An unknown column raises `ValueError("<col> not column of <table>")`.
-- List projections accept the `"col[i]"` **slicer** syntax but **not** the
-  dotted json-path syntax (`"data.key"`) that query keys accept: `["data.s"]`
-  raises `ValueError`.  (Path access in *results* is asymmetric with path
-  access in *queries*; slicers are the only path form supported in a
-  projection.)
+- A **list** projection may not repeat a column: `["a", "a"]` raises
+  `ValueError("Duplicate column(s) in projection: a")`.
+- List projections accept path specifiers, as query keys do: both the
+  `"col[i]"` array **slicer** syntax and the dotted json/array-path syntax
+  (`"data.key"`, `"ainvs.1"`).  The selected value is the element at that path.
+  (Two exceptions: neither form is allowed together with `split_ors` or
+  `one_per`, which key the fetched rows by plain column name and so raise a
+  `ValueError` for a path or slicer in the projection or sort.)
 - Dictionary projections are **not** supported together with `join` (see
   [Joins](#joins)).
 
@@ -181,7 +185,9 @@ emitted as `ORDER BY col DESC NULLS LAST`.
 
 - **`sort=[]`** — explicitly unsorted: no `ORDER BY` is emitted, so the row
   order is whatever PostgreSQL returns (arbitrary and not stable).
-- **An explicit non-empty list** — used verbatim.
+- **An explicit non-empty list** — used verbatim.  A column may not appear more
+  than once (its first appearance already fixes the order); a repeat raises
+  `ValueError("Duplicate column 'col' in sort order")`.
 - **`sort=None` (the default for `search`)** — the table's default sort, with a
   query-planner optimization:
   - If the table has **no default sort**, results are ordered by `id` when a
@@ -671,15 +677,16 @@ db.ec_nfcurves.search(
 
 When a projection produces a dictionary, whether columns whose value is SQL
 `NULL` appear in that dictionary is governed by the table's `include_nones`
-setting (a **per-table** meta setting, `_include_nones`, default `False`):
+setting (a **per-table** meta setting, `_include_nones`, default `True`):
 
-- **`include_nones = False` (default)** — key/value pairs whose value is `None`
-  are **omitted** from the result dictionary.  A returned dict therefore
-  contains only the non-null columns among those projected, and callers must
-  treat a missing key as "null" (e.g. with `dict.get`).  This applies uniformly
-  to `search` (iterator and list forms), `lucky`, `lookup` and joined queries.
-- **`include_nones = True`** — every projected column is present, with `None`
-  for nulls.
+- **`include_nones = True` (default)** — every projected column is present in
+  the result dictionary, with `None` for nulls.  This applies uniformly to
+  `search` (iterator and list forms), `lucky`, `lookup` and joined queries.
+- **`include_nones = False`** — key/value pairs whose value is `None` are
+  **omitted** from the result dictionary, so a returned dict contains only the
+  non-null columns among those projected and callers must treat a missing key
+  as "null" (e.g. with `dict.get`).  Pass `include_nones=False` at
+  `create_table` to select this per table.
 
 Because the setting is per-table, two tables in the same database can differ,
 and the same projection can yield dicts with different key sets depending on the
@@ -687,8 +694,9 @@ table it came from.  (Bare-value projections — `0` or a string — are unaffec
 they can return `None` as the value.)
 
 This interacts with left/right/full joins: an unmatched side contributes `NULL`
-columns, which under the default `include_nones = False` simply do not appear in
-the result dict — so to detect unmatched rows, project a column you expect to be
+columns.  Under the default `include_nones = True` they appear as `None`; under
+`include_nones = False` they simply do not appear in the result dict — so on a
+table set that way, to detect unmatched rows project a column you expect to be
 non-null and test for its absence, or query `{"table.col": None}`.  See the
 Joined queries section of [QueryLanguage.md](QueryLanguage.md).
 
@@ -707,7 +715,10 @@ psycodict's registered adapters (`psycodict/encoding.py`,
   value with a decimal point becomes a real number.  The exact Python type
   **depends on whether Sage is importable**: with Sage, integers become Sage
   `Integer`s and decimals become Sage real literals (`LmfdbRealLiteral`, whose
-  precision tracks the number of digits and which re-prints as it was stored);
+  precision tracks the number of digits and which re-prints as it was stored) —
+  except an all-zero decimal, which becomes an exact integer zero
+  (`LmfdbDecimalZero`) so it does not drag a partner down to a few bits of
+  precision in later arithmetic;
   without Sage, they fall back to Python `int` and `float` respectively.  Other
   numeric SQL types (`integer`, `bigint`, `double precision`, `boolean`, `text`)
   map to the obvious Python types.
