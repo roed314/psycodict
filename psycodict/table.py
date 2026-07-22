@@ -5,6 +5,7 @@ import tempfile
 import time
 import re
 from bisect import bisect
+from functools import partial
 
 from psycopg.sql import SQL, Identifier, Placeholder, Literal
 
@@ -1079,8 +1080,12 @@ class PostgresTable(PostgresBase):
         # to give func access to the data to process.
         # An alternative approach would be to use COPY TO and have func and filter both
         # operate on the results, but then func would have to process the strings
+        sep = kwds.get("sep", "|")
         if tostr_func is None:
-            tostr_func = copy_dumps
+            # Curry the separator in so that text and jsonb values get it escaped the way
+            # COPY FROM expects.  A user-supplied tostr_func keeps its (value, type) signature,
+            # so it is responsible for its own separator handling.
+            tostr_func = partial(copy_dumps, sep=sep)
         if datafile is None:
             datafile = tempfile.NamedTemporaryFile("w", delete=False)
         elif os.path.exists(datafile):
@@ -1090,7 +1095,6 @@ class PostgresTable(PostgresBase):
         start = time.time()
         count = 0
         tot = self.count(query)
-        sep = kwds.get("sep", "|")
         try:
             with datafile:
                 # write headers

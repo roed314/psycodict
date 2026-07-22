@@ -39,6 +39,25 @@ def copy_unescape(text):
     return "".join(out)
 
 
+def copy_split(line, sep):
+    """
+    Split a COPY text-format row into its fields on unescaped ``sep`` characters,
+    the way ``COPY FROM`` does before it unescapes each field.  A backslash escapes
+    the following character, so an escaped separator is not a field boundary.
+    """
+    fields = [[]]
+    chars = iter(line)
+    for char in chars:
+        if char == "\\":
+            fields[-1].append(char)
+            fields[-1].append(next(chars))
+        elif char == sep:
+            fields.append([])
+        else:
+            fields[-1].append(char)
+    return ["".join(field) for field in fields]
+
+
 NASTY_STRINGS = [
     "plain",
     "tab\there",
@@ -451,6 +470,37 @@ def test_copy_dumps_booleans(value, expected):
 
 def test_copy_dumps_bytea():
     assert copy_dumps(b"abc", "bytea") == r"\\x616263"
+
+
+@pytest.mark.parametrize("value,typ,expected", [
+    ("a|b", "text", r"a\|b"),
+    ("|", "text", r"\|"),
+    ({"k": "x|y"}, "jsonb", r'{"k": "x\|y"}'),
+    (["a|b", "c"], "text[]", r"{a\|b,c}"),
+])
+def test_copy_dumps_escapes_the_default_separator(value, typ, expected):
+    # The COPY delimiter itself must be escaped, or COPY FROM reads it as a
+    # column boundary; Postgres' own COPY TO writes it the same way.
+    assert copy_dumps(value, typ) == expected
+
+
+@pytest.mark.parametrize("row", [
+    ["a|b", "c"],
+    ["with|two|pipes", "|leading", "trailing|"],
+    ["back\\slash|pipe", "plain"],
+])
+def test_copy_dumps_separator_survives_a_full_row(row):
+    # copy_unescape alone cannot see this bug: it acts on an already-split field.
+    # A leaked separator only shows once the row is split into columns first.
+    line = "|".join(copy_dumps(value, "text") for value in row)
+    assert [copy_unescape(field) for field in copy_split(line, "|")] == row
+
+
+def test_copy_dumps_separator_is_configurable():
+    # A non-default separator is escaped in its place (the pipe is left alone)...
+    assert copy_dumps("a;b|c", "text", sep=";") == r"a\;b|c"
+    # ...and tab, already escaped as \t above, is not doubled.
+    assert copy_dumps("a\tb", "text", sep="\t") == r"a\tb"
 
 
 # ---------------------------------------------------------------------------

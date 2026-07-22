@@ -526,7 +526,7 @@ class DictJsonDumper(Dumper):
         return Json.dumps(obj).encode()
 
 
-def copy_dumps(inp, typ, recursing=False):
+def copy_dumps(inp, typ, sep="|", recursing=False):
     """
     Output a string formatted as needed for loading by Postgres' COPY FROM.
 
@@ -534,6 +534,11 @@ def copy_dumps(inp, typ, recursing=False):
 
     - ``inp`` -- a Python or Sage object that directly translates to a postgres type (e.g. Integer, RealLiteral, dict...
     - ``typ`` -- the Postgres type of the column in which this data is being stored.
+    - ``sep`` -- the column separator that the resulting file will be loaded with (default
+      ``"|"``).  Occurrences of this character inside a value are backslash-escaped, matching
+      what Postgres' COPY (text format) does on output, so that they are not mistaken for
+      column boundaries on the way back in.  This must agree with the separator eventually
+      passed to COPY FROM.
     """
     if inp is None:
         # inside an array the null marker is the array literal NULL, since
@@ -562,11 +567,22 @@ def copy_dumps(inp, typ, recursing=False):
             .replace("\t", r"\t")
             .replace('"', r"\"")
         )
+        if sep != "\t":
+            # The active COPY delimiter must be escaped too (tab is handled above);
+            # for the default "|" this is what stops a pipe inside a value from being
+            # read as a column boundary.  This is a COPY field-level escape, so it goes
+            # before the enclosing array quotes are added.
+            inp = inp.replace(sep, "\\" + sep)
         if quote:
             inp = '"' + inp + '"'
         return inp
     elif typ in ("json", "jsonb"):
-        return json.dumps(Json.prep(inp, escape_backslashes=True))
+        out = json.dumps(Json.prep(inp, escape_backslashes=True))
+        if sep != "\t":
+            # A separator appearing inside a JSON string (json.dumps leaves it literal)
+            # must be escaped for the same reason as for text values above.
+            out = out.replace(sep, "\\" + sep)
+        return out
     elif typ[-2:] == "[]":
         if not isinstance(inp, (list, tuple)):
             raise TypeError("You must use list or tuple for array columns")
@@ -588,7 +604,7 @@ def copy_dumps(inp, typ, recursing=False):
                 subtyp = typ[:-2]
             elif subtyp != typ[:-2]:
                 raise ValueError("Array dimensions must be uniform")
-        return "{" + ",".join(copy_dumps(x, subtyp, recursing=True) for x in inp) + "}"
+        return "{" + ",".join(copy_dumps(x, subtyp, sep=sep, recursing=True) for x in inp) + "}"
     elif typ == "boolean":
         # must come before the numeric branch, since bool is a subclass of int
         return "t" if inp else "f"
