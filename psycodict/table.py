@@ -1271,7 +1271,24 @@ class PostgresTable(PostgresBase):
                                 self._clone(table, table + "_tmp")
                     self.stats.refresh_stats(suffix=suffix)
                 if not inplace:
-                    self._swap_in_tmp([self.search_table])
+                    # Swap in the refreshed counts/stats alongside the search
+                    # table.  refresh_stats above populated the _tmp counts and
+                    # stats tables, but they only reach the live names if they
+                    # are in this list; otherwise the recomputed statistics are
+                    # silently dropped (the live stats keep their stale values)
+                    # and the _tmp tables are left orphaned.  reload builds its
+                    # swap list the same way.
+                    tables = [self.search_table]
+                    if restat and self.stats.saving:
+                        tables += [self.stats.counts, self.stats.stats]
+                    if self.stats.counts in tables:
+                        # _clone built the _tmp counts table with a bare LIKE,
+                        # which copies no indexes; build the standard counts
+                        # indexes on it before the swap so the live counts
+                        # table keeps them (otherwise cached-count lookups
+                        # degrade to sequential scans).  reload does the same.
+                        self._create_counts_indexes(suffix=suffix)
+                    self._swap_in_tmp(tables)
                     if ordered:
                         self._set_ordered()
                 # Delete the temporary table used to load the data
