@@ -219,6 +219,13 @@ class PostgresSearchTable(PostgresTable):
             - ``$notcontains`` -- for json columns, the column must not contain any entry of the given value (which should be iterable)
             - ``$containedin`` -- for json columns, the column should be a subset of the given list
             - ``$overlaps`` -- the column should overlap the given array
+            - ``$size`` -- constrains the number of elements of an array or jsonb column.
+              For an array column it is the cardinality; for a jsonb column it is the
+              array length or, for a jsonb object, the number of keys -- a jsonb scalar
+              (or json/SQL null) has no size, so it never matches (and does not error).
+              The value is either an integer (testing equality of the length) or an
+              operator dictionary (e.g. ``{"$gte": 2}``, ``{"$in": [2, 3]}``) that
+              constrains the length like any integer column.
             - ``$exists`` -- if True, require not null; if False, require null.
             - ``$startswith`` -- for text columns, matches strings that start with the given string.
             - ``$like`` -- for text columns, matches strings according to the LIKE operand in SQL.
@@ -314,6 +321,45 @@ class PostgresSearchTable(PostgresTable):
             # have to take modulus twice since MOD(-1,5) = -1 in postgres
             cmd = SQL("MOD(%s + MOD({0}, %s), %s) = %s").format(col)
             value = [value[1], value[1], value[1], value[0] % value[1]]
+        elif key == "$size":
+            # Constrains the number of elements of an array or jsonb-array column.
+            if col_type is not None and col_type.endswith("[]"):
+                # cardinality, not array_length(col, 1): array_length of an
+                # empty array is NULL (so {"$size": 0} could never match an
+                # empty array), while cardinality returns 0.  For a
+                # multidimensional array it counts the elements of every
+                # dimension, not the length of the outermost one.
+                length = SQL("cardinality({0})").format(col)
+            elif col_type == "jsonb":
+                # A jsonb value has a "size" only when it is a container:
+                # jsonb_typeof dispatches to the array's element count or the
+                # object's key count.  Every other type (a scalar, or a json
+                # null), and a SQL NULL, falls through to the implicit ELSE
+                # NULL, so $size neither matches nor errors on them -- unlike a
+                # bare jsonb_array_length, which raises on any non-array.  The
+                # CASE guard is evaluated per row, so each branch's function
+                # only ever sees the jsonb type it expects.  (An empty array or
+                # object gives 0; there is no jsonb_object_length, hence the
+                # key count.)
+                length = SQL(
+                    "CASE jsonb_typeof({0}) "
+                    "WHEN 'array' THEN jsonb_array_length({0}) "
+                    "WHEN 'object' THEN (SELECT count(*)::int FROM jsonb_object_keys({0})) "
+                    "END"
+                ).format(col)
+            else:
+                raise ValueError("$size requires an array or jsonb column")
+            if isinstance(value, dict):
+                # An operator dictionary recurses with the length expression as
+                # the outer column, exactly as $or/$and recurse with a column,
+                # so every integer operator ($gte, $in, $ne, ...) works against
+                # the length -- including on joined columns and dotted paths,
+                # since ``col`` arrives as an already-built composable.
+                return self._parse_dict(value, outer=length, outer_type="integer",
+                                        join_context=join_context)
+            # A bare integer is an equality test on the length.
+            cmd = SQL("{0} = %s").format(length)
+            value = [value]
         elif key == "$raw":
             # Names in the expression resolve like query keys: bare names are
             # this table's columns, and in a joined query table.column names
