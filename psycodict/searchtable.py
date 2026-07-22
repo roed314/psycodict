@@ -906,27 +906,27 @@ class PostgresSearchTable(PostgresTable):
         INPUT:
 
         - ``query`` -- a mongo-style dictionary specifying the query.
-           Generally, the keys will correspond to columns,
-           and values will either be specific numbers (specifying an equality test)
-           or dictionaries giving more complicated constraints.
-           The main exception is that "$or" can be a top level key,
-           specifying a list of constraints of which at least one must be true.
+          Generally, the keys will correspond to columns,
+          and values will either be specific numbers (specifying an equality test)
+          or dictionaries giving more complicated constraints.
+          The main exception is that "$or" can be a top level key,
+          specifying a list of constraints of which at least one must be true.
         - ``projection`` -- which columns are desired.
           This can be specified either as a list of columns to include;
-           a dictionary specifying columns to include (using all True values)
-                                           or exclude (using all False values);
-           a string giving a single column (only returns the value, not a dictionary);
-           or an integer code (0 means only return the label,
-                               1 means return all search columns,
-                               2 means all columns (default)).
+          a dictionary specifying columns to include (using all True values)
+          or exclude (using all False values);
+          a string giving a single column (only returns the value, not a dictionary);
+          or an integer code (0 means only return the label,
+          1 means return all search columns, 2 means all columns (default)).
         - ``offset`` -- integer. allows retrieval of a later record rather than just first.
         - ``sort`` -- The sort order, from which the first result is returned.
-            - None, Using the default sort order for the table
-            - a list of strings (which are interpreted as column names in the
-                ascending direction) or of pairs (column name, 1 or -1).
-                If not specified, will use the default sort order on the table.
-            - [] (default), unsorted, thus if there is more than one match to
-                the query then the choice of the result is arbitrary.
+
+          - None, Using the default sort order for the table
+          - a list of strings (which are interpreted as column names in the
+            ascending direction) or of pairs (column name, 1 or -1).
+            If not specified, will use the default sort order on the table.
+          - [] (default), unsorted, thus if there is more than one match to
+            the query then the choice of the result is arbitrary.
         - ``raw`` -- a string, to be used as the WHERE part of the query.  DO NOT USE THIS DIRECTLY FOR INPUT FROM WEBSITE.
         - ``raw_values`` -- a list of values to be substituted for %s entries in the raw string.  Useful when strings might include quotes.
         - ``join`` -- a list of tuples describing other search tables to join to this one,
@@ -1003,19 +1003,18 @@ class PostgresSearchTable(PostgresTable):
         INPUT:
 
         - ``query`` -- a mongo-style dictionary specifying the query.
-           Generally, the keys will correspond to columns,
-           and values will either be specific numbers (specifying an equality test)
-           or dictionaries giving more complicated constraints.
-           The main exception is that "$or" can be a top level key,
-           specifying a list of constraints of which at least one must be true.
+          Generally, the keys will correspond to columns,
+          and values will either be specific numbers (specifying an equality test)
+          or dictionaries giving more complicated constraints.
+          The main exception is that "$or" can be a top level key,
+          specifying a list of constraints of which at least one must be true.
         - ``projection`` -- which columns are desired.
           This can be specified either as a list of columns to include;
-           a dictionary specifying columns to include (using all True values)
-                                           or exclude (using all False values);
-           a string giving a single column (only returns the value, not a dictionary);
-           or an integer code (0 means only return the label,
-                               1 means return all search columns (default),
-                               2 means all columns).
+          a dictionary specifying columns to include (using all True values)
+          or exclude (using all False values);
+          a string giving a single column (only returns the value, not a dictionary);
+          or an integer code (0 means only return the label,
+          1 means return all search columns (default), 2 means all columns).
         - ``limit`` -- an integer or None (default), giving the maximum number of records to return.
         - ``offset`` -- a nonnegative integer (default 0), where to start in the list of results.
         - ``sort`` -- a sort order.  Either None or a list of strings (which are interpreted as column names in the ascending direction) or of pairs (column name, 1 or -1).  If not specified, will use the default sort order on the table.  If you want the result unsorted, use [].
