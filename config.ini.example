@@ -1,0 +1,16 @@
+# Example psycodict configuration.  Copy this file to config.ini and edit;
+# psycodict reads config.ini from the current directory by default (an
+# explicit config_file always wins).  The password can also be kept out of
+# this file entirely: leave it empty here and put it in secrets.ini, which
+# overrides values in this file and is never committed.
+
+[logging]
+slowcutoff = 0.1
+slowlogfile = slow_queries.log
+
+[postgresql]
+host = localhost
+port = 5432
+user = postgres
+password = 
+dbname = lmfdb
