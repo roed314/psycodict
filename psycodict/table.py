@@ -2192,7 +2192,7 @@ class PostgresTable(PostgresBase):
             return staged, logid
         finally:
             if aborted:
-                self.log_db_change("staged", logid=logid, aborted=True)
+                self._log_db_change("staged", logid=logid, aborted=True)
 
     def _staged_commit(self, staged, logid):
         """
@@ -2201,7 +2201,7 @@ class PostgresTable(PostgresBase):
         INPUT:
 
         - ``staged`` -- the staged table object returned by ``_staged_enter``
-        - ``logid`` -- passed on to ``log_db_change``
+        - ``logid`` -- passed on to ``_log_db_change``
         """
         suffix = "_tmp"
         # Drop the staging-only label index before rebuilding the real
@@ -2270,7 +2270,7 @@ class PostgresTable(PostgresBase):
                 self.reload_final_swap(tables=self._staged_tables(), ordered=False)
             aborted = False
         finally:
-            self.log_db_change("staged", logid=logid, aborted=aborted)
+            self._log_db_change("staged", logid=logid, aborted=aborted)
 
     def _staged_abort(self, logid):
         """
@@ -2280,7 +2280,7 @@ class PostgresTable(PostgresBase):
         # clear it so that the drops below can run
         self.conn.rollback()
         self.drop_tmp()
-        self.log_db_change("staged", logid=logid, aborted=True)
+        self._log_db_change("staged", logid=logid, aborted=True)
 
     def max_id(self, table=None):
         """
