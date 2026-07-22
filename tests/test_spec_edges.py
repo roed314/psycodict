@@ -6,9 +6,11 @@ The point of this file is different from ``test_search.py``: it does not check
 that the common paths work, but *pins* the behavior of corner cases so that the
 1.0 release freezes them deliberately rather than by accident.  Each test
 therefore states, in a one-line comment, WHY the pinned value is what it is (or
-that it is simply frozen as-is).  Where the current behavior looks like a real
-bug, the test still pins what the code does today and the comment links the
-concern -- these are reported separately, not fixed here.
+that it is simply frozen as-is).  The genuine footguns these tests originally
+surfaced -- a mixed operator/plain query dict, ``$ne None`` never matching, a
+boolean column compared with 0/1 -- have since been fixed (1.0 being a good
+time for the breaking change), and the tests below assert the corrected
+behavior.
 
 Everything runs against short-lived tables built directly from the session
 ``db`` fixture (the tables in ``conftest`` are function-scoped; these are
@@ -114,8 +116,9 @@ def test_top_level_or_empty_list_is_false(db, spec_table):
 
 
 def test_top_level_and_empty_list_is_everything(db, spec_table):
-    # Asymmetric with $or: an empty $and imposes no constraint (None), not
-    # SQL("true"), so it matches everything.  Pinned as-is for 1.0.
+    # The correct boolean identities, not a wart: an empty $and is true (no
+    # constraint -> everything), just as an empty $or is false (nothing).  The
+    # asymmetry with the $or case above is deliberate.
     assert _sql(db, spec_table, {"$and": []}) is None
     assert spec_table.search({"$and": []}, "n", limit=20) == list(range(10))
 
@@ -231,17 +234,21 @@ def test_unknown_column_and_operator_raise_valueerror(spec_table):
         spec_table._parse_dict({"n": {"$bogus": 1}})
 
 
-def test_mixed_operator_dict_is_treated_as_a_value(db, spec_table):
-    # FOOTGUN (pinned as-is): a constraint dict is read as operators only when
-    # *every* key starts with "$".  One non-$ key (a typo, a stray field) makes
-    # the whole dict a literal equality value.  On a typed column that value
-    # fails to cast (raises); on a jsonb column it silently compares and
-    # quietly matches nothing.
-    assert _sql(db, spec_table, {"n": {"$gt": 1, "plain": 2}}) == '"n" = %s'
-    with pytest.raises(psycopg.errors.InvalidTextRepresentation):
-        spec_table.search({"n": {"$gt": 1, "plain": 2}}, "n", limit=20)
-    # jsonb: no error, just a silent empty result set.
-    assert spec_table.search({"data": {"$gt": 1, "plain": 2}}, "n", limit=20) == []
+def test_mixed_operator_dict_raises(db, spec_table):
+    # A dict is operators only when *every* key starts with "$".  A mix of
+    # "$"-keys and plain keys is almost always a dropped "$"; rather than
+    # silently treating the whole dict as a literal value (which failed to cast
+    # on a typed column and matched nothing on jsonb), psycodict now refuses it
+    # with a clear error, at parse time, on any column type.
+    with pytest.raises(ValueError, match="mixes operators"):
+        spec_table._parse_dict({"n": {"$gt": 1, "plain": 2}})
+    with pytest.raises(ValueError, match="mixes operators"):
+        spec_table._parse_dict({"data": {"$gt": 1, "plain": 2}})
+    # An all-operator dict is unaffected...
+    allops = _sql(db, spec_table, {"n": {"$gt": 1, "$lt": 5}})
+    assert '"n" > %s' in allops and '"n" < %s' in allops
+    # ...and a dict with no "$" keys is still a literal jsonb value, not an error.
+    assert _sql(db, spec_table, {"data": {"a": 1}}) == '"data" = %s'
 
 
 # ===========================================================================
@@ -285,8 +292,8 @@ def test_lucky_default_sort_is_empty(null_table):
 
 
 def test_duplicate_sort_column_is_accepted(db, null_table):
-    # Sorting by the same column twice is redundant but not an error; it is
-    # emitted verbatim.  Pinned as-is for 1.0.
+    # Sorting by the same column twice is redundant but harmless (Postgres
+    # ignores the repeat); it is emitted verbatim rather than de-duplicated.
     assert null_table._sort_str([("num", 1), ("num", 1)]).as_string(db.conn) == '"num", "num"'
     rows = null_table.search({}, ["n"], sort=[("num", 1), ("num", 1)], limit=20)
     assert [r["n"] for r in rows] == [2, 0, 4, 1, 3]
@@ -394,12 +401,12 @@ def test_exists_and_none_equivalences(db, null_table):
     assert sorted(null_table.search({"num": None}, "n", limit=20)) == [1, 3]
 
 
-def test_ne_none_is_not_a_null_test(db, null_table):
-    # FOOTGUN (pinned as-is): {col: {"$ne": None}} renders 'col != NULL', which
-    # in SQL is never true, so it matches NOTHING -- it is NOT the complement of
-    # {col: None}.  Use $exists:True to test for non-null.
-    assert _sql(db, null_table, {"num": {"$ne": None}}) == '"num" != %s'
-    assert null_table.search({"num": {"$ne": None}}, "n", limit=20) == []
+def test_ne_none_is_the_non_null_complement(db, null_table):
+    # {col: {"$ne": None}} now renders 'col IS NOT NULL' -- the true complement
+    # of {col: None} ('col IS NULL') -- instead of the SQL 'col != NULL', which
+    # is never true and so matched nothing.  (It agrees with $exists:True.)
+    assert _sql(db, null_table, {"num": {"$ne": None}}) == '"num" IS NOT NULL'
+    assert sorted(null_table.search({"num": {"$ne": None}}, "n", limit=20)) == [0, 2, 4]
 
 
 def test_exists_on_missing_jsonb_path(db, spec_table):
@@ -438,12 +445,13 @@ def test_text_column_against_int_raises(spec_table):
 
 
 def test_boolean_column_needs_a_real_bool(spec_table):
-    # FOOTGUN (pinned as-is): Python's 0/1 are sent as smallint and there is no
-    # boolean = smallint operator, so {"flag": 0} / {"flag": 1} RAISE.  Only
-    # actual bools work on a boolean column.
-    with pytest.raises(psycopg.errors.UndefinedFunction):
+    # A boolean column has no "boolean = integer" operator, so 0/1 used to fail
+    # with a cryptic driver error deep in the query.  psycodict now rejects a
+    # non-bool int on a boolean column with a clear error, at parse time; only
+    # actual bools work.
+    with pytest.raises(ValueError, match="is boolean"):
         spec_table.search({"flag": 0}, "n", limit=20)
-    with pytest.raises(psycopg.errors.UndefinedFunction):
+    with pytest.raises(ValueError, match="is boolean"):
         spec_table.search({"flag": 1}, "n", limit=20)
     assert spec_table.search({"flag": True}, "n", limit=20) == [0, 3, 6, 9]
     assert spec_table.search({"flag": False}, "n", limit=20) == [1, 2, 4, 5, 7, 8]

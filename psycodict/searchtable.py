@@ -320,6 +320,12 @@ class PostgresSearchTable(PostgresTable):
             else:
                 cmd = SQL("{0} IS NULL").format(col)
             value = []
+        elif key == "$ne" and value is None:
+            # SQL "col != NULL" is never true, so {col: {"$ne": None}} used to
+            # match nothing -- the opposite of {col: None} (which renders "col
+            # IS NULL").  Make $ne None its true complement, mirroring $eq/None.
+            cmd = SQL("{0} IS NOT NULL").format(col)
+            value = []
         elif key == "$notcontains":
             if not value:
                 # excluding nothing is no constraint at all
@@ -565,6 +571,7 @@ class PostgresSearchTable(PostgresTable):
                         strings.append(sub)
                         values.extend(vals)
                     continue
+                orig_key = key  # the column name as written, for error messages
                 # In a joined query, a prefix naming a joined table sends the
                 # key to that table; anything else is a column of this table,
                 # with periods keeping their usual path meaning
@@ -592,16 +599,45 @@ class PostgresSearchTable(PostgresTable):
                     key = SQL("{0}{1}").format(ident, SQL("").join(path))
                 else:
                     key = ident
-                if isinstance(value, dict) and all(k.startswith("$") for k in value):
-                    sub, vals = self._parse_dict(value, key, outer_type=col_type,
-                                                 join_context=join_context)
-                    if sub is not None:
-                        strings.append(sub)
-                        values.extend(vals)
-                    continue
+                if isinstance(value, dict):
+                    dollar = [k for k in value if k.startswith("$")]
+                    if dollar and len(dollar) != len(value):
+                        # A dict of operators must be *all* operator keys.  A
+                        # mix of "$"-keys and plain keys is almost always a
+                        # dropped "$" on one operator; treating it as a literal
+                        # value (the old behavior) fails to cast on a typed
+                        # column and silently matches nothing on jsonb, so
+                        # refuse it explicitly.
+                        plain = [k for k in value if not k.startswith("$")]
+                        raise ValueError(
+                            "Error building query for %r: an operator dict mixes "
+                            "operators %s with non-operator keys %s.  Use only "
+                            "keys beginning with '$' (did you drop a '$'?); a "
+                            "dict with no '$' keys is matched as a literal value."
+                            % (orig_key, sorted(dollar), sorted(plain))
+                        )
+                    if dollar or not value:
+                        # an all-operator dict, or {} (which imposes nothing)
+                        sub, vals = self._parse_dict(value, key, outer_type=col_type,
+                                                     join_context=join_context)
+                        if sub is not None:
+                            strings.append(sub)
+                            values.extend(vals)
+                        continue
+                    # otherwise a dict with no operators is a literal value
+                    # (e.g. a jsonb object), handled by the equality path below
                 if value is None:
                     strings.append(SQL("{0} IS NULL").format(key))
                 else:
+                    if col_type == "boolean" and isinstance(value, int) and not isinstance(value, bool):
+                        # Postgres has no boolean = integer operator, so 0/1 on
+                        # a boolean column raised a cryptic "operator does not
+                        # exist" deep in the driver.  Refuse it clearly instead;
+                        # pass a real bool (True/False).
+                        raise ValueError(
+                            "Column %r is boolean; compare it with True or "
+                            "False, not the integer %r." % (orig_key, value)
+                        )
                     if col_type == "jsonb":
                         value = Json(value)
                     cmd = "{0} = %s" + self._create_typecast("$eq", value, key, col_type)
