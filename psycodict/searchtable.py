@@ -766,7 +766,8 @@ class PostgresSearchTable(PostgresTable):
         return queries
 
     def lucky(self, query={}, projection=2, offset=0, sort=[], raw=None, raw_values=None, join=None):
-        # FIXME Nulls aka Nones are being erased, we should perhaps just leave them there
+        # None values are kept in result dictionaries by default; tables
+        # created with include_nones=False omit them instead
         """
         One of the two main public interfaces for performing SELECT queries,
         intended for situations where only a single result is desired.

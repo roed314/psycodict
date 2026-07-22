@@ -148,7 +148,7 @@ _meta_tables_defaults = {
     "stats_valid": "true",
     "total": "0",
     "important": "false",
-    "include_nones": "false",
+    "include_nones": "true",
 }
 _meta_tables_types = dict(zip(_meta_tables_cols, (
     "text",

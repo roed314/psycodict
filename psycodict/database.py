@@ -661,6 +661,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             # Without this an integer id would silently widen to the
             # default bigint in the copy.
             id_type=table.col_type["id"],
+            # keep the source's behavior rather than the current default
+            include_nones=table._include_nones,
         )
         if data:
             logid = table._check_locks("create_table_like")
@@ -693,6 +695,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         tablespace=None,
         force_description=False,
         id_type="bigint",
+        include_nones=True,
     ):
         """
         Add a new search table to the database.  See also `create_table_like`.
@@ -716,6 +719,11 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         - ``tablespace`` -- (optional) a postgres tablespace to use for the new table
         - ``force_description`` -- whether to require descriptions
         - ``id_type`` -- what postgres type to use for the id column
+        - ``include_nones`` -- whether search results should include columns
+          whose value is None (default True).  Pass False to omit None values
+          from result dictionaries, as was the default before psycodict 1.0.
+          The value is stored explicitly in meta_tables, so the flipped
+          default reaches databases created before it without any migration.
 
         COMMON TYPES:
 
@@ -808,10 +816,14 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             self.grant_select(name + "_stats")
             self.grant_insert(name + "_stats")
             # FIXME use global constants ?
+            # include_nones is written explicitly rather than left to the
+            # column default: existing databases keep the DDL default their
+            # meta_tables was created with, so relying on it would give new
+            # tables different behavior in old and new databases.
             inserter = SQL(
                 "INSERT INTO meta_tables "
-                "(name, sort, id_ordered, out_of_order, label_col) "
-                "VALUES (%s, %s, %s, %s, %s)"
+                "(name, sort, id_ordered, out_of_order, label_col, include_nones) "
+                "VALUES (%s, %s, %s, %s, %s, %s)"
             )
             self._execute(
                 inserter,
@@ -821,6 +833,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     id_ordered,
                     not id_ordered,
                     label_col,
+                    include_nones,
                 ],
             )
         new_table = self._search_table_class_(
@@ -831,6 +844,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             id_ordered=id_ordered,
             out_of_order=(not id_ordered),
             total=0,
+            include_nones=include_nones,
         )
         # Add the primary key on id, so that methods like drop_pkeys (used by
         # insert_many and reload) find the constraint they expect

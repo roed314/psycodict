@@ -566,7 +566,7 @@ def test_jsonb_explicit_none_is_stored_as_sql_null(table_factory):
     table = table_factory()
     table.insert_many([{"n": 0, "label": "a", "data": None}])
     # the value reads back as None, so it should also be searchable as one
-    assert table.lucky({"n": 0}, ["data"]) == {}
+    assert table.lucky({"n": 0}, ["data"]) == {"data": None}
     assert table.count({"data": None}) == 1
     assert table.count({"data": {"$exists": False}}) == 1
 
@@ -600,15 +600,20 @@ def test_numeric_and_float_roundtrip(filled_table, nullable_table):
         assert isinstance(fractional["mat"][1], int)
 
 
-def test_nulls_are_omitted_from_results(nullable_table, monkeypatch):
-    assert nullable_table.lucky({"n": 1}, 1) == {"n": 1, "label": "b"}
-    assert list(nullable_table.search({"n": 1})) == [{"n": 1, "label": "b"}]
-    # unless the table asks for them
-    monkeypatch.setattr(nullable_table, "_include_nones", True)
+def test_nulls_are_included_by_default(nullable_table):
     record = nullable_table.lucky({"n": 1}, 1)
     assert sorted(record) == ["data", "flag", "label", "mat", "n", "num", "vec", "x"]
     assert record["num"] is None
     assert record["vec"] is None
+    assert list(nullable_table.search({"n": 1}, ["label", "num"])) == [{"label": "b", "num": None}]
+
+
+def test_nulls_are_omitted_when_asked(table_factory):
+    # the pre-1.0 default, now opt-in at table creation
+    table = table_factory(include_nones=False)
+    table.insert_many([{"n": 1, "label": "b"}])
+    assert table.lucky({"n": 1}, 1) == {"n": 1, "label": "b"}
+    assert list(table.search({"n": 1})) == [{"n": 1, "label": "b"}]
 
 
 ##################################################################
