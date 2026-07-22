@@ -82,7 +82,10 @@ and drop the predicate.  `meta_format` and `min_compat` cannot stop it, since
 it never reads them.
 
 > **Do not run a pre-1.0 psycodict against a database that a 1.0+ psycodict
-> has created or migrated (format ≥ 1).**  This matters only during a
+> has created or migrated (format ≥ 1).**  If it has already happened, the
+> damage is repairable: the predicate is still recorded in `meta_indexes`, so
+> running `restore_index` from a 1.0 client rebuilds the partial index
+> correctly.  This matters only during a
 > mixed-version rollout; once every process has been upgraded to 1.0+ there is
 > nothing to watch for.  (The alternative — leaving a tombstone in the old
 > `meta_version` table so pre-1.0 clients refuse — was declined in favor of the
@@ -103,6 +106,16 @@ which applies each registered step in order and re-stamps the format as it
 goes (each step's DDL and stamp commit together).  Steps are idempotent, so
 re-running a migration — or running it on a database that grew a column out
 of band — is harmless.  Downgrades are not supported.
+
+### Rolling back
+
+Because downgrades are not supported, take an ordinary backup before
+migrating — `pg_dump` — and restoring it is the rollback.  This procedure has
+been rehearsed against a live format-0 database: after `pg_restore`, a
+pre-1.0 client operates exactly as before, and a 1.0 client connects with the
+usual format-0 warning and degrades, as if the migration had never run.  A
+migration touches only the meta tables, so the backup taken for this purpose
+has no reason to outlive the rollout.
 
 ## Exported metadata files
 
