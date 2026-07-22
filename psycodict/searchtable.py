@@ -1651,7 +1651,11 @@ class PostgresSearchTable(PostgresTable):
                 else:
                     # An arbitrary projection might be large, so we get ids
                     L = list(self.search(query, "id", sort=[]))
-                self.stats._record_count(query, len(L))
+                # Cache the count we just computed, but only when count-saving
+                # is enabled -- matching count()/count_distinct(), which never
+                # write to the cache tables while ``saving`` is False.
+                if self.stats.saving:
+                    self.stats._record_count(query, len(L))
                 if len(L) == 0:
                     return None
                 res = random.choice(L)
@@ -1843,7 +1847,9 @@ class PostgresSearchTable(PostgresTable):
           displayed repeatedly (search pages record theirs), but every distinct
           recorded query adds a row to the counts table, so it is opt-in:
           scripts running many one-off counts no longer clutter the table (and
-          slow down reloads) by accident.
+          slow down reloads) by accident.  Recording also requires ``saving``
+          to be enabled on the stats table; with the psycodict default
+          ``saving = False`` nothing is written.
         - ``join`` -- a list of tuples describing other search tables to join
           to this one, as for ``search``.  Counts of joined queries are
           computed directly and never cached, so ``record`` is ignored;
