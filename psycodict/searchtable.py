@@ -1,4 +1,14 @@
 # -*- coding: utf-8 -*-
+"""
+The read half of a table: dictionary queries.
+
+:class:`PostgresSearchTable` extends
+:class:`~psycodict.table.PostgresTable` with the query API -- ``search``,
+``lucky``, ``lookup``, ``count``, ``random`` and friends -- translating
+query dictionaries into SQL SELECT statements, with projections, sorting,
+joins and the ``info`` contract used by search pages.  The query language
+is specified in QueryLanguage.md and the read API in Searching.md.
+"""
 import random
 import time
 from itertools import islice
@@ -33,6 +43,25 @@ def _qualify(frag, tablename):
 
 
 class PostgresSearchTable(PostgresTable):
+    """
+    A single search table, as returned by ``db.<tablename>``: the interface
+    for reading data with dictionary queries.
+
+    The read methods -- :meth:`search`, :meth:`lucky`, :meth:`lookup`,
+    :meth:`exists`, :meth:`count`, :meth:`random`, :meth:`distinct` and
+    friends -- accept a query dictionary such as
+    ``{"degree": 2, "disc": {"$lt": 0}}``, translate it into SQL, and
+    return rows as dictionaries (or bare values, under a string
+    projection).  The query language is specified in QueryLanguage.md and
+    the read API in Searching.md.  Writing and schema changes live on the
+    base class :class:`~psycodict.table.PostgresTable`, and precomputed
+    statistics on :class:`~psycodict.statstable.PostgresStatsTable`
+    (available as ``self.stats``).
+
+    Instances are constructed by
+    :class:`~psycodict.database.PostgresDatabase` from each table's
+    ``meta_tables`` row; they are not meant to be created directly.
+    """
     ##################################################################
     # Helper functions for querying                                  #
     ##################################################################
@@ -51,7 +80,7 @@ class PostgresSearchTable(PostgresTable):
             could be split into a search table and an extras table).
           - If 3, as 1 but with id included
           - If a dictionary, can specify columns to include by giving True values, or columns to exclude by giving False values.  Entries must be plain columns; path specifiers are not accepted here (they raise the not-a-column error).
-          - If a list, specifies which columns to include.  Entries may be plain columns, array slicers (``vec[2]``) or dotted [path specifiers](#column-part-specifiers) (``data.s``, ``vec.1``), the same forms accepted by joined queries; only the base column is validated, and the entry string is used verbatim as the key of the returned result dictionaries.
+          - If a list, specifies which columns to include.  Entries may be plain columns, array slicers (``vec[2]``) or dotted path specifiers (``data.s``, ``vec.1``; see the *Column part specifiers* section of QueryLanguage.md), the same forms accepted by joined queries; only the base column is validated, and the entry string is used verbatim as the key of the returned result dictionaries.
           - If a string, projects onto just that column (which may itself be a slicer or path); searches will return the value rather than a dictionary.
 
         OUTPUT:
@@ -142,7 +171,7 @@ class PostgresSearchTable(PostgresTable):
     def _create_typecast(self, key, value, col, col_type):
         """
         This method is used to add typecasts to queries when necessary.
-        It is called from `_parse_special` and `_parse_dict`; see the documentation
+        It is called from ``_parse_special`` and ``_parse_dict``; see the documentation
         of those functions for inputs.
         """
         if col_type == "smallint[]" and key in ["$contains", "$containedin"]:
@@ -1019,7 +1048,7 @@ class PostgresSearchTable(PostgresTable):
         - ``offset`` -- a nonnegative integer (default 0), where to start in the list of results.
         - ``sort`` -- a sort order.  Either None or a list of strings (which are interpreted as column names in the ascending direction) or of pairs (column name, 1 or -1).  If not specified, will use the default sort order on the table.  If you want the result unsorted, use [].
         - ``info`` -- a dictionary, which is updated with values of 'query', 'count', 'start', 'exact_count' and 'number'.  Optional.
-        - ``split_ors`` -- a boolean.  If true, executes one query per clause in the `$or` list, combining the results.  Only used when a limit is provided.
+        - ``split_ors`` -- a boolean.  If true, executes one query per clause in the ``$or`` list, combining the results.  Only used when a limit is provided.
         - ``one_per`` -- a list of columns.  If provided, only one result will be included with each given set of values for those columns (the first according to the provided sort order).
         - ``silent`` -- a boolean.  If True, slow query warnings will be suppressed.
         - ``raw`` -- a string, to be used as the WHERE part of the query.  DO NOT USE THIS DIRECTLY FOR INPUT FROM WEBSITE.

@@ -180,6 +180,9 @@ class Array():
         self._seq = seq
 
     def getquoted(self):
+        """
+        The Postgres array literal for the wrapped sequence, as bytes.
+        """
         return _pg_array_literal(self._seq).encode()
 
     def __str__(self):
@@ -213,6 +216,9 @@ class ArrayDumper(Dumper):
     Dumps an Array wrapper as a Postgres array literal with unknown oid.
     """
     def dump(self, obj):
+        """
+        Render the wrapped sequence as a Postgres array literal.
+        """
         return _pg_array_literal(obj._seq).encode()
 
 
@@ -236,10 +242,18 @@ class Json():
 
     @classmethod
     def dumps(cls, obj):
+        """
+        Serialize ``obj`` to json text using the extended encoding
+        (see :meth:`prep`).
+        """
         return json.dumps(cls.prep(obj))
 
     @classmethod
     def loads(cls, s):
+        """
+        Parse json text and decode the extended encoding back to Python
+        and Sage objects (see :meth:`extract`).
+        """
         return cls.extract(json.loads(s))
 
     @classmethod
@@ -514,6 +528,9 @@ class JsonWrapperDumper(Dumper):
     context (this works for both json and jsonb columns).
     """
     def dump(self, obj):
+        """
+        Render the wrapped value as json text.
+        """
         return Json.dumps(obj.obj).encode()
 
 
@@ -523,6 +540,9 @@ class DictJsonDumper(Dumper):
     ``register_adapter(dict, Json)``).
     """
     def dump(self, obj):
+        """
+        Render the dict as json text.
+        """
         return Json.dumps(obj).encode()
 
 

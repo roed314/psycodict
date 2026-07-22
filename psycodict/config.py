@@ -1,4 +1,16 @@
 # -*- coding: utf-8 -*-
+"""
+Configuration handling for psycodict.
+
+:class:`Configuration` merges a ``config.ini`` file with command-line
+arguments (off by default; see ``readargs``) and hands the result to
+:class:`~psycodict.database.PostgresDatabase`.  When no file is named
+explicitly, :func:`find_config_file` discovers one: the
+``PSYCODICT_CONFIG`` environment variable, then ``config.ini`` in the
+current directory if it already exists, then ``~/.psycodict/config.ini``,
+which is created on first use.  A ``secrets.ini`` next to the configuration
+file overrides its values, so credentials can be kept out of it.
+"""
 import os
 import argparse
 from configparser import ConfigParser
@@ -362,6 +374,11 @@ class Configuration():
         return None
 
     def get_postgresql_default(self):
+        """
+        The built-in default connection options (host, port, user, ...), as
+        a dictionary -- the values used before the configuration file and
+        command line are consulted.
+        """
         res = dict(self.default_args["postgresql"])
         res["port"] = int(res["port"])
         return res

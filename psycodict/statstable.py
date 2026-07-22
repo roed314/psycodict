@@ -1,4 +1,16 @@
 # -*- coding: utf-8 -*-
+"""
+Precomputed counts and statistics for a search table.
+
+:class:`PostgresStatsTable`, available as ``table.stats``, records the
+number of rows matching queries (in an auxiliary ``_counts`` table) and
+statistics -- minimum, maximum, average, totals -- on numerical columns
+(in a ``_stats`` table), so that count displays and statistics pages need
+not rescan large tables.  Statistics are added with ``add_stats`` and
+``add_numstats``, kept current by the data management methods of
+:class:`~psycodict.table.PostgresTable`, and read back with ``count``,
+``quick_count``, ``max``, ``column_counts``, ``numstats`` and friends.
+"""
 import itertools
 import logging
 import math
@@ -40,7 +52,9 @@ for typ in ["text", "char", "character", "character varying", "varchar"]:
 
 class PostgresStatsTable(PostgresBase):
     """
-    This object is used for storing statistics and counts for a search table.
+    This object is used for storing statistics and counts for a search table,
+    available as the ``stats`` attribute of a
+    :class:`~psycodict.searchtable.PostgresSearchTable`.
 
     For each search table (e.g. ec_curvedata), there are two auxiliary tables supporting
     statistics functionality.  The counts table (e.g. ec_curvedata_counts) records
@@ -67,29 +81,31 @@ class PostgresStatsTable(PostgresBase):
     updated.
 
     The backend functionality of this object supports the StatsDisplay object
-    available in `lmfdb.utils.display_stats`.  See that module for more details
-    on making a statistics page for a section of the LMFDB.  In particular,
-    the interface there has the capacity to automatically call ``add_stats`` so that
-    viewing an appropriate stats page (e.g. beta.lmfdb.org/ModularForm/GL2/Q/holomorphic/stats)
-    is sufficient to add the necessary statistics to the stats and counts tables.
-    The methods ``_get_values_counts`` and ``_get_total_avg`` exist to support
-    the ``StatsDisplay`` object.
+    available in the LMFDB (``lmfdb.utils.display_stats``).  See that module
+    for more details on making a statistics page for a section of the LMFDB.
+    In particular, the interface there has the capacity to automatically call
+    ``add_stats`` so that viewing an appropriate stats page
+    (e.g. beta.lmfdb.org/ModularForm/GL2/Q/holomorphic/stats) is sufficient to
+    add the necessary statistics to the stats and counts tables.  The methods
+    ``_get_values_counts`` and ``_get_total_avg`` exist to support the
+    ``StatsDisplay`` object.
 
     Once statistics have been added, they are accessed using the following functions:
 
     - ``quick_count`` -- count the number of rows satisfying a query,
-                         returning None if not already cached.
-    - ``count`` -- count the number of rows satisfying a query, computing and storing
-                   the result if not yet cached.
-    - ``max`` -- returns the maximum value attained by a column, computing and storing
-                 the result if not yet cached.
-    - ``column_counts`` -- provides all counts stored for a given column or set of columns.
-                           This will be much faster than calling ``count`` repeatedly.
-                           If ``add_stats`` has not been called, it will do so.
-    - ``numstats`` -- provides numerical statistics on a single column, grouped by
-                      the values taken on by another set of columns.
-    - ``extra_counts`` -- returns a dictionary giving counts that were added separately
-                          from an ``add_stats`` call (for example, via user requests on the website)
+      returning None if not already cached.
+    - ``count`` -- count the number of rows satisfying a query, computing and
+      storing the result if not yet cached.
+    - ``max`` -- returns the maximum value attained by a column, computing and
+      storing the result if not yet cached.
+    - ``column_counts`` -- provides all counts stored for a given column or
+      set of columns.  This will be much faster than calling ``count``
+      repeatedly.  If ``add_stats`` has not been called, it will do so.
+    - ``numstats`` -- provides numerical statistics on a single column,
+      grouped by the values taken on by another set of columns.
+    - ``extra_counts`` -- returns a dictionary giving counts that were added
+      separately from an ``add_stats`` call (for example, via user requests
+      on the website)
     - ``status`` -- prints a summary of the statistics currently stored.
 
     EXAMPLES:
@@ -142,15 +158,15 @@ class PostgresStatsTable(PostgresBase):
 
     - ``cols`` -- these are the columns specified in the query.  A list, stored as a jsonb.
     - ``values`` -- these could be numbers, or dictionaries giving a more complicated constraint.
-        A list, of the same length as ``cols``, stored as a jsonb.
+      A list, of the same length as ``cols``, stored as a jsonb.
     - ``count`` -- the number of rows in the search table where the columns take on the given values.
     - ``extra`` -- false if the count was added in an ``add_stats`` method,
-        true if it was added separately (such as by a request on a search results page).
+      true if it was added separately (such as by a request on a search results page).
     - ``split`` -- used when column values are arrays.  If true, then the array is split
-        up before counting.  For example, when counting ramified primes,
-        if split werefalse then [2,3,5] and [2,3,7] would count as separate values
-        (there are 888280 number fields in the LMFDB with ramps = [2,3,5]).
-        If split were true, then both [2,3,5] and [2,3,7] would contribute toward the count for 2.
+      up before counting.  For example, when counting ramified primes,
+      if split were false then [2,3,5] and [2,3,7] would count as separate values
+      (there are 888280 number fields in the LMFDB with ramps = [2,3,5]).
+      If split were true, then both [2,3,5] and [2,3,7] would contribute toward the count for 2.
 
     For example,
     ["ramps"], [[2, 3, 5]], 888280, t, f
@@ -167,16 +183,16 @@ class PostgresStatsTable(PostgresBase):
     The columns in a stats table are:
 
     - ``stat`` -- a text field giving the statistic type.  Currently, will be one of
-        "max", "min", "avg", "total" (one such row for each add_stats call),
-        "ntotal" (one such row for each add_numstats call), "split_total"
-        (one such row for each add_stats call with split_list True).
+      "max", "min", "avg", "total" (one such row for each add_stats call),
+      "ntotal" (one such row for each add_numstats call), "split_total"
+      (one such row for each add_stats call with split_list True).
     - ``cols`` -- the columns for which statistics are being computed.  Must have
-        length 1 and be numerical in order to have "max", "min" or "avg"
+      length 1 and be numerical in order to have "max", "min" or "avg"
     - ``constraint_cols`` -- columns in the constraint dictionary
     - ``constraint_values`` -- the values specified for the columns in ``ccols``
     - ``threshold`` -- NULL or an integer.  If specified, only value sets where the
-        row count surpasses the threshold will be added to the counts table and
-        counted toward min, max and avg statistics.
+      row count surpasses the threshold will be added to the counts table and
+      counted toward min, max and avg statistics.
 
     BUCKETED STATS:
 
@@ -192,12 +208,12 @@ class PostgresStatsTable(PostgresBase):
 
         sage: db.mf_newforms.stats.add_bucketed_counts(['level', 'weight'], {'level': ['1','2-10','11-100','101-1000','1001-2000', '2001-4000','4001-6000','6001-8000','8001-10000'], 'weight': ['1','2','3','4','5-8','9-16','17-32','33-64','65-316']})
 
-    You can now count certain ranges:
+    You can now count certain ranges::
 
         sage: db.mf_newforms.stats.quick_count({'level':{'$gte':101, '$lte':1000}, 'weight':4})
         12281
 
-    But only those specified by the buckets:
+    But only those specified by the buckets::
 
         sage: db.mf_newforms.stats.quick_count({'level':{'$gte':201, '$lte':800}, 'weight':2}) is None
         True
@@ -206,7 +222,7 @@ class PostgresStatsTable(PostgresBase):
 
     - ``table`` -- a ``PostgresTable`` object.
     - ``total`` -- an integer, the number of rows in the search table.  If not provided,
-        it will be looked up or computed.
+      it will be looked up or computed.
     """
     # By default we don't save counts.  You can inherit from this class and change
     # the following value to True, then set _stats_table_class_ to your new stats class on your table class
@@ -761,7 +777,7 @@ class PostgresStatsTable(PostgresBase):
 
     def _record_statistic(self, col, ccols, cvals, m, kind="max"):
         """
-        Store a computed statistic (referenced by `kind`) in the stats table.
+        Store a computed statistic (referenced by ``kind``) in the stats table.
 
         INPUT:
 
@@ -769,7 +785,7 @@ class PostgresStatsTable(PostgresBase):
         - ``ccols`` -- the constraint columns
         - ``cvals`` -- the constraint values
         - ``m`` -- the maximum value to be stored
-        - ``kind`` -- the kind of statistic. Usually `min` or `max` or `sum`
+        - ``kind`` -- the kind of statistic. Usually ``min`` or ``max`` or ``sum``
         """
         try:
             inserter = SQL(
@@ -1146,7 +1162,7 @@ class PostgresStatsTable(PostgresBase):
         INPUT:
 
         - ``col`` -- the column whose minimum, maximum and average values are to be computed.
-            Should be an integer or real type in order for `AVG` to function.
+            Should be an integer or real type in order for ``AVG`` to function.
         - ``grouping`` -- a list of columns.  Statistics will be computed within groups defined by
             the values taken on by these columns.  If no columns given, then the overall statistics
             will be computed.
@@ -1284,7 +1300,7 @@ class PostgresStatsTable(PostgresBase):
         INPUT:
 
         - ``col`` -- the column whose minimum, maximum and average values are to be computed.
-            Should be an integer or real type in order for `AVG` to function.
+            Should be an integer or real type in order for ``AVG`` to function.
         - ``grouping`` -- a list of columns.  Statistics will be computed within groups defined by
             the values taken on by these columns.  If no columns given, then the overall statistics
             will be computed.
@@ -1912,7 +1928,7 @@ ORDER BY v.ord LIMIT %s"""
         INPUT:
 
         - ``include_counts`` -- if False, will omit the counts and just give lists of values.
-        - ``suffix`` -- Used when dealing with `_tmp` or `_old*` tables.
+        - ``suffix`` -- Used when dealing with ``_tmp`` or ``_old*`` tables.
         """
         selecter = SQL("SELECT cols, values, count FROM {0} WHERE extra ='t'").format(
             Identifier(self.counts + suffix)
