@@ -4,12 +4,13 @@ Run the doctests embedded in psycodict's docstrings.
 
 The EXAMPLES blocks in the library are real transcripts: they run here,
 against two small tables of genuine LMFDB data created for the purpose --
-``test_fields``, the number fields of degree at most 3 with absolute
-discriminant at most 90 (plus the rationals), and ``test_curves``, a dozen
-elliptic curves over three of those fields.  Each docstring can assume a
-connected database ``db`` with those two tables and nothing else; anything
-a reader should reproduce (``nf = db.test_fields`` and so on) is written
-out in the example itself.
+``test_fields``, 22 selected number fields of degree at most 3 (the
+rationals, thirteen quadratic fields, and the nine cubic fields with
+absolute discriminant at most 90), and ``test_curves``, a dozen elliptic
+curves over three of those fields.  Each docstring can assume a connected
+database ``db`` with those two tables and nothing else; anything a reader
+should reproduce (``nf = db.test_fields`` and so on) is written out in
+the example itself.
 
 Examples that demonstrate operational workflows (reloads, staged writes,
 comparing servers) are marked ``# doctest: +SKIP`` in their docstrings:
@@ -27,8 +28,10 @@ import pytest
 
 
 # The columns and rows of the standard example tables.  Real LMFDB data:
-# all number fields with degree <= 3 and |disc| <= 90, and elliptic curves
-# over Q(sqrt(5)), Q(sqrt(2)) and Q(sqrt(13)) of small conductor norm.
+# 22 selected number fields of degree <= 3 (the rationals, thirteen
+# quadratic fields, and the nine cubic fields with |disc| <= 90), and
+# elliptic curves over Q(sqrt(5)), Q(sqrt(2)) and Q(sqrt(13)) of small
+# conductor norm.
 FIELD_COLUMNS = [
     ("label", "text"),
     ("degree", "smallint"),
@@ -110,10 +113,38 @@ def _rows(columns, data):
     return [dict(zip(names, row)) for row in data]
 
 
+def _is_our_leftover(db, name, columns, data):
+    """
+    Whether an existing table with one of our fixed names is a leftover
+    from a crashed earlier run of this file: same columns and the same
+    set of labels.  Anything else is somebody's real table.
+    """
+    table = db[name]
+    if sorted(table.search_cols) != sorted(col for col, typ in columns):
+        return False
+    try:
+        return set(table.distinct("label")) == {row[0] for row in data}
+    except Exception:
+        return False
+
+
 @pytest.fixture(scope="module")
 def doc_tables(db):
-    for name in ("test_curves", "test_fields"):
+    # These tables have fixed names (the docstrings use them), unlike the
+    # rest of the suite, which randomises its names.  Refuse to touch an
+    # existing table unless it is recognizably a leftover of our own.
+    for name, columns, data in [
+        ("test_curves", CURVE_COLUMNS, CURVES),
+        ("test_fields", FIELD_COLUMNS, FIELDS),
+    ]:
         if name in db.tablenames:
+            if not _is_our_leftover(db, name, columns, data):
+                pytest.fail(
+                    "The database already contains a table named %r that "
+                    "does not look like this test file's own leftover; "
+                    "refusing to drop it.  Point the tests at a scratch "
+                    "database or remove the table by hand." % name
+                )
             db.drop_table(name, force=True)
     db.create_table(
         "test_fields",
@@ -129,9 +160,14 @@ def doc_tables(db):
         sort=["conductor_norm", "label"],
     )
     db.test_curves.insert_many(_rows(CURVE_COLUMNS, CURVES))
+    # Clear any _tmp/_old debris of ours from a crashed earlier run (the
+    # staged() example creates a test_fields_old1 backup, for instance).
+    db.test_fields.cleanup_from_reload()
+    db.test_curves.cleanup_from_reload()
     yield db
     for name in ("test_curves", "test_fields"):
         try:
+            db[name].cleanup_from_reload()
             db.drop_table(name, force=True)
         except Exception:  # pragma: no cover - cleanup must not mask failures
             pass

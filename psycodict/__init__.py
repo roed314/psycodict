@@ -5,9 +5,9 @@ the kinds of queries needed by the LMFDB.
 
 The examples in this package's docstrings are real transcripts, run as
 doctests by ``tests/test_doctests.py`` against two small tables of LMFDB
-data that it creates: ``test_fields`` (the number fields of degree at most
-3 with absolute discriminant at most 90) and ``test_curves`` (a dozen
-elliptic curves over three of those fields).
+data that it creates: ``test_fields`` (22 selected number fields of
+degree at most 3) and ``test_curves`` (a dozen elliptic curves over three
+of those fields).
 
 EXAMPLES::
 

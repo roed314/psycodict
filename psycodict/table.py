@@ -2388,12 +2388,28 @@ class PostgresTable(PostgresBase):
         change neither number and escape the backstop, so raw-SQL writers
         must simply stay away from a table while it is being staged.
 
-        EXAMPLES::
+        EXAMPLES:
 
-            >>> with db.test_fields.staged() as staged:  # doctest: +SKIP
-            ...     staged.insert_many(rows)
-            ...     staged.update({"degree": 2}, {"flag": True})
-            ...     staged.delete({"bad": True})
+        Stage a batch of changes -- here inserting a (real) totally real
+        quartic field, touching it up, and then deleting it again, so the
+        table ends up back where it started::
+
+            >>> nf = db.test_fields
+            >>> row = {'label': '4.4.725.1', 'degree': 4, 'r2': 0,
+            ...        'disc_abs': 725, 'disc_sign': 1, 'ramps': [5, 29],
+            ...        'class_number': 1, 'class_group': []}
+            >>> with nf.staged() as staged:
+            ...     staged.insert_many([row])
+            ...     staged.update({'label': '4.4.725.1'}, {'class_number': 1})
+            ...     staged.delete({'degree': 4})
+            Built primary key on test_fields in ... secs
+            Staged copy of test_fields created in ... secs
+            Inserted 1 records into test_fields_tmp in ... secs
+            ...
+            Swapped temporary tables for test_fields into place in ... secs
+            New backup at test_fields_old1
+            >>> nf.count()
+            22
         """
         return StagedWriteContext(self)
 
