@@ -133,6 +133,9 @@ dmypy.json
 
 # Secrets file: should not be committed to repo!
 secrets.ini
+# Local database configuration (may contain a password): copy
+# config.ini.example to config.ini and edit.  Should not be committed.
+config.ini
 # Guides copied into docs/ at build time by docs/conf.py
 docs/README.md
 docs/QueryLanguage.md

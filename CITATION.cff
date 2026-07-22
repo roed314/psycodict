@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use psycodict in your work, please cite it as below."
+title: "psycodict: dictionary-based Python interface to PostgreSQL databases"
+type: software
+authors:
+  - family-names: Roe
+    given-names: David
+    affiliation: "Massachusetts Institute of Technology"
+  - family-names: Costa
+    given-names: Edgar
+    affiliation: "Massachusetts Institute of Technology"
+abstract: >-
+  A Python interface to PostgreSQL in which queries are expressed as
+  dictionaries, developed for and split off from the L-functions and
+  Modular Forms Database (LMFDB). It also provides data management
+  tools wrapping PostgreSQL's COPY mechanisms and statistics tables
+  for cached counts.
+repository-code: "https://github.com/roed314/psycodict"
+license: GPL-2.0-or-later
+keywords:
+  - PostgreSQL
+  - Python
+  - database
+  - query language
+  - LMFDB
