@@ -91,6 +91,10 @@ class PostgresDatabase(PostgresBase):
 
     Also, each tablename will be stored as an attribute, so that db.ec_curvedata works for example.
 
+    These table objects are snapshots: if another process later changes the schema
+    (adding or dropping columns or tables), call ``refresh_tables`` to update them
+    in place instead of restarting the process.
+
     EXAMPLES::
 
         sage: from lmfdb import db
@@ -229,16 +233,6 @@ class PostgresDatabase(PostgresBase):
         logging.info("Read/write to userdb: %s", self._read_and_write_userdb)
         logging.info("Read/write to knowls: %s", self._read_and_write_knowls)
 
-        cur = self._execute(SQL(
-            "SELECT table_name, column_name, udt_name::regtype "
-            "FROM information_schema.columns ORDER BY table_name, ordinal_position"
-        ))
-        data_types = {}
-        for table_name, column_name, regtype in cur:
-            if table_name not in data_types:
-                data_types[table_name] = []
-            data_types[table_name].append((column_name, regtype))
-
         # Refuse to run against a database that still uses the removed
         # search/extras table split
         legacy = self._execute(SQL(
@@ -286,6 +280,40 @@ class PostgresDatabase(PostgresBase):
                 % (META_VERSION, hint)
             )
 
+        self.tablenames = []
+        self.refresh_tables()
+
+    def refresh_tables(self):
+        """
+        Update the table objects to match the current state of the database.
+
+        The set of tables, and each table's columns, types, sort order and
+        other metadata, are read from the database when this object is
+        created.  A long-running process (such as a website) therefore does
+        not see schema changes made from other processes: after a column is
+        dropped, for example, its queries still mention the column and fail,
+        while a newly added column is silently invisible.  Rather than
+        restarting every such process, call this method to bring the process
+        up to date -- on a schedule, say, or upon catching an
+        ``errors.UndefinedColumn``.
+
+        Existing table objects are updated in place, so table references held
+        by application code (``nf = db.nf_fields``) remain valid.  Tables
+        created since the last refresh become accessible as attributes and are
+        added to ``tablenames``; tables that have been dropped are removed.  A
+        reference held to a dropped table's object will raise an error on its
+        next query, as it must, since the underlying table no longer exists.
+        """
+        cur = self._execute(SQL(
+            "SELECT table_name, column_name, udt_name::regtype "
+            "FROM information_schema.columns ORDER BY table_name, ordinal_position"
+        ))
+        data_types = {}
+        for table_name, column_name, regtype in cur:
+            if table_name not in data_types:
+                data_types[table_name] = []
+            data_types[table_name].append((column_name, regtype))
+
         try:
             cur = self._execute(SQL(
                 "SELECT name, label_col, sort, count_cutoff, id_ordered, out_of_order, "
@@ -297,13 +325,20 @@ class PostgresDatabase(PostgresBase):
                 "If this is a fresh database, connect with PostgresDatabase(create=True) "
                 "to create them."
             )
-        self.tablenames = []
+        current = set()
         for tabledata in cur:
             tablename = tabledata[0]
-            tabledata += (data_types,)
-            table = self._search_table_class_(self, *tabledata)
-            self.__dict__[tablename] = table
-            self.tablenames.append(tablename)
+            current.add(tablename)
+            if tablename in self.tablenames:
+                self.__dict__[tablename]._refresh(tabledata[1:], data_types)
+            else:
+                tabledata += (data_types,)
+                table = self._search_table_class_(self, *tabledata)
+                self.__dict__[tablename] = table
+                self.tablenames.append(tablename)
+        for tablename in [name for name in self.tablenames if name not in current]:
+            delattr(self, tablename)
+            self.tablenames.remove(tablename)
         self.tablenames.sort()
 
     def __repr__(self):

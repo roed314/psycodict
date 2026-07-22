@@ -171,6 +171,58 @@ class PostgresTable(PostgresBase):
         else:
             self._sort = self._primary_sort = None
 
+    def _refresh(self, meta=None, data_types=None):
+        """
+        Update this object to match the current schema of the underlying table.
+
+        The columns and their types, together with this table's metadata in
+        ``meta_tables`` (sort order, label column, etc.), are read from the
+        database when this object is created.  A long-running process (such as
+        a website) does not see schema changes made by other processes, and
+        once its snapshot is stale its queries can fail.  This method re-reads
+        this table's row in ``meta_tables`` together with the current columns,
+        updating the object in place.  It is normally invoked through
+        ``db.refresh_tables()``, which refreshes every table at once; see its
+        documentation for more details.
+
+        INPUT:
+
+        - ``meta`` -- (optional) this table's row in ``meta_tables``, as a tuple
+          ``(label_col, sort, count_cutoff, id_ordered, out_of_order,
+          stats_valid, total, include_nones)``.  If not provided, the row will
+          be looked up from the database.
+        - ``data_types`` -- (optional) a dictionary providing a list of column
+          names and types for each table name, as in ``_column_types``.  If not
+          provided, the columns will be looked up from the database.
+        """
+        if meta is None:
+            cur = self._execute(
+                SQL(
+                    "SELECT label_col, sort, count_cutoff, id_ordered, out_of_order, "
+                    "stats_valid, total, include_nones FROM meta_tables WHERE name = %s"
+                ),
+                [self.search_table],
+            )
+            if cur.rowcount == 0:
+                raise ValueError("%s is not in meta_tables" % (self.search_table,))
+            meta = cur.fetchone()
+        (label_col, sort, count_cutoff, id_ordered,
+         out_of_order, stats_valid, total, include_nones) = meta
+        self._label_col = label_col
+        self._count_cutoff = count_cutoff
+        self._id_ordered = id_ordered
+        self._out_of_order = out_of_order
+        self._stats_valid = stats_valid
+        # A legacy meta_tables row predating the include_nones column reads as
+        # SQL NULL; treat it as True, matching the constructor, so that a later
+        # refresh_tables() does not silently flip such a table back to the old
+        # omit-Nones behavior.  (The coalescing in the constructor arrives with
+        # PR #103; keeping the two in step is the point of doing it here too.)
+        self._include_nones = True if include_nones is None else include_nones
+        self.search_cols, self.col_type, self.has_id = self._column_types(self.search_table, data_types=data_types)
+        self._set_sort(sort)
+        self.stats._init_total(total)
+
     def __repr__(self):
         return "Interface to Postgres table %s" % (self.search_table)
 
