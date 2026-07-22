@@ -327,42 +327,81 @@ def test_drift_error_explains_both_drop_and_force_swap(db, config, filled_table)
         msg = str(excinfo.value)
         # Both ways forward are spelled out: discard, or force the swap.
         assert "drop_tmp()" in msg
-        assert "restore_indexes(suffix='_tmp')" in msg
-        assert "reload_final_swap()" in msg
+        assert "staged_force_swap()" in msg
         filled_table.drop_tmp()
     finally:
         other.conn.close()
 
 
-def test_drift_force_swap_recipe_adopts_the_staged_copy(db, config, filled_table):
-    # Following the recipe in the drift error swaps the staged copy in,
-    # discarding the concurrent change -- and leaves the live table correctly
-    # indexed, with no staging-only index left behind.
+def test_staged_force_swap_adopts_and_finalizes_the_staged_copy(db, config, filled_table):
+    # staged_force_swap (the recovery named in the drift error) swaps the
+    # staged copy in with the same finalization as a clean commit: rebuilt
+    # main-table and counts indexes, invalidated stats, and the order flag
+    # conservatively broken.  (The two-command restore_indexes/
+    # reload_final_swap recipe it replaces skipped all of that: the refused
+    # commit's transaction rolled back its index builds and never reached
+    # _break_stats/_break_order.)
+    from psycodict.table import _counts_indexes
+
     name = filled_table.search_table
+    # A real meta index, so the swap has something meaningful to restore.
+    filled_table.create_index(["n"])
+    live_indexes_before = set(_index_names(filled_table, name))
+    # The fixture's insert_many already broke both flags on the live table;
+    # reset them to the healthy state so that what this test detects is the
+    # swap's own invalidation.
+    filled_table._execute(
+        SQL("UPDATE meta_tables SET stats_valid = true, out_of_order = false WHERE name = %s"),
+        [name],
+    )
+    filled_table._stats_valid = True
+    filled_table._out_of_order = False
     other = PostgresDatabase(config=config)
     try:
-        with pytest.raises(RuntimeError, match="reload_final_swap"):
+        with pytest.raises(RuntimeError, match="staged_force_swap"):
             with filled_table.staged() as staged:
+                # insert_many on a staged handle skips resorting, so the copy
+                # is out of id order and the live table must be flagged
+                staged.insert_many([sample_row(200)])
                 staged.update({"n": 1}, {"label": "staged-edit"})
                 other._execute(
                     SQL("INSERT INTO {0} (id, n, label) VALUES (%s, %s, %s)").format(Identifier(name)),
-                    [200, 200, "raw"],
+                    [201, 201, "raw"],
                 )
-        # The recipe: rebuild the copy's indexes (rolled back with the refused
-        # swap) and swap it in.
-        filled_table.restore_indexes(suffix="_tmp")
-        filled_table.reload_final_swap()
+        # The refusal rolled its transaction back without touching the flags;
+        # breaking them is the recovery's job.
+        assert filled_table._stats_valid is True
+        filled_table.staged_force_swap()
         live = db[name]
-        # The staged edit won and the concurrent raw row was discarded.
+        # The staged writes won and the concurrent raw row was discarded.
         assert live.lucky({"n": 1}, projection="label") == "staged-edit"
-        assert live.lucky({"n": 200}, projection="label") is None
-        assert _num_rows(live) == 200
-        # No staging-only label index rode into the live table.
+        assert live.lucky({"n": 200}, projection="label") == "l200"
+        assert live.lucky({"n": 201}, projection="label") is None
+        assert _num_rows(live) == 201
+        # The main-table indexes were rebuilt (the refused commit rolled its
+        # builds back), without the staging-only label index riding along.
+        assert live_indexes_before <= set(_index_names(live, name))
         assert not any("staged_label" in idx for idx in _index_names(live, name))
+        # The counts table kept its standard indexes: the staged clone is
+        # built by a bare LIKE, so they only exist if the swap rebuilt them.
+        counts_indexes = set(_index_names(live, name + "_counts"))
+        for index in _counts_indexes:
+            assert index["name"].format(name + "_counts") in counts_indexes
+        # The swapped-in stats tables are empty clones and the copy's id
+        # order is unknown, so both flags must be broken, as a clean commit
+        # would have done.
+        assert live._stats_valid is False
+        assert live._out_of_order is True
         live.cleanup_from_reload()
         assert _tmp_leftovers(live) == []
     finally:
         other.conn.close()
+
+
+def test_staged_force_swap_requires_the_staged_tables(filled_table):
+    # With nothing staged there is nothing to adopt.
+    with pytest.raises(ValueError, match="missing"):
+        filled_table.staged_force_swap()
 
 
 def test_staged_copy_has_a_label_index_for_lookups(db, filled_table):
@@ -453,6 +492,7 @@ def test_staged_blocks_schema_changes(db, filled_table):
             lambda: staged.reload("nofile"),
             lambda: staged.reload_revert(),
             lambda: staged.staged(),
+            lambda: staged.staged_force_swap(),
         ]:
             with pytest.raises(ValueError, match="not supported on a staged table"):
                 blocked()

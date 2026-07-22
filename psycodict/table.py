@@ -1994,6 +1994,7 @@ class PostgresTable(PostgresBase):
         "revert_constraints",
         "drop_tmp",
         "staged",
+        "staged_force_swap",
     )
 
     def staged(self):
@@ -2029,7 +2030,8 @@ class PostgresTable(PostgresBase):
         a time can be active on a table; a second one raises on entry.
         Schema changes through the staged handle are disabled.  If the swap
         itself fails, the staged tables are left in place so that no work is
-        lost; ``drop_tmp`` discards them.
+        lost; ``drop_tmp`` discards them and ``staged_force_swap`` adopts
+        them, discarding whatever concurrent changes made the swap refuse.
 
         While the context is open, writes to the live table through
         psycodict's API (``insert_many``, ``update``, ``delete``, ..., from
@@ -2210,7 +2212,9 @@ class PostgresTable(PostgresBase):
         # transaction back), the staged copy is left without this artifact:
         # _swap renames indexes but does not drop them, so a leftover here
         # would otherwise ride into the live table when the caller forces the
-        # swap with the restore_indexes/reload_final_swap recipe in the error.
+        # swap with the staged_force_swap recovery named in the error (which
+        # drops it again itself, but only staged tables adopted from a session
+        # that never reached this point still carry it).
         if self._label_col is not None and self._label_col != "id":
             with DelayCommit(self, silence=True):
                 self._execute(SQL("DROP INDEX IF EXISTS {0}").format(
@@ -2243,9 +2247,7 @@ class PostgresTable(PostgresBase):
                         "staged tables are kept: run db.%s.drop_tmp() to discard "
                         "the staged writes, or -- if instead you want the staged "
                         "copy to win, discarding those concurrent changes -- "
-                        "rebuild its indexes and swap it in with "
-                        "db.%s.restore_indexes(suffix='_tmp') followed by "
-                        "db.%s.reload_final_swap()."
+                        "swap it in with db.%s.staged_force_swap()."
                         % (
                             name,
                             staged._staged_source_count,
@@ -2254,23 +2256,83 @@ class PostgresTable(PostgresBase):
                             live_max_id,
                             name,
                             name,
-                            name,
                         )
                     )
-                # The staged writes could not update the meta_tables row (it
-                # is keyed on the live name), so transfer the order flag and
-                # invalidate the statistics: the swapped-in counts and stats
-                # tables are empty, not refreshed
-                if staged._out_of_order:
-                    self._break_order()
-                self._break_stats()
-                # reload_final_swap backs the live tables up under _old<n>,
-                # renames the _tmp ones into place, recounts the total and
-                # replaces the table object held by the database
-                self.reload_final_swap(tables=self._staged_tables(), ordered=False)
+                self._staged_swap_in(staged._out_of_order)
             aborted = False
         finally:
             self._log_db_change("staged", logid=logid, aborted=aborted)
+
+    def _staged_swap_in(self, out_of_order):
+        """
+        The shared tail of ``_staged_commit`` and ``staged_force_swap``:
+        transfer the flags to the live meta_tables row and swap the staged
+        tables into place.
+
+        INPUT:
+
+        - ``out_of_order`` -- whether the live table must be marked out of
+          order, because the staged writes broke (or, in the forced case,
+          may have broken) the id ordering.
+        """
+        # The staged writes could not update the meta_tables row (it is
+        # keyed on the live name), so transfer the order flag and invalidate
+        # the statistics: the swapped-in counts and stats tables are empty,
+        # not refreshed
+        if out_of_order:
+            self._break_order()
+        self._break_stats()
+        # reload_final_swap backs the live tables up under _old<n>, renames
+        # the _tmp ones into place, recounts the total and replaces the
+        # table object held by the database
+        self.reload_final_swap(tables=self._staged_tables(), ordered=False)
+
+    def staged_force_swap(self):
+        """
+        Adopt a staged copy whose commit never happened: build its indexes
+        and swap it into place, finalized exactly as a clean ``staged`` exit
+        would have.
+
+        This is the recovery named in the error raised when a staged commit
+        refuses to swap because the live table changed during staging; it
+        also adopts staged tables left behind by a session that died before
+        its commit ran.  Unlike the commit it performs **no** drift check:
+        the staged copy wins, and whatever the live table holds is backed up
+        under ``_old<n>`` (so ``reload_revert`` still undoes this).
+
+        The staged handle that knew whether the staged writes preserved the
+        id ordering is gone, so the table is conservatively marked out of
+        order -- always safe, it merely disables a sort optimization; run
+        ``resort`` afterward to restore id order.  As with a normal staged
+        commit the statistics are invalidated, and the table object held by
+        the database is replaced, so get a fresh reference (``db[name]``)
+        afterward.
+        """
+        suffix = "_tmp"
+        missing = [
+            table + suffix
+            for table in self._staged_tables()
+            if not self._table_exists(table + suffix)
+        ]
+        if missing:
+            raise ValueError(
+                "Cannot force a staged swap on %s: %s missing"
+                % (self.search_table, ", ".join(missing))
+            )
+        with DelayCommit(self, silence=True):
+            # The staging-only label index: a commit that got as far as its
+            # drift check has already dropped it, but staged tables left by
+            # a session that died before commit still carry it, and _swap
+            # renames indexes rather than dropping them
+            if self._label_col is not None and self._label_col != "id":
+                self._execute(SQL("DROP INDEX IF EXISTS {0}").format(
+                    Identifier(self.search_table + suffix + "_staged_label")))
+            # The index builds from a refused commit were rolled back along
+            # with its transaction, so build them all here, as the commit
+            # itself would have
+            self.restore_indexes(suffix=suffix)
+            self._create_counts_indexes(suffix=suffix)
+            self._staged_swap_in(out_of_order=True)
 
     def _staged_abort(self, logid):
         """
