@@ -158,6 +158,12 @@ class PostgresStatsTable(PostgresBase):
     ["ramps"], [2], 11372999, f, t
     would record the count of number fields with ramps containing 2.
 
+    Rows are keyed by ``(cols, values, split)``: at most one row should be
+    stored per key.  There is no unique index enforcing this, but
+    ``add_stats`` and ``add_numstats`` replace any existing rows with the
+    keys they insert -- whether recorded by a one-off count or by an
+    overlapping statistics run -- rather than adding duplicates.
+
     The columns in a stats table are:
 
     - ``stat`` -- a text field giving the statistic type.  Currently, will be one of
@@ -339,7 +345,9 @@ class PostgresStatsTable(PostgresBase):
             updater = SQL("UPDATE meta_tables SET total = %s WHERE name = %s")
             self._execute(updater, [total, self.search_table], silent=True)
         if self.saving:
-            self._record_count({}, total, suffix=suffix)
+            # extra=False: the empty-query total is maintained by the library,
+            # so it should not be reported by extra_counts.
+            self._record_count({}, total, suffix=suffix, extra=False)
 
     def _update_total(self, delta):
         """
@@ -360,7 +368,7 @@ class PostgresStatsTable(PostgresBase):
         row = cur.fetchone()
         self.total = max(0, self.total + delta) if row is None else row[0]
         if self.saving:
-            self._record_count({}, self.total)
+            self._record_count({}, self.total, extra=False)
 
     def _slow_count(self, query, split_list=False, record=True, suffix="", extra=True):
         """
@@ -408,7 +416,13 @@ class PostgresStatsTable(PostgresBase):
         nullrec = (list(query.values()) == [None])
         cols, vals = self._split_dict(query)
         data = [count, cols, vals, split_list]
-        if self.quick_count(query, suffix=suffix) is None:
+        # Consult the counts table itself to decide between INSERT and UPDATE,
+        # passing split_list so that we test the same key we are about to
+        # write.  startup=True skips the in-memory total shortcut for an empty
+        # query: that total says nothing about whether the row is actually
+        # present (in particular in a suffixed counts table during a reload),
+        # and updating a missing row would silently record nothing.
+        if self.quick_count(query, split_list, suffix=suffix, startup=True) is None:
             if count == 0 and not nullrec:
                 return # we don't want to store 0 counts since it can break stats
             updater = SQL("INSERT INTO {0} (count, cols, values, split, extra) VALUES (%s, %s, %s, %s, %s)")
@@ -1027,6 +1041,83 @@ class PostgresStatsTable(PostgresBase):
         )
         return self._execute(selecter, values)
 
+    def _delete_superseded_counts(self, rows, suffix=""):
+        """
+        Delete rows of the counts table that are about to be reinserted.
+
+        The counts table has no unique constraint, but rows are keyed by
+        ``(cols, values, split)``: ``quick_count`` and the display helpers
+        assume there is at most one row per key.  Rows with the keys that
+        ``add_stats`` or ``add_numstats`` is about to insert may already be
+        present -- recorded by a one-off ``count(record=True)`` call
+        (with ``extra = True``), or by an overlapping family (the same columns
+        under a different threshold, a constraint family contained in a larger
+        one, or an ``add_numstats`` call grouped by the same columns).
+        Inserting alongside them would produce duplicate rows, which show up
+        as repeated headers in displayed statistics; see LMFDB issue #4103.
+
+        INPUT:
+
+        - ``rows`` -- a list of tuples ``(cols, values, count, split, extra)``
+            prepared for insertion into the counts table, with ``cols`` and
+            ``values`` wrapped in Json.  All rows must share the same ``cols``
+            and ``split``, as those produced by a single ``add_stats`` or
+            ``add_numstats`` call do.
+        - ``suffix`` -- if provided, the table with that suffix added will be
+            used to perform the deletion.
+        """
+        if not rows:
+            return
+        jcols, split = rows[0][0], rows[0][3]
+        jvalues = Json([row[1].obj for row in rows])
+        deleter = SQL(
+            "DELETE FROM {0} WHERE cols = %s AND split = %s"
+            " AND values IN (SELECT jsonb_array_elements(%s))"
+        ).format(Identifier(self.counts + suffix))
+        self._execute(deleter, [jcols, split, jvalues])
+
+    def _delete_superseded_stats(self, jcols, stat_names, ccols, jcvals_list, threshold, suffix=""):
+        """
+        Delete rows of the stats table that are about to be reinserted.
+
+        Like the counts table, the stats table has no unique constraint, but
+        rows are keyed by ``(cols, stat, constraint_cols, constraint_values,
+        threshold)``.  Rows with the keys that ``add_stats`` or
+        ``add_numstats`` is about to insert may already be present -- recorded
+        by a one-off ``max()``/``min()`` call, or by the overlap between
+        ``add_stats`` and ``add_numstats`` (for example, ``add_stats(["n"],
+        {"flag": True})`` and ``add_numstats("n", ["flag"])`` both record an
+        avg/min/max of ``n`` constrained to ``flag = True``).  Only the listed
+        ``stat_names`` are deleted, so unrelated statistics on the same
+        columns (such as ``sum`` or ``distinct`` rows) are left alone.
+
+        INPUT:
+
+        - ``jcols`` -- the columns being statted, wrapped in Json.
+        - ``stat_names`` -- a list of the stat values being inserted
+            (e.g. ``["total", "avg", "min", "max"]``).
+        - ``ccols`` -- the constraint columns, wrapped in Json.
+        - ``jcvals_list`` -- a list of Json-wrapped constraint values, one for
+            each family being inserted (a single element for ``add_stats``,
+            one per group for ``add_numstats``).
+        - ``threshold`` -- an integer or None, as stored with the new rows.
+        - ``suffix`` -- if provided, the table with that suffix added will be
+            used to perform the deletion.
+        """
+        if not stat_names or not jcvals_list:
+            return
+        values = [jcols, stat_names, ccols, Json([jcv.obj for jcv in jcvals_list])]
+        if threshold is None:
+            thresh = SQL("threshold IS NULL")
+        else:
+            values.append(threshold)
+            thresh = SQL("threshold = %s")
+        deleter = SQL(
+            "DELETE FROM {0} WHERE cols = %s AND stat = ANY(%s) AND constraint_cols = %s"
+            " AND constraint_values IN (SELECT jsonb_array_elements(%s)) AND {1}"
+        ).format(Identifier(self.stats + suffix), thresh)
+        self._execute(deleter, values)
+
     def add_numstats(self, col, grouping, constraint=None, threshold=None, suffix=""):
         """
         For each value taken on by the columns in ``grouping``, numerical statistics on ``col`` (min, max, avg) will be added.
@@ -1059,8 +1150,20 @@ class PostgresStatsTable(PostgresBase):
                 raise ValueError("Must provide exactly one column")
         where, values, constraint, ccols, cvals, _ = self._process_constraint([col], constraint)
         jcol = Json([col])
-        jcgcols = Json(sorted(ccols.adapted + grouping))
-        if self._has_numstats(jcol, jcgcols, cvals, threshold, suffix=suffix):
+        # Two key conventions are in play.  The avg/min/max stats rows and the
+        # counts rows are keyed by the jointly sorted union of the constraint
+        # and grouping columns, matching _split_dict on a query dictionary.
+        # The "ntotal" row instead records the constraint columns followed by
+        # the grouping columns, without sorting them together, so that _status
+        # can split them apart again (the first len(cvals) entries are the
+        # constraint columns).  The existence guard checks the ntotal row, so
+        # it must use the latter key: sorting it (as this used to do) made
+        # repeated constrained calls miss the previous run's row and stack up
+        # duplicate ntotal rows.  list(): _split_dict wraps tuples, which
+        # cannot be concatenated with the grouping list.
+        cgcols = list(ccols.adapted) + grouping
+        jcgcols = Json(sorted(cgcols))
+        if self._has_numstats(jcol, Json(cgcols), cvals, threshold, suffix=suffix):
             self._logger.info("Numstats already exist")
             return
         now = time.time()
@@ -1093,19 +1196,32 @@ class PostgresStatsTable(PostgresBase):
                 jcol,
                 "ntotal",
                 total,
-                Json(ccols.adapted + grouping),
+                Json(cgcols),
                 cvals,
                 threshold,
             ))
-            # It's possible that stats/counts have been added by an add_stats call
-            # The right solution is a unique index and an ON CONFLICT DO NOTHING clause,
-            # but for now we just live with the possibility of a few duplicate rows.
+            # It's possible that stats/counts with these keys have already been
+            # added, by an add_stats call or an overlapping add_numstats call,
+            # and inserting alongside them would create duplicate rows (LMFDB
+            # issue #4103).  There is no unique index to hang ON CONFLICT on,
+            # so instead we delete the rows being replaced first.  The ntotal
+            # row cannot collide: it is inserted with the same key that
+            # _has_numstats checked above, so we would have returned already.
+            self._delete_superseded_stats(
+                jcol,
+                ["avg", "min", "max"],
+                jcgcols,
+                [row[1] for row in counts_to_add],
+                threshold,
+                suffix=suffix,
+            )
             inserter = SQL("INSERT INTO {0} (cols, stat, value, constraint_cols, constraint_values, threshold) VALUES %s")
             self._execute(
                 inserter.format(Identifier(self.stats + suffix)),
                 stats_to_add,
                 values_list=True,
             )
+            self._delete_superseded_counts(counts_to_add, suffix=suffix)
             inserter = SQL("INSERT INTO {0} (cols, values, count, split, extra) VALUES %s")
             self._execute(
                 inserter.format(Identifier(self.counts + suffix)),
@@ -1122,7 +1238,10 @@ class PostgresStatsTable(PostgresBase):
         INPUT:
 
         - ``jcol`` -- a list containing the column name whose min/max/avg were computed (wrapped in Json)
-        - ``cgcols`` -- the sorted constraint columns, followed by the sorted grouping columns (wrappe in Json)
+        - ``cgcols`` -- the sorted constraint columns, followed by the sorted
+            grouping columns (wrapped in Json).  These are *not* sorted
+            together: this is the key the ntotal row is stored under, chosen
+            so that ``_status`` can recover the two parts.
         - ``cvals`` -- a list of the values required for the constraint columns (wrapped in Json).
         - ``threshold`` -- an integer: if the number of rows with a given tuple of
            values for the grouping columns is less than this threshold, those
@@ -1174,9 +1293,13 @@ class PostgresStatsTable(PostgresBase):
                 raise ValueError("Only single columns supported")
         grouping = sorted(grouping)
         ccols, cvals = self._split_dict(constraint)
-        jcgcols = Json(sorted(ccols.adapted + grouping))
+        # As in add_numstats: the existence check keys on the ntotal row
+        # (constraint columns followed by grouping columns), while the
+        # avg/min/max rows fetched below are keyed by the sorted union.
+        cgcols = list(ccols.adapted) + grouping
+        jcgcols = Json(sorted(cgcols))
         jcol = Json([col])
-        if not self._has_numstats(jcol, jcgcols, cvals, threshold):
+        if not self._has_numstats(jcol, Json(cgcols), cvals, threshold):
             self._logger.info("Missing numstats, adding them")
             self.add_numstats(col, grouping, constraint, threshold)
             # raise ValueError("Missing numstats")
@@ -1343,6 +1466,10 @@ class PostgresStatsTable(PostgresBase):
         the given threshold.  If there is only one column and it is numeric,
         average, min, and max will be computed as well.
 
+        Existing rows of the counts and stats tables with the same keys as
+        the fresh rows (for example one-off counts previously recorded from
+        a search results page) are replaced instead of duplicated.
+
         Returns a boolean: whether any counts were stored.
         """
         if self._db._read_only:
@@ -1426,18 +1553,26 @@ class PostgresStatsTable(PostgresBase):
                 stats.append((jcols, "max", mx, ccols, cvals, threshold))
 
             # Note that the cols in the stats table does not add the constraint columns, while in the counts table it does.
+            # Rows with the keys we are about to insert may already exist,
+            # recorded by one-off count(record=True) or max()/min() calls or
+            # by an overlapping add_stats/add_numstats family.  Inserting
+            # fresh rows alongside them would create duplicates, which make
+            # quick_count nondeterministic and show up as repeated headers in
+            # displayed statistics (LMFDB issue #4103), so delete them first.
+            self._delete_superseded_stats(jcols, [s[1] for s in stats], ccols, [cvals], threshold, suffix=suffix)
             inserter = SQL("INSERT INTO {0} (cols, stat, value, constraint_cols, constraint_values, threshold) VALUES %s")
             self._execute(
                 inserter.format(Identifier(self.stats + suffix)),
                 stats,
                 values_list=True,
             )
-            inserter = SQL("INSERT INTO {0} (cols, values, count, split, extra) VALUES %s")
             if split_list:
                 to_add = [
                     (Json(c), Json(v), ct, True, False)
                     for ((c, v), ct) in to_add.items()
                 ]
+            self._delete_superseded_counts(to_add, suffix=suffix)
+            inserter = SQL("INSERT INTO {0} (cols, values, count, split, extra) VALUES %s")
             self._execute(
                 inserter.format(Identifier(self.counts + suffix)),
                 to_add,
@@ -1651,7 +1786,11 @@ ORDER BY v.ord LIMIT %s"""
                     continue
                 self.add_stats(cols, (ccols, cvals), threshold, split_list=True, suffix=suffix)
             for col, grouping, ccols, cvals, threshold in nstat_cmds:
-                if any(col not in self.table.search_cols for col in cols + ccols):
+                # Check the columns this command actually uses.  This used to
+                # read the ``cols`` left over from the loops above -- unbound
+                # when only numstats were recorded -- with the generator
+                # variable shadowing ``col``.
+                if any(c not in self.table.search_cols for c in [col] + grouping + ccols):
                     # Column may have been deleted
                     continue
                 self.add_numstats(col, grouping, (ccols, cvals), threshold, suffix=suffix)
