@@ -76,9 +76,14 @@ class PostgresDatabase(PostgresBase):
 
     A single psycopg connection is shared by this database object and every
     table interface registered on it (see ``register_object`` and
-    ``reset_connection``).  Because that one connection is not safe for
-    concurrent use, a ``PostgresDatabase`` instance is not thread-safe; use
-    one instance per process or thread (this is how LMFDB deploys it).
+    ``reset_connection``).  The psycopg connection itself is thread-safe --
+    it serializes concurrent cursor use with an internal lock -- but sharing
+    one connection means sharing one transaction and session state, and
+    psycodict layers unsynchronized mutable bookkeeping on top (the
+    commit-deferral stack behind ``DelayCommit``, the server-side cursor
+    counter, the per-object connection references reset together).  So a
+    ``PostgresDatabase`` instance is not thread-safe; use one instance per
+    process or thread (this is how LMFDB deploys it).
 
     INPUT:
 
