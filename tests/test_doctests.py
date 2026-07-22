@@ -5,7 +5,7 @@ Run the doctests embedded in psycodict's docstrings.
 The EXAMPLES blocks in the library are real transcripts: they run here,
 against two small tables of genuine LMFDB data created for the purpose --
 ``test_fields``, 22 selected number fields of degree at most 3 (the
-rationals, thirteen quadratic fields, and the nine cubic fields with
+rationals, twelve quadratic fields, and the nine cubic fields with
 absolute discriminant at most 90), and ``test_curves``, a dozen elliptic
 curves over three of those fields.  Each docstring can assume a connected
 database ``db`` with those two tables and nothing else; anything a reader
@@ -19,7 +19,12 @@ they show the shape of a session rather than a reproducible transcript.
 Unlike the rest of the suite, which randomises its table names, these
 tables have the fixed names the docstrings use, so this file must not run
 concurrently with itself against one database (the suite runs serially,
-so this only matters when experimenting with pytest-xdist).
+so this only matters when experimenting with pytest-xdist).  For the same
+reason the fixture refuses to run at all while *anything* occupies its
+namespace (``test_fields``/``test_curves`` and their derived ``_tmp``,
+``_old*``, ``_counts`` and ``_stats`` names): it never guesses whether an
+existing table is disposable.  After a crashed run, clean up by hand as
+the failure message describes, or point the tests at a scratch database.
 """
 import doctest
 import importlib
@@ -28,7 +33,7 @@ import pytest
 
 
 # The columns and rows of the standard example tables.  Real LMFDB data:
-# 22 selected number fields of degree <= 3 (the rationals, thirteen
+# 22 selected number fields of degree <= 3 (the rationals, twelve
 # quadratic fields, and the nine cubic fields with |disc| <= 90), and
 # elliptic curves over Q(sqrt(5)), Q(sqrt(2)) and Q(sqrt(13)) of small
 # conductor norm.
@@ -113,39 +118,44 @@ def _rows(columns, data):
     return [dict(zip(names, row)) for row in data]
 
 
-def _is_our_leftover(db, name, columns, data):
+def _occupying_tables(db):
     """
-    Whether an existing table with one of our fixed names is a leftover
-    from a crashed earlier run of this file: same columns and the same
-    set of labels.  Anything else is somebody's real table.
+    Every table in the public schema whose name lies in this file's
+    namespace: the two fixed names and anything derived from them
+    (``_tmp``, ``_old*``, ``_counts``, ``_stats``, ...), whether or not
+    psycodict's meta tables know about it.
     """
-    table = db[name]
-    if sorted(table.search_cols) != sorted(col for col, typ in columns):
-        return False
-    try:
-        return set(table.distinct("label")) == {row[0] for row in data}
-    except Exception:
-        return False
+    from psycodict import SQL
+
+    cur = db._execute(
+        SQL(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+            "AND (tablename IN ('test_fields', 'test_curves') "
+            "OR tablename LIKE %s OR tablename LIKE %s)"
+        ),
+        ["test\\_fields\\_%", "test\\_curves\\_%"],
+    )
+    return sorted(row[0] for row in cur)
 
 
 @pytest.fixture(scope="module")
 def doc_tables(db):
     # These tables have fixed names (the docstrings use them), unlike the
-    # rest of the suite, which randomises its names.  Refuse to touch an
-    # existing table unless it is recognizably a leftover of our own.
-    for name, columns, data in [
-        ("test_curves", CURVE_COLUMNS, CURVES),
-        ("test_fields", FIELD_COLUMNS, FIELDS),
-    ]:
-        if name in db.tablenames:
-            if not _is_our_leftover(db, name, columns, data):
-                pytest.fail(
-                    "The database already contains a table named %r that "
-                    "does not look like this test file's own leftover; "
-                    "refusing to drop it.  Point the tests at a scratch "
-                    "database or remove the table by hand." % name
-                )
-            db.drop_table(name, force=True)
+    # rest of the suite, which randomises its names.  Never guess whether
+    # an existing table is disposable: refuse to run while anything
+    # occupies the namespace, and require explicit cleanup instead.
+    occupied = _occupying_tables(db)
+    if occupied:
+        pytest.fail(
+            "The database already contains %s.  These names are reserved "
+            "by tests/test_doctests.py; refusing to drop anything it did "
+            "not create in this run.  If they are leftovers of a crashed "
+            "earlier run, remove them by hand -- for the main tables "
+            "db.drop_table('test_fields', force=True) (likewise "
+            "test_curves), and DROP TABLE for bare _tmp/_old debris -- or "
+            "point the tests at a scratch database."
+            % ", ".join(occupied)
+        )
     db.create_table(
         "test_fields",
         FIELD_COLUMNS,
@@ -160,11 +170,10 @@ def doc_tables(db):
         sort=["conductor_norm", "label"],
     )
     db.test_curves.insert_many(_rows(CURVE_COLUMNS, CURVES))
-    # Clear any _tmp/_old debris of ours from a crashed earlier run (the
-    # staged() example creates a test_fields_old1 backup, for instance).
-    db.test_fields.cleanup_from_reload()
-    db.test_curves.cleanup_from_reload()
     yield db
+    # The namespace was verified empty above and the suite runs serially,
+    # so everything in it now is ours: the two tables, their stats/counts
+    # companions, and the staged() example's test_fields_old1 backup.
     for name in ("test_curves", "test_fields"):
         try:
             db[name].cleanup_from_reload()
