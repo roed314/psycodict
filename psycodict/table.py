@@ -9,7 +9,7 @@ from functools import partial
 
 from psycopg.sql import SQL, Identifier, Placeholder, Literal
 
-from .encoding import Json, copy_dumps
+from .encoding import Json, check_copy_sep, copy_dumps
 from .base import PostgresBase, _meta_table_name
 from .utils import DelayCommit, IdentifierWrapper, LockError
 from .base import (
@@ -1069,6 +1069,10 @@ class PostgresTable(PostgresBase):
         """
         # Fail before the expensive dump below rather than deep inside update_from_file
         self._forbid_reindex_false(kwds.get("reindex"), kwds.get("inplace"))
+        sep = kwds.get("sep", "|")
+        # An unusable separator would otherwise be rejected only by COPY itself,
+        # after func has already been run over every row of the table.
+        check_copy_sep(sep)
         if not kwds.get("inplace"):
             # A non-inplace rewrite ends in update_from_file, which repeats
             # this check; running it here as well means that a leftover from
@@ -1080,11 +1084,10 @@ class PostgresTable(PostgresBase):
         # to give func access to the data to process.
         # An alternative approach would be to use COPY TO and have func and filter both
         # operate on the results, but then func would have to process the strings
-        sep = kwds.get("sep", "|")
         if tostr_func is None:
-            # Curry the separator in so that text and jsonb values get it escaped the way
-            # COPY FROM expects.  A user-supplied tostr_func keeps its (value, type) signature,
-            # so it is responsible for its own separator handling.
+            # Curry the separator in so that every formatted field gets it escaped the
+            # way COPY FROM expects.  A user-supplied tostr_func keeps its (value, type)
+            # signature, so it is responsible for its own separator handling.
             tostr_func = partial(copy_dumps, sep=sep)
         if datafile is None:
             datafile = tempfile.NamedTemporaryFile("w", delete=False)
