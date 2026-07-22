@@ -378,7 +378,8 @@ class PostgresStatsTable(PostgresBase):
 
         - ``query`` -- a mongo-style dictionary, as in the ``search`` method.
         - ``split_list`` -- see the ``add_stats`` method.
-        - ``record`` -- boolean (default True).  Whether to store the result in the count table.
+        - ``record`` -- boolean (default True).  Whether to store the result in the
+            count table (which happens only when ``saving`` is enabled).
         - ``suffix`` -- if provided, the table with that suffix added will be
             used to perform the count
         - ``extra`` -- used if the result is recorded (see discussion at the top of this class).
@@ -460,7 +461,9 @@ class PostgresStatsTable(PostgresBase):
           are displayed repeatedly (search pages record theirs), but every
           distinct recorded query adds a row to the counts table, so it is
           opt-in: scripts running many one-off counts no longer clutter the
-          table (and slow down reloads) by accident.
+          table (and slow down reloads) by accident.  Recording also requires
+          ``saving`` to be enabled; with the psycodict default
+          ``saving = False`` nothing is written.
         - ``groupby`` -- (default None) a list of columns
 
         OUTPUT:
@@ -526,7 +529,8 @@ class PostgresStatsTable(PostgresBase):
 
         - ``cols`` -- a list of column names
         - ``query`` -- a search query, as a dictionary
-        - ``record`` -- boolean (default True).  Whether to store the result in the stats table.
+        - ``record`` -- boolean (default True).  Whether to store the result in the
+            stats table (which happens only when ``saving`` is enabled).
         - ``suffix`` -- if provided, the table with that suffix added will be
             used to perform the count
 
@@ -791,7 +795,8 @@ class PostgresStatsTable(PostgresBase):
         - ``col`` -- the column on which the max is taken.
         - ``constraint`` -- a dictionary giving a constraint.  The max will be taken
             over rows satisfying this constraint.
-        - ``record`` -- whether to store the result in the stats table.
+        - ``record`` -- whether to store the result in the stats table
+            (which happens only when ``saving`` is enabled).
 
         EXAMPLES::
 
@@ -827,7 +832,8 @@ class PostgresStatsTable(PostgresBase):
         - ``col`` -- the column on which the min is taken.
         - ``constraint`` -- a dictionary giving a constraint.  The min will be taken
             over rows satisfying this constraint.
-        - ``record`` -- whether to store the result in the stats table.
+        - ``record`` -- whether to store the result in the stats table
+            (which happens only when ``saving`` is enabled).
 
         EXAMPLES::
 
@@ -851,7 +857,18 @@ class PostgresStatsTable(PostgresBase):
 
     def sum(self, col, constraint={}, record=True):
         """
-        Look up sum; if it exists return it, otherwise compute it, store it, and return
+        The sum of the given column over rows satisfying the constraint.
+
+        Answered from the stats table when cached; otherwise computed, and
+        stored in the stats table when ``record`` and ``saving`` are both set.
+
+        INPUT:
+
+        - ``col`` -- the column to be summed, which must be in the search table.
+        - ``constraint`` -- a dictionary giving a constraint.  The sum is
+            taken over rows satisfying this constraint.
+        - ``record`` -- whether to store the result in the stats table
+            (which happens only when ``saving`` is enabled).
         """
         ccols, cvals = self._split_dict(constraint)
         m = self._quick_statistic(col, ccols, cvals, kind="sum")
