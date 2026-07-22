@@ -16,7 +16,9 @@ metadata tables living inside your database.
    leading underscore are private, whatever module they live in, and may change
    in any release.
  * **The query language** as specified in [QueryLanguage.md](QueryLanguage.md):
-   the meaning of a query dictionary is stable within a major version.
+   the meaning of a query dictionary is stable within a major version: new
+   features may be added in minor versions, but functioning queries will
+   remain functional.
  * **The re-exported SQL composition classes** (`from psycodict import SQL,
    Identifier, ...`).  Downstream code should import these from `psycodict`
    rather than from the driver; the re-export point is the stable name.
