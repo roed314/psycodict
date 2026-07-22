@@ -76,6 +76,7 @@ class Configuration():
 
     - ``parser`` -- an argparse.ArgumentParser instance.  If not provided, a default will be created.
     - ``defaults`` -- a dictionary with default values for the created argument parser.  Only used if a parser is not specified.  The keys used are:
+
       - ``config_file`` -- the filename for the configuration file.  If not
         given, it is discovered: the ``PSYCODICT_CONFIG`` environment
         variable, then ``config.ini`` in the current directory if it exists,
@@ -95,6 +96,7 @@ class Configuration():
       - ``postgresql_user`` -- the username when connecting to the database
       - ``postgresql_password`` -- the password for connecting to the database
       - ``postgresql_dbname`` -- the name of the database to connect to
+
     - ``writeargstofile`` -- a boolean, if config file doesn't exist, it determines if command line arguments are written to the config file instead of the default arguments
     - ``readargs`` -- a boolean (default False), determining whether command
       line arguments are read.  Leave this off in libraries and applications
