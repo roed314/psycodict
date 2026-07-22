@@ -526,7 +526,31 @@ class DictJsonDumper(Dumper):
         return Json.dumps(obj).encode()
 
 
-def copy_dumps(inp, typ, recursing=False):
+# Characters that can never serve as the COPY delimiter for files written by
+# copy_dumps.  Postgres itself refuses backslash, newline, carriage return,
+# lowercase letters, digits and dot (they would be read back as escape
+# sequences or data; see ProcessCopyOptions), and refuses any character of the
+# null marker, which is always \N here, so N is out too.  psycodict
+# additionally refuses the double quote: copy_dumps writes \" for a quote
+# inside a value but emits bare quotes around array elements and inside JSON
+# text, so a quote delimiter could not be escaped coherently.
+_COPY_SEP_REJECTED = frozenset('abcdefghijklmnopqrstuvwxyz0123456789.N\\\r\n"')
+
+
+def check_copy_sep(sep):
+    """
+    Raise a ValueError if ``sep`` cannot be used as the column separator for
+    a COPY (text format) file written by :func:`copy_dumps`.
+    """
+    if len(sep) != 1 or ord(sep) > 127 or sep in _COPY_SEP_REJECTED:
+        raise ValueError(
+            "Invalid COPY separator %r: must be a single ASCII character and not "
+            'a lowercase letter, digit, or one of . \\ " N, newline, carriage return'
+            % (sep,)
+        )
+
+
+def copy_dumps(inp, typ, recursing=False, *, sep="|"):
     """
     Output a string formatted as needed for loading by Postgres' COPY FROM.
 
@@ -534,7 +558,40 @@ def copy_dumps(inp, typ, recursing=False):
 
     - ``inp`` -- a Python or Sage object that directly translates to a postgres type (e.g. Integer, RealLiteral, dict...
     - ``typ`` -- the Postgres type of the column in which this data is being stored.
+    - ``recursing`` -- used internally to format the elements of an array.  The value is
+      rendered as an array member (quoted and escaped for the array parser as needed)
+      rather than as a complete COPY field, and ``sep`` plays no role: the separator is
+      escaped in a single pass over the assembled field by the top-level call.
+    - ``sep`` -- (keyword only) the column separator that the resulting file will be
+      loaded with (default ``"|"``).  Occurrences of this character anywhere in the
+      formatted field -- inside text values, but also in dates and negative numbers for
+      ``sep="-"``, times for ``sep=":"``, JSON text and the braces, commas and quotes of
+      array literals -- are backslash-escaped, matching what Postgres' COPY (text format)
+      does on output, so that they are not mistaken for column boundaries on the way back
+      in.  This must agree with the separator eventually passed to COPY FROM.  Separators
+      that cannot work (see :func:`check_copy_sep`) raise a ValueError.
     """
+    if recursing:
+        return _copy_dumps(inp, typ, True)
+    if sep != "|":
+        # One containment check per field; the default is known good.
+        check_copy_sep(sep)
+    out = _copy_dumps(inp, typ, False)
+    if inp is None:
+        # \N is the field-level null marker: it must reach COPY unescaped
+        # (check_copy_sep keeps backslash and N out of sep in any case).
+        return out
+    if sep != "\t":
+        # COPY's field-level escape of the delimiter, applied to the complete
+        # formatted field just as COPY TO applies it on output, so that it covers
+        # every type and the structural characters of array literals, not just
+        # text values.  Tab needs no pass of its own: _copy_dumps has already
+        # escaped every literal tab, so no raw tab remains in ``out``.
+        out = out.replace(sep, "\\" + sep)
+    return out
+
+
+def _copy_dumps(inp, typ, recursing):
     if inp is None:
         # inside an array the null marker is the array literal NULL, since
         # COPY's field-level unescaping would turn \N into the letter N
@@ -588,7 +645,7 @@ def copy_dumps(inp, typ, recursing=False):
                 subtyp = typ[:-2]
             elif subtyp != typ[:-2]:
                 raise ValueError("Array dimensions must be uniform")
-        return "{" + ",".join(copy_dumps(x, subtyp, recursing=True) for x in inp) + "}"
+        return "{" + ",".join(_copy_dumps(x, subtyp, True) for x in inp) + "}"
     elif typ == "boolean":
         # must come before the numeric branch, since bool is a subclass of int
         return "t" if inp else "f"

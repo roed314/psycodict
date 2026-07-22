@@ -39,6 +39,25 @@ def copy_unescape(text):
     return "".join(out)
 
 
+def copy_split(line, sep):
+    """
+    Split a COPY text-format row into its fields on unescaped ``sep`` characters,
+    the way ``COPY FROM`` does before it unescapes each field.  A backslash escapes
+    the following character, so an escaped separator is not a field boundary.
+    """
+    fields = [[]]
+    chars = iter(line)
+    for char in chars:
+        if char == "\\":
+            fields[-1].append(char)
+            fields[-1].append(next(chars))
+        elif char == sep:
+            fields.append([])
+        else:
+            fields[-1].append(char)
+    return ["".join(field) for field in fields]
+
+
 NASTY_STRINGS = [
     "plain",
     "tab\there",
@@ -451,6 +470,115 @@ def test_copy_dumps_booleans(value, expected):
 
 def test_copy_dumps_bytea():
     assert copy_dumps(b"abc", "bytea") == r"\\x616263"
+
+
+@pytest.mark.parametrize("value,typ,expected", [
+    ("a|b", "text", r"a\|b"),
+    ("|", "text", r"\|"),
+    ({"k": "x|y"}, "jsonb", r'{"k": "x\|y"}'),
+    (["a|b", "c"], "text[]", r"{a\|b,c}"),
+])
+def test_copy_dumps_escapes_the_default_separator(value, typ, expected):
+    # The COPY delimiter itself must be escaped, or COPY FROM reads it as a
+    # column boundary; Postgres' own COPY TO writes it the same way.
+    assert copy_dumps(value, typ) == expected
+
+
+@pytest.mark.parametrize("row", [
+    ["a|b", "c"],
+    ["with|two|pipes", "|leading", "trailing|"],
+    ["back\\slash|pipe", "plain"],
+])
+def test_copy_dumps_separator_survives_a_full_row(row):
+    # copy_unescape alone cannot see this bug: it acts on an already-split field.
+    # A leaked separator only shows once the row is split into columns first.
+    line = "|".join(copy_dumps(value, "text") for value in row)
+    assert [copy_unescape(field) for field in copy_split(line, "|")] == row
+
+
+def test_copy_dumps_separator_is_configurable():
+    # A non-default separator is escaped in its place (the pipe is left alone)...
+    assert copy_dumps("a;b|c", "text", sep=";") == r"a\;b|c"
+    # ...and tab, already escaped as \t above, is not doubled.
+    assert copy_dumps("a\tb", "text", sep="\t") == r"a\tb"
+
+
+def test_copy_dumps_recursing_stays_third_positional():
+    # The pre-sep signature was copy_dumps(inp, typ, recursing=False); sep went
+    # in after it and keyword-only, so a positional third argument still means
+    # recursing and a positional fourth cannot silently become the separator.
+    assert copy_dumps("a{b}", "text", True) == '"a{b}"'
+    with pytest.raises(TypeError):
+        copy_dumps("a{b}", "text", True, "|")
+
+
+@pytest.mark.parametrize("value,typ,sep,expected", [
+    # rewrite() passes sep for every column, so every type must escape it:
+    # with sep="-" an unescaped date is three fields' worth of separators.
+    (datetime.date(2026, 7, 22), "date", "-", r"2026\-07\-22"),
+    (datetime.time(12, 30, 5), "time", ":", r"12\:30\:05"),
+    (datetime.datetime(2026, 7, 22, 12, 30, 5), "timestamp", " ", "2026-07-22\\ 12:30:05"),
+    (-17, "integer", "-", r"\-17"),
+    (1e20, "double precision", "+", r"1e\+20"),
+    ([datetime.date(2026, 1, 2), datetime.date(2026, 1, 3)], "date[]", "-", r"{2026\-01\-02,2026\-01\-03}"),
+    ([1, -2], "integer[]", "-", r"{1,\-2}"),
+])
+def test_copy_dumps_escapes_separator_in_every_type(value, typ, sep, expected):
+    assert copy_dumps(value, typ, sep=sep) == expected
+
+
+@pytest.mark.parametrize("value,typ,sep,expected", [
+    # The separator is escaped over the complete field, the way COPY TO does it,
+    # so the braces and commas of an array literal and the punctuation of JSON
+    # text are covered, not just the data inside them.
+    ([1, 2], "integer[]", ",", r"{1\,2}"),
+    (["a,b", "c"], "text[]", ",", r'{"a\,b"\,c}'),
+    ([1], "integer[]", "{", "\\{1}"),
+    ([[1, 2], [3, 4]], "integer[]", "{", "\\{\\{1,2},\\{3,4}}"),
+    ({"a": [1, 2]}, "jsonb", ",", '{"a": [1\\, 2]}'),
+    ({"a": 1}, "jsonb", ":", '{"a"\\: 1}'),
+])
+def test_copy_dumps_escapes_separator_in_structural_characters(value, typ, sep, expected):
+    assert copy_dumps(value, typ, sep=sep) == expected
+
+
+@pytest.mark.parametrize("sep", ['"', "a", "7", ".", "\\", "\r", "\n", "N", "", "||", "é"])
+def test_copy_dumps_rejects_impossible_separators(sep):
+    # Postgres refuses most of these as COPY delimiters outright (lowercase
+    # letters, digits, dot, backslash, line endings, multi-byte characters, and
+    # anything in the null marker \N); failing here keeps a rewrite() from
+    # dumping a whole table into a file that COPY will then refuse to load.
+    # The double quote is legal for COPY but irreconcilable with the bare
+    # quotes this encoding writes around array elements and inside JSON.
+    with pytest.raises(ValueError, match="COPY separator"):
+        copy_dumps("x", "text", sep=sep)
+
+
+@pytest.mark.parametrize("sep", ["-", ":", " ", ","])
+def test_copy_dumps_separator_survives_a_typed_row(sep):
+    # The full-row regression for non-text types: with per-branch escaping the
+    # date and the negative integer leaked sep="-" and this row split into too
+    # many fields.  After copy_split + copy_unescape each field must be exactly
+    # the text Postgres hands to the column type's input parser.
+    values = [
+        datetime.date(2026, 7, 22),
+        datetime.time(12, 30, 5),
+        -17,
+        [1, -2],
+        ["a,b", "c-d"],
+        {"k": "x:y"},
+    ]
+    types = ["date", "time", "integer", "integer[]", "text[]", "jsonb"]
+    line = sep.join(copy_dumps(v, t, sep=sep) for v, t in zip(values, types))
+    fields = [copy_unescape(f) for f in copy_split(line, sep)]
+    assert fields == [
+        "2026-07-22",
+        "12:30:05",
+        "-17",
+        "{1,-2}",
+        '{"a,b",c-d}',
+        '{"k": "x:y"}',
+    ]
 
 
 # ---------------------------------------------------------------------------
