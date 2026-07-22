@@ -1393,6 +1393,80 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 table = self[tablename]
                 table.cleanup_from_reload()
 
+    def _get_queries(self):
+        """
+        The queries currently running in this database, excluding this
+        connection's own, as (pid, duration, username, query) tuples in
+        starting order (oldest first).
+        """
+        return list(self._execute(SQL(
+            "SELECT pid, age(clock_timestamp(), query_start), usename, query "
+            "FROM pg_stat_activity "
+            "WHERE state = 'active' AND datname = current_database() "
+            "AND pid != pg_backend_pid() ORDER BY query_start"
+        ), silent=True))
+
+    def show_queries(self):
+        """
+        Prints the queries currently running in this database (which may be
+        holding the locks shown by ``show_locks``; see ``show_blocked`` for
+        statements that are stuck behind them).
+        """
+        queries = self._get_queries()
+        if not queries:
+            print("No queries currently running")
+            return
+        # Collapse each query's whitespace once, up front, so the pid, duration
+        # and user columns are measured (and aligned) against what prints; the
+        # query itself is last, so it needs no padding.
+        rows = [("pid %s" % pid, str(duration), user, " ".join(query.split()))
+                for pid, duration, user, query in queries]
+        pidlen = max(len(pidstr) for pidstr, _, _, _ in rows) + 2
+        durlen = max(len(duration) for _, duration, _, _ in rows) + 2
+        userlen = max(len(user) for _, _, user, _ in rows) + 2
+        for pidstr, duration, user, query in rows:
+            print(
+                pidstr
+                + " " * (pidlen - len(pidstr))
+                + duration
+                + " " * (durlen - len(duration))
+                + user
+                + " " * (userlen - len(user))
+                + query
+            )
+
+    def _get_blocked(self):
+        """
+        Statements waiting on locks, each paired with a session that actually
+        blocks them, as tuples (blocked_pid, blocked_user, blocking_pid,
+        blocking_user, blocked_statement, blocking_statement).
+
+        Blockers are determined by pg_blocking_pids, which accounts for lock
+        modes, grant status and the wait queue; the well-known pg_locks
+        self-join matches on resource identity alone and reports bystanders
+        (e.g. an unrelated ACCESS SHARE holder) as blockers.
+        """
+        return list(self._execute(SQL(
+            "SELECT blocked.pid, blocked.usename, "
+            "blocking.pid, blocking.usename, "
+            "blocked.query, blocking.query "
+            "FROM pg_stat_activity blocked "
+            "JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(bpid) ON true "
+            "JOIN pg_stat_activity blocking ON blocking.pid = b.bpid "
+            "WHERE blocked.datname = current_database() "
+            "ORDER BY blocked.pid, blocking.pid"
+        ), silent=True))
+
+    def show_blocked(self):
+        """
+        Prints the statements that are waiting on locks held by other
+        sessions, together with the sessions holding them.
+        """
+        for bpid, buser, gpid, guser, bquery, gquery in self._get_blocked():
+            print("pid %s (%s) blocked on pid %s (%s)" % (bpid, buser, gpid, guser))
+            print("  waiting: %s" % " ".join(bquery.split()))
+            print("  blocker: %s" % " ".join(gquery.split()))
+
     def show_locks(self):
         """
         Prints information on all locks currently held on any table.

@@ -945,6 +945,22 @@ class PostgresTable(PostgresBase):
         elif changetype == "create_table_like":
             locktypes = "select"
         elif changetype == "reload":
+            # A reload builds new tables on the side and swaps them in at the
+            # end, so it can proceed while other sessions use the table -- but
+            # the swap takes an ACCESS EXCLUSIVE lock, so it will wait for any
+            # lock held at that point (blocking everyone else while it queues).
+            # Warn rather than raise, since these locks may well be gone by
+            # the time the swap happens.
+            locks = self._table_locked(self.search_table + suffix, "all")
+            if locks:
+                print(
+                    "Warning: %s is locked by other processes; the swap at "
+                    "the end of the reload will block until these locks are "
+                    "released:" % (self.search_table + suffix,)
+                )
+                for locktype, pid in locks:
+                    print("    %s held by pid %s" % (locktype, pid))
+                print("Use db.show_queries() and db.show_blocked() to monitor them.")
             return
         else:
             locktypes = "all"
