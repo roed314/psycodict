@@ -210,7 +210,12 @@ def test_reconnecting_with_create_sees_the_same_tables(db, config):
 def test_meta_ddl_matches_declaration(db, meta_name, cols, types):
     expected = [(col, types[col]) for col in cols]
     assert pg_columns(db, meta_name) == expected
-    assert pg_columns(db, meta_name + "_hist") == expected + [("version", "integer")]
+    # The _hist table has the same columns plus ``version``.  Its order is
+    # compared as a set: a column added by a format migration (ALTER ADD COLUMN)
+    # lands after the pre-existing ``version``, whereas a fresh bootstrap puts
+    # ``version`` last, so a migrated database and a fresh one differ only in the
+    # ordering here -- and psycodict addresses these columns by name.
+    assert set(pg_columns(db, meta_name + "_hist")) == set(expected + [("version", "integer")])
 
 
 def test_meta_tables_defaults_match_declaration(db):
@@ -808,72 +813,44 @@ def test_description_hooks_are_no_ops_by_default(empty_table):
     assert empty_table.column_description(description={"label": "a column"}) is None
 
 
-def test_meta_version_is_stamped(db):
-    from psycodict.base import META_VERSION
+def test_meta_format_is_stamped(db):
+    from psycodict.base import META_FORMAT
 
-    cur = db._execute(SQL("SELECT version FROM meta_version"))
-    assert cur.fetchone()[0] == META_VERSION
+    cur = db._execute(SQL("SELECT version, min_compat FROM meta_format"))
+    assert cur.fetchone() == (META_FORMAT, 1)
+    assert db.meta_format == META_FORMAT
 
 
-def test_meta_version_mismatch_refuses_connection(db, config):
-    from psycodict.base import META_VERSION
+def test_meta_format_gates_connections(db, config, caplog):
+    # The full compatibility matrix (older, newer, empty, degraded operation)
+    # is covered in tests/test_meta_formats.py against a private database;
+    # here just the connection-level contract on the shared one: a newer
+    # format that excludes us refuses, one that admits us only warns, and an
+    # empty stamp refuses.
+    import logging
+
+    from psycodict.base import META_FORMAT
     from psycodict.database import PostgresDatabase
 
     try:
-        db._execute(SQL("UPDATE meta_version SET version = %s"), [META_VERSION + 1])
-        with pytest.raises(RuntimeError, match="newer"):
+        db._execute(SQL("UPDATE meta_format SET version = %s, min_compat = %s"),
+                    [META_FORMAT + 1, META_FORMAT + 1])
+        with pytest.raises(RuntimeError, match="upgrade psycodict"):
             PostgresDatabase(config=config)
-        db._execute(SQL("UPDATE meta_version SET version = %s"), [META_VERSION - 1])
-        with pytest.raises(RuntimeError, match="older"):
-            PostgresDatabase(config=config)
-        db._execute(SQL("DELETE FROM meta_version"))
+        db._execute(SQL("UPDATE meta_format SET version = %s, min_compat = %s"),
+                    [META_FORMAT + 1, 0])
+        with caplog.at_level(logging.WARNING):
+            other = PostgresDatabase(config=config)
+        assert any("newer" in record.message for record in caplog.records)
+        assert other.meta_format == META_FORMAT
+        other.conn.close()
+        db._execute(SQL("DELETE FROM meta_format"))
         with pytest.raises(RuntimeError, match="empty"):
             PostgresDatabase(config=config)
     finally:
-        db._execute(SQL("DELETE FROM meta_version"))
-        db._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"), [META_VERSION])
-
-
-def test_missing_meta_version_tolerated_and_stamped_by_create(db, config):
-    from psycodict.base import META_VERSION
-    from psycodict.database import PostgresDatabase
-
-    try:
-        db._execute(SQL("DROP TABLE meta_version"))
-        # a database from before the stamp existed connects fine
-        other = PostgresDatabase(config=config)
-        other.conn.close()
-    finally:
-        # and connecting with create=True adds the stamp back
-        other = PostgresDatabase(config=config, create=True)
-        other.conn.close()
-    cur = db._execute(SQL("SELECT version FROM meta_version"))
-    assert cur.fetchone()[0] == META_VERSION
-
-
-def test_unstamped_database_is_treated_as_format_one(db, config, monkeypatch):
-    from psycodict import database as database_module
-    from psycodict.database import PostgresDatabase
-
-    try:
-        db._execute(SQL("DROP TABLE meta_version"))
-        monkeypatch.setattr(database_module, "META_VERSION", database_module.META_VERSION + 1)
-        # an unstamped (pre-stamp, format 1) database must not slip past a
-        # future format bump
-        with pytest.raises(RuntimeError, match="older"):
-            PostgresDatabase(config=config)
-        # create=True stamps the baseline it found -- not the new format --
-        # and then still refuses to run until migrated
-        with pytest.raises(RuntimeError, match="older"):
-            PostgresDatabase(config=config, create=True)
-        cur = db._execute(SQL("SELECT version FROM meta_version"))
-        assert cur.fetchone()[0] == 1
-    finally:
-        # undo before restoring, so the stamp goes back to the real version
-        monkeypatch.undo()
-        db._execute(SQL("DELETE FROM meta_version"))
-        db._execute(SQL("INSERT INTO meta_version (version) VALUES (%s)"),
-                    [database_module.META_VERSION])
+        db._execute(SQL("DELETE FROM meta_format"))
+        db._execute(SQL("INSERT INTO meta_format (version, min_compat) VALUES (%s, %s)"),
+                    [META_FORMAT, 1])
 
 
 def test_include_nones_stored_explicitly_and_copied(db, table_factory):

@@ -68,13 +68,18 @@ def config(tmp_path_factory):
 def db(config):
     """
     A ``PostgresDatabase`` connected to the test database, meta tables created.
+
+    ``upgrade=True`` because the suite tests the current metadata format: a
+    fresh database bootstraps at that format anyway, and pointing the suite at
+    a database left at an older format migrates it (see MetadataFormats.md)
+    rather than failing every test that touches the newer features.
     """
     import psycopg
 
     from psycodict.database import PostgresDatabase
 
     try:
-        database = PostgresDatabase(config=config, create=True)
+        database = PostgresDatabase(config=config, create=True, upgrade=True)
     except psycopg.OperationalError as err:
         # Only a failure to reach the server means "skip".  Catching every
         # exception here would turn a genuine regression in the constructor

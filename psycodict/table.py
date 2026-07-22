@@ -13,9 +13,7 @@ from .encoding import Json, check_copy_sep, copy_dumps
 from .base import PostgresBase, _meta_table_name
 from .utils import DelayCommit, IdentifierWrapper, LockError
 from .base import (
-    _meta_indexes_cols,
-    _meta_constraints_cols,
-    _meta_tables_cols,
+    _meta_cols_types_jsonb_idx,
     jsonb_idx,
 )
 from .statstable import PostgresStatsTable
@@ -310,14 +308,29 @@ class PostgresTable(PostgresBase):
 
         For the current built indexes on the search table, see _list_built_indexes
         """
-        selecter = SQL("SELECT index_name, type, columns, modifiers FROM meta_indexes WHERE table_name = %s")
+        if self._db._meta_format >= 1:
+            selecter = SQL("SELECT index_name, type, columns, modifiers, whereclause FROM meta_indexes WHERE table_name = %s")
+        else:
+            # A format-0 database has no whereclause column (and so no
+            # partial indexes); selecting NULL keeps the row shape uniform.
+            selecter = SQL("SELECT index_name, type, columns, modifiers, NULL FROM meta_indexes WHERE table_name = %s")
         cur = self._execute(selecter, [self.search_table], silent=True)
         output = {}
-        for name, typ, columns, modifiers in cur:
+        for name, typ, columns, modifiers, whereclause in cur:
             output[name] = {"type": typ, "columns": columns, "modifiers": modifiers}
+            # Only partial indexes carry a predicate; including the key
+            # unconditionally would change every caller's output and let a plain
+            # index be recreated with where=None, so add it only when present.
+            # As a bonus, create_index(**entry) then rebuilds a partial index
+            # correctly (used by create_table_like).
+            if whereclause is not None:
+                output[name]["where"] = whereclause
             if verbose:
                 colspec = [" ".join([col] + mods) for col, mods in zip(columns, modifiers)]
-                print("{0} ({1}): {2}".format(name, typ, ", ".join(colspec)))
+                line = "{0} ({1}): {2}".format(name, typ, ", ".join(colspec))
+                if whereclause is not None:
+                    line += " WHERE {0}".format(whereclause)
+                print(line)
         if not verbose:
             return output
 
@@ -328,7 +341,7 @@ class PostgresTable(PostgresBase):
         cur = self._execute(SQL("SELECT tablespace FROM pg_tables WHERE tablename=%s"), [self.search_table])
         return cur.fetchone()[0]
 
-    def _create_index_statement(self, name, table, type, columns, modifiers, storage_params):
+    def _create_index_statement(self, name, table, type, columns, modifiers, storage_params, whereclause=None):
         """
         Utility function for making the create index SQL statement.
         """
@@ -347,6 +360,14 @@ class PostgresTable(PostgresBase):
         else:
             storage_params = SQL("")
         tablespace = self._tablespace_clause()
+        # A partial index restricts the rows it covers to those matching a
+        # predicate.  The clause is raw SQL supplied by an administrator (see
+        # create_index), so it is inlined directly, like the whitelisted type
+        # and modifiers above; it must come last, after WITH and TABLESPACE.
+        if whereclause:
+            where = SQL(" WHERE " + whereclause)
+        else:
+            where = SQL("")
         modifiers = [" " + " ".join(mods) if mods else "" for mods in modifiers]
         # The inner % operator is on strings prior to being wrapped by SQL: modifiers have been whitelisted.
         columns = SQL(", ").join(
@@ -354,8 +375,8 @@ class PostgresTable(PostgresBase):
             for col, mods in zip(columns, modifiers)
         )
         # The inner % operator is on strings prior to being wrapped by SQL: type has been whitelisted.
-        creator = SQL("CREATE INDEX {0} ON {1} USING %s ({2}){3}{4}" % (type))
-        return creator.format(Identifier(name), Identifier(table), columns, storage_params, tablespace)
+        creator = SQL("CREATE INDEX {0} ON {1} USING %s ({2}){3}{4}{5}" % (type))
+        return creator.format(Identifier(name), Identifier(table), columns, storage_params, tablespace, where)
 
     def _create_counts_indexes(self, suffix="", warning_only=False):
         """
@@ -434,7 +455,7 @@ class PostgresTable(PostgresBase):
                 + "try specifying a different name"
             )
 
-    def create_index(self, columns, type="btree", modifiers=None, name=None, storage_params=None):
+    def create_index(self, columns, type="btree", modifiers=None, name=None, storage_params=None, where=None):
         """
         Create an index.
 
@@ -454,10 +475,28 @@ class PostgresTable(PostgresBase):
             - ``NULLS FIRST``
             - ``NULLS LAST``
             This interface doesn't currently support creating indexes with nonstandard collations.
+        - ``where`` -- if given, a string with the predicate of a partial index, emitted
+            verbatim as the ``WHERE`` clause of ``CREATE INDEX`` (e.g. ``"disc > 0"``).
+            Unlike a search query, this is **raw SQL**: it is not parsed, escaped or
+            translated, and is inlined into the DDL like ``storage_params``.  It is
+            administrative input (you are already trusted to run DDL), never website
+            input, and must be trusted accordingly.  The predicate is recorded in
+            meta_indexes so the partial index survives a drop/restore or reload.  A
+            partial index needs a name distinct from any plain index on the same
+            columns: pass an explicit ``name``, or rely on the automatic numeric
+            suffix appended below when the generated name collides with an existing
+            relation.
         """
         now = time.time()
         if type not in _operator_classes:
             raise ValueError("Unrecognized index type")
+        if where is not None and self._db._meta_format < 1:
+            raise ValueError(
+                "Partial indexes need metadata format 1, but this database "
+                "uses format %s: migrate it with db.upgrade_metadata() (or "
+                "reconnect with PostgresDatabase(upgrade=True)); see "
+                "MetadataFormats.md." % self._db._meta_format
+            )
         if modifiers is None:
             if type == "gin":
                 def mod(col):
@@ -514,21 +553,25 @@ class PostgresTable(PostgresBase):
         with DelayCommit(self, silence=True):
             self._check_index_name(name, "Index")
             creator = self._create_index_statement(
-                name, self.search_table, type, columns, modifiers, storage_params
+                name, self.search_table, type, columns, modifiers, storage_params, where
             )
             self._execute(creator)
-            inserter = SQL("INSERT INTO meta_indexes (index_name, table_name, type, columns, modifiers, storage_params) VALUES (%s, %s, %s, %s, %s, %s)")
-            self._execute(
-                inserter,
-                [
-                    name,
-                    self.search_table,
-                    type,
-                    Json(columns),
-                    Json(modifiers),
-                    storage_params,
-                ],
-            )
+            values = [
+                name,
+                self.search_table,
+                type,
+                Json(columns),
+                Json(modifiers),
+                storage_params,
+            ]
+            if self._db._meta_format >= 1:
+                inserter = SQL("INSERT INTO meta_indexes (index_name, table_name, type, columns, modifiers, storage_params, whereclause) VALUES (%s, %s, %s, %s, %s, %s, %s)")
+                values.append(where)
+            else:
+                # A format-0 database has no whereclause column; ``where`` is
+                # necessarily None here (checked above).
+                inserter = SQL("INSERT INTO meta_indexes (index_name, table_name, type, columns, modifiers, storage_params) VALUES (%s, %s, %s, %s, %s, %s)")
+            self._execute(inserter, values)
         print("Index %s created in %.3f secs" % (name, time.time() - now))
 
     def drop_index(self, name, suffix="", permanent=True):
@@ -561,16 +604,24 @@ class PostgresTable(PostgresBase):
         """
         now = time.time()
         with DelayCommit(self, silence=True):
-            selecter = SQL(
-                "SELECT type, columns, modifiers, storage_params FROM meta_indexes "
-                "WHERE table_name = %s AND index_name = %s"
-            )
+            if self._db._meta_format >= 1:
+                selecter = SQL(
+                    "SELECT type, columns, modifiers, storage_params, whereclause FROM meta_indexes "
+                    "WHERE table_name = %s AND index_name = %s"
+                )
+            else:
+                # A format-0 database has no whereclause column (and so no
+                # partial indexes); selecting NULL keeps the row shape uniform.
+                selecter = SQL(
+                    "SELECT type, columns, modifiers, storage_params, NULL FROM meta_indexes "
+                    "WHERE table_name = %s AND index_name = %s"
+                )
             cur = self._execute(selecter, [self.search_table, name])
             if cur.rowcount > 1:
                 raise RuntimeError("Duplicated rows in meta_indexes")
             elif cur.rowcount == 0:
                 raise ValueError("Index %s does not exist in meta_indexes" % (name,))
-            type, columns, modifiers, storage_params = cur.fetchone()
+            type, columns, modifiers, storage_params, whereclause = cur.fetchone()
             creator = self._create_index_statement(
                 name + suffix,
                 self.search_table + suffix,
@@ -578,6 +629,7 @@ class PostgresTable(PostgresBase):
                 columns,
                 modifiers,
                 storage_params,
+                whereclause,
             )
             # this avoids clashes with deprecated indexes/constraints
             self._rename_if_exists(name, suffix)
@@ -1969,7 +2021,6 @@ class PostgresTable(PostgresBase):
                 if resort:
                     if metafile:
                         # read the metafile
-                        from .base import _meta_cols_types_jsonb_idx
                         # using code from _reload_meta
                         meta_name = 'meta_tables'
                         meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
@@ -2703,10 +2754,15 @@ class PostgresTable(PostgresBase):
                 (self.stats.stats, _stats_cols, False, False, statsfile),
             ])
 
+        # The columns this database actually has (an older-format database
+        # lacks the columns added by newer formats; see MetadataFormats.md)
         metadata = [
-            ("meta_indexes", "table_name", _meta_indexes_cols, indexesfile),
-            ("meta_constraints", "table_name", _meta_constraints_cols, constraintsfile),
-            ("meta_tables", "name", _meta_tables_cols, metafile),
+            ("meta_indexes", "table_name",
+             _meta_cols_types_jsonb_idx("meta_indexes", self._db._meta_format)[0], indexesfile),
+            ("meta_constraints", "table_name",
+             _meta_cols_types_jsonb_idx("meta_constraints", self._db._meta_format)[0], constraintsfile),
+            ("meta_tables", "name",
+             _meta_cols_types_jsonb_idx("meta_tables", self._db._meta_format)[0], metafile),
         ]
         print("Exporting %s..." % (self.search_table))
         now_overall = time.time()
