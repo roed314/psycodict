@@ -18,6 +18,7 @@ QueryLanguage
 Searching
 DataManagement
 MetadataFormats
+Versioning
 ```
 
 ```{toctree}
