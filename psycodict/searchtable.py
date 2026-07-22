@@ -108,6 +108,15 @@ class PostgresSearchTable(PostgresTable):
         else:  # iterable or str
             if isinstance(projection, str):
                 projection = [projection]
+            else:
+                projection = list(projection)
+                seen = set()
+                dups = [c for c in projection if c in seen or seen.add(c)]
+                if dups:
+                    raise ValueError(
+                        "Duplicate column(s) in projection: %s"
+                        % ", ".join(sorted(set(dups)))
+                    )
             include_id = False
             for col in projection:
                 # Determine the base column, matching _column_composable's
@@ -1085,6 +1094,10 @@ class PostgresSearchTable(PostgresTable):
             return self._join_search(query, projection, join, limit=limit, offset=offset, sort=sort, info=info, silent=silent)
         if offset < 0:
             raise ValueError("Offset cannot be negative")
+        if limit is not None and limit < 0:
+            raise ValueError("Limit cannot be negative")
+        if sort is not None:
+            self._check_sort_duplicates(sort)
         search_cols = self._parse_projection(projection)
         if limit is None and split_ors:
             raise ValueError("split_ors only supported when a limit is provided")
@@ -1433,6 +1446,10 @@ class PostgresSearchTable(PostgresTable):
         """
         if offset < 0:
             raise ValueError("Offset cannot be negative")
+        if limit is not None and limit < 0:
+            raise ValueError("Limit cannot be negative")
+        if sort is not None:
+            self._check_sort_duplicates(sort)
         if limit is None:
             prelimit = None
         else:

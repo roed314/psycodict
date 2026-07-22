@@ -720,6 +720,7 @@ class PostgresBase():
 
         - a Composable to be used by psycopg in the ORDER BY clause.
         """
+        PostgresBase._check_sort_duplicates(sort_list)
         L = []
         for col in sort_list:
             if isinstance(col, str):
@@ -729,6 +730,21 @@ class PostgresBase():
             else:
                 L.append(SQL("{0} DESC NULLS LAST").format(Identifier(col[0])))
         return SQL(", ").join(L)
+
+    @staticmethod
+    def _check_sort_duplicates(sort_list):
+        """
+        Raise if a column appears more than once in ``sort_list`` (a list of
+        column names or (column, direction) pairs).  A column already fixes the
+        order by its first appearance, so a repeat is dead weight and almost
+        always a mistake.
+        """
+        seen = set()
+        for col in sort_list:
+            name = col if isinstance(col, str) else col[0]
+            if name in seen:
+                raise ValueError("Duplicate column %r in sort order" % (name,))
+            seen.add(name)
 
     def _column_types(self, table_name, data_types=None):
         """

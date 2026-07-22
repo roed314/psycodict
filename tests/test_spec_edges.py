@@ -291,12 +291,16 @@ def test_lucky_default_sort_is_empty(null_table):
     assert got["n"] in {0, 2, 4}
 
 
-def test_duplicate_sort_column_is_accepted(db, null_table):
-    # Sorting by the same column twice is redundant but harmless (Postgres
-    # ignores the repeat); it is emitted verbatim rather than de-duplicated.
-    assert null_table._sort_str([("num", 1), ("num", 1)]).as_string(db.conn) == '"num", "num"'
-    rows = null_table.search({}, ["n"], sort=[("num", 1), ("num", 1)], limit=20)
-    assert [r["n"] for r in rows] == [2, 0, 4, 1, 3]
+def test_duplicate_sort_column_raises(db, null_table):
+    # A column already fixes the order by its first appearance, so a repeat is
+    # dead weight and almost always a mistake; it is rejected (in either the
+    # pair or the string form, and regardless of direction).
+    with pytest.raises(ValueError, match="Duplicate column"):
+        null_table._sort_str([("num", 1), ("num", 1)])
+    with pytest.raises(ValueError, match="Duplicate column"):
+        null_table._sort_str(["num", "num"])
+    with pytest.raises(ValueError, match="Duplicate column"):
+        null_table.search({}, ["n"], sort=[("num", 1), ("num", -1)], limit=20)
 
 
 def test_sort_pair_and_string_forms_agree(db, null_table):
@@ -319,11 +323,13 @@ def test_empty_projection_raises(spec_table):
             spec_table._parse_projection(proj)
 
 
-def test_duplicate_list_projection_is_kept_then_collapses(spec_table):
-    # A duplicated column stays duplicated in the selected columns (so the
-    # SELECT lists it twice), but the result dict has one entry per key.
-    assert spec_table._parse_projection(["n", "n"]) == ("n", "n")
-    assert spec_table.search({"n": 2}, ["n", "n"], limit=1) == [{"n": 2}]
+def test_duplicate_list_projection_raises(spec_table):
+    # A column repeated in a list projection would select it twice and collide
+    # on one result-dict key, so it is rejected.
+    with pytest.raises(ValueError, match="Duplicate column"):
+        spec_table._parse_projection(["n", "n"])
+    with pytest.raises(ValueError, match="Duplicate column"):
+        spec_table.search({"n": 2}, ["n", "n"], limit=1)
 
 
 def test_id_only_projection(spec_table):
@@ -379,12 +385,16 @@ def test_offset_past_end_with_info_snaps_to_last_page(spec_table):
 
 
 def test_negative_limit_and_offset(spec_table):
-    # Negative offset is guarded explicitly; negative limit is not, and reaches
-    # cur.fetchmany(-1), which psycopg rejects.  Both pinned as raising.
+    # Symmetric guards: neither a negative offset nor a negative limit is
+    # meaningful, so both are rejected up front with a clear error (a negative
+    # limit used to slip through to cur.fetchmany(-1), a cryptic psycopg error).
     with pytest.raises(ValueError, match="Offset cannot be negative"):
         spec_table.search({}, "n", limit=2, offset=-1)
-    with pytest.raises(psycopg.InterfaceError):
+    with pytest.raises(ValueError, match="Limit cannot be negative"):
         spec_table.search({"n": {"$lt": 5}}, "n", limit=-1)
+    # limit=0 (count-only) and limit=None (all rows) stay valid.
+    assert spec_table.search({}, "n", limit=0) == []
+    assert sorted(spec_table.search({}, "n", limit=None)) == list(range(10))
 
 
 # ===========================================================================

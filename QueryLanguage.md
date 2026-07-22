@@ -31,7 +31,7 @@ It is designed to interface with PostgreSQL, though it could be modified to work
 
 ## Column constraints
 
-The value associated to a column or column-part can be another dictionary, all of whose keys are [lower-level special keys](#lower-level-special-keys) (all of which start with `$`).  The column is then constrained to satisfy all of the conditions imposed this dictionary.  If any key does *not* start with `$`, the dictionary is not read as conditions at all but is compared to the column as a literal value (an equality test); a single mistyped operator therefore silently changes the meaning of the constraint.
+The value associated to a column or column-part can be another dictionary, all of whose keys are [lower-level special keys](#lower-level-special-keys) (all of which start with `$`).  The column is then constrained to satisfy all of the conditions imposed by this dictionary.  A dictionary with *no* `$` keys is instead compared to the column as a literal value (an equality test), which is useful for `jsonb` columns.  A dictionary that *mixes* `$` keys with non-`$` keys — almost always a mistyped operator with a dropped `$` — raises an error rather than being silently reinterpreted as a literal value.
 
 ## Column part specifiers
 
@@ -42,8 +42,6 @@ Path specifiers are also accepted in the projection and sort passed to `search`,
 ## Top-level special keys
 
 There are three valid top-level special keys: `$or`, `$and` and `$not`. The first two cases take a list of dictionaries as the value, parse them as full queries, and then join them using `OR` or `AND` respectively.  The last takes a single dictionary as the value and negates the resulting clause.
-
-The empty and degenerate cases are asymmetric and worth noting.  An empty `$or` list matches nothing (an `OR` over no clauses is false), whereas an empty `$and` list matches everything (it imposes no constraint).  An empty dictionary as one of the `$or` branches (as in `{"$or": [{}, ...]}`) imposes nothing on that branch and so makes the whole `$or` match every row.  Because `$not` distinguishes an unsatisfiable clause from the absence of a constraint, `{"$not": {}}` matches nothing (the negation of a trivially-true clause) while `{"$not": {"$or": []}}` matches everything (the negation of false).
 
 ## Lower-level special keys
 
@@ -59,7 +57,7 @@ These translate to infix operators in postgres (`<=`, `<`, `>=`, `>`, `!=`, `LIK
 
 ### `$exists`
 
-If the corresponding value is true, translates to `IS NOT NULL`; otherwise, to `IS NULL`.  Use this (or `{col: None}`) to test for null: the comparison operators follow SQL's NULL semantics, so `{col: {"$ne": None}}` becomes `col <> NULL`, which is never true and matches no rows — it is *not* the complement of `{col: None}`.
+If the corresponding value is true, translates to `IS NOT NULL`; otherwise, to `IS NULL`.  Testing for null has three equivalent spellings: `{col: {"$exists": True}}`, `{col: {"$ne": None}}` and the negation of `{col: None}` all become `IS NOT NULL`, and `{col: {"$exists": False}}` matches `{col: None}` as `IS NULL`.  (`$ne` against `None` is special-cased to `IS NOT NULL`; every other operator follows SQL's NULL semantics, under which a comparison to `NULL` is never true.)
 
 ### `$contains`
 
