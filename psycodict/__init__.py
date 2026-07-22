@@ -25,6 +25,10 @@ You can search using the methods ``search``, ``lucky`` and ``lookup``::
 
 """
 
+# Single source of truth for the package version: pyproject.toml reads it via
+# ``[tool.setuptools.dynamic]``, and it works from an uninstalled checkout too.
+__version__ = "0.1.13"
+
 try:
     import psycopg
     assert psycopg
