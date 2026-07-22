@@ -69,7 +69,8 @@ migration note.
   `./config.ini` if it already exists, then `~/.psycodict/config.ini` — and a
   missing file is created under `~/.psycodict`, never in the working
   directory; the default `slow_queries.log` lands in a `logs` directory next
-  to the configuration file; and the default secrets file sits next to the
+  to the configuration file (falling back to `~/.psycodict/logs` when that
+  location is not writable); and the default secrets file sits next to the
   configuration file.  Existing `./config.ini` setups keep working unchanged.
   *Migration:* pass `readargs=True` in a script whose command line psycodict
   should parse; set `PSYCODICT_CONFIG` (or pass `config_file`) to pin a
