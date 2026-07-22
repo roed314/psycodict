@@ -434,7 +434,19 @@ class PostgresSearchTable(PostgresTable):
             elif key == "$contains":
                 cmd = SQL("{0} @> %s")
                 if col_type != "jsonb":
-                    value = [value]
+                    # The parameter of @> is the array of required elements.  A
+                    # list is already that array and is passed through (so the
+                    # empty list emits '{}', not the '{{}}' that wrapping would
+                    # produce and that PostgreSQL before 17 rejects as
+                    # malformed); a tuple means the same, but psycopg would
+                    # adapt it as a composite literal '(3,5)' rather than an
+                    # array, so normalize it to a list; anything else is a
+                    # single required element and is wrapped.  This mirrors how
+                    # $containedin passes its list through.
+                    if isinstance(value, tuple):
+                        value = list(value)
+                    elif not isinstance(value, list):
+                        value = [value]
             elif key == "$containedin":
                 # jsonb_path_ops modifiers for the GIN index doesn't support this query
                 cmd = SQL("{0} <@ %s")
