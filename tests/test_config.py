@@ -284,15 +284,17 @@ def test_command_line_values_beat_the_config_file(paths, monkeypatch):
     assert config.options["postgresql"]["user"] == "fileuser"
 
 
-@pytest.mark.parametrize("has_file,expected", [(True, "cli.example.com"), (False, "localhost")])
-def test_readargs_defaults_to_whether_main_is_a_script(paths, monkeypatch, has_file, expected):
+def test_readargs_defaults_to_false_even_in_a_script(paths, monkeypatch):
+    # The command line belongs to the host program: psycodict must not parse
+    # it unless asked.  It used to auto-detect "running as a script" (via
+    # __main__.__file__) and then argparse would reject the host's own
+    # options with a SystemExit; pin that both are gone.
     main = types.ModuleType("fake_main")
-    if has_file:
-        main.__file__ = "script.py"
+    main.__file__ = "script.py"
     monkeypatch.setitem(sys.modules, "__main__", main)
-    monkeypatch.setattr(sys, "argv", ["prog", "--postgresql-host", "cli.example.com"])
+    monkeypatch.setattr(sys, "argv", ["prog", "--no-such-option", "--postgresql-host", "cli.example.com"])
     config = Configuration(defaults=paths)
-    assert config.options["postgresql"]["host"] == expected
+    assert config.options["postgresql"]["host"] == "localhost"
 
 
 def test_extra_options_holds_the_arguments_not_stored_in_the_file(paths):
@@ -301,6 +303,143 @@ def test_extra_options_holds_the_arguments_not_stored_in_the_file(paths):
         "config_file": paths["config_file"],
         "secrets_file": paths["secrets_file"],
     }
+
+
+# ---------------------------------------------------------------------------
+# file discovery
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated(tmp_path, monkeypatch):
+    """
+    An isolated environment for the discovery tests: an empty working
+    directory, a throwaway HOME, and no PSYCODICT_CONFIG.
+
+    Returns the fake home directory (so ``~/.psycodict`` resolves under it).
+    """
+    cwd = tmp_path / "cwd"
+    home = tmp_path / "home"
+    cwd.mkdir()
+    home.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSYCODICT_CONFIG", raising=False)
+    return home
+
+
+def test_discovery_falls_back_to_the_psycodict_home(isolated):
+    config = Configuration(readargs=False)
+    created = isolated / ".psycodict" / "config.ini"
+    assert created.exists()
+    assert config.extra_options["config_file"] == str(created)
+    assert config.options["postgresql"]["host"] == "localhost"
+    # ... and nothing was created in the working directory
+    assert not os.path.exists("config.ini")
+
+
+def test_discovery_uses_an_existing_cwd_config(isolated):
+    write_ini("config.ini", {"postgresql": {"host": "cwdhost"}})
+    config = Configuration(readargs=False)
+    assert config.options["postgresql"]["host"] == "cwdhost"
+    assert config.extra_options["config_file"] == os.path.abspath("config.ini")
+    # the fallback location is not touched
+    assert not (isolated / ".psycodict").exists()
+
+
+def test_discovery_env_var_beats_the_cwd_config(isolated, tmp_path, monkeypatch):
+    write_ini("config.ini", {"postgresql": {"host": "cwdhost"}})
+    target = tmp_path / "elsewhere" / "psycodict.ini"
+    monkeypatch.setenv("PSYCODICT_CONFIG", str(target))
+    config = Configuration(readargs=False)
+    # created at the environment location, with the defaults
+    assert target.exists()
+    assert config.extra_options["config_file"] == str(target)
+    assert config.options["postgresql"]["host"] == "localhost"
+
+
+def test_an_explicit_config_file_beats_the_environment(isolated, tmp_path, monkeypatch, paths):
+    monkeypatch.setenv("PSYCODICT_CONFIG", str(tmp_path / "env.ini"))
+    config = Configuration(defaults=paths, readargs=False)
+    assert config.extra_options["config_file"] == paths["config_file"]
+    assert not (tmp_path / "env.ini").exists()
+
+
+def test_the_default_secrets_file_sits_next_to_the_config_file(isolated):
+    confdir = isolated / ".psycodict"
+    confdir.mkdir()
+    write_ini(str(confdir / "secrets.ini"), {"postgresql": {"password": "s3cret"}})
+    config = Configuration(readargs=False)
+    assert config.extra_options["secrets_file"] == str(confdir / "secrets.ini")
+    assert config.options["postgresql"]["password"] == "s3cret"
+
+
+# ---------------------------------------------------------------------------
+# the slow-query log location
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_slowlogfile_lands_in_logs_next_to_the_config(isolated):
+    config = Configuration(readargs=False)
+    logdir = isolated / ".psycodict" / "logs"
+    assert config.options["logging"]["slowlogfile"] == str(logdir / "slow_queries.log")
+    # PostgresDatabase attaches a FileHandler immediately, so the directory
+    # must already exist
+    assert logdir.is_dir()
+    # the file itself records the default name; the redirect is applied when
+    # the configuration is read, so editing the file still works
+    written = read_ini(str(isolated / ".psycodict" / "config.ini"))
+    assert written.get("logging", "slowlogfile") == "slow_queries.log"
+
+
+def test_an_explicit_slowlogfile_is_respected(isolated, tmp_path):
+    target = str(tmp_path / "my_slow.log")
+    config = Configuration(
+        defaults={"logging_slowlogfile": target}, readargs=False
+    )
+    assert config.options["logging"]["slowlogfile"] == target
+
+
+def test_a_slowlogfile_from_the_config_file_is_respected(isolated, tmp_path):
+    target = str(tmp_path / "configured.log")
+    write_ini("config.ini", {"logging": {"slowlogfile": target}})
+    config = Configuration(readargs=False)
+    assert config.options["logging"]["slowlogfile"] == target
+    assert not os.path.exists("logs")
+
+
+def test_the_default_name_in_a_config_file_is_also_redirected(isolated):
+    # An existing file that kept the default name gets the same treatment as
+    # a fresh one: the name is treated as "unconfigured", not as a request
+    # for a file of that name in the working directory.
+    write_ini("config.ini", {"logging": {"slowlogfile": "slow_queries.log"}})
+    config = Configuration(readargs=False)
+    expected = os.path.join(os.path.abspath("logs"), "slow_queries.log")
+    assert config.options["logging"]["slowlogfile"] == expected
+
+
+def test_a_supplied_parser_gets_no_log_redirect(isolated, paths):
+    # Callers with their own parser own their logging semantics.
+    parser = make_parser(paths)
+    parser.add_argument("--slowlogfile", dest="logging_slowlogfile",
+                        default="slow_queries.log")
+    config = Configuration(parser=parser, readargs=False)
+    assert config.options["logging"]["slowlogfile"] == "slow_queries.log"
+
+
+# ---------------------------------------------------------------------------
+# postgresql_dbname
+# ---------------------------------------------------------------------------
+
+
+def test_postgresql_dbname_default_is_honoured(paths):
+    # dbname used to be the one option whose default ignored the defaults
+    # dictionary.
+    config = Configuration(
+        defaults=dict(paths, postgresql_dbname="mydb"), readargs=False
+    )
+    assert config.options["postgresql"]["dbname"] == "mydb"
+    assert read_ini(paths["config_file"]).get("postgresql", "dbname") == "mydb"
 
 
 # ---------------------------------------------------------------------------

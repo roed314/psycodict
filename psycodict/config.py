@@ -18,6 +18,38 @@ def strbool(s):
         raise ValueError(s)
 
 
+def psycodict_home():
+    """
+    The directory used for psycodict's own files (the configuration file and
+    the slow-query log) when no explicit location is given: ``~/.psycodict``.
+    """
+    return os.path.join(os.path.expanduser("~"), ".psycodict")
+
+
+def find_config_file():
+    """
+    The path of the configuration file when none is specified explicitly.
+
+    This is the first of:
+
+    - the ``PSYCODICT_CONFIG`` environment variable;
+    - ``config.ini`` in the current directory, if it exists;
+    - ``config.ini`` in ``~/.psycodict``.
+
+    A missing configuration file is created at the resolved location.  The
+    current-directory candidate requires the file to already exist, so
+    nothing is ever created in the working directory: a fresh setup gets its
+    configuration under ``~/.psycodict`` (or wherever ``PSYCODICT_CONFIG``
+    points).
+    """
+    path = os.environ.get("PSYCODICT_CONFIG")
+    if path:
+        return os.path.abspath(os.path.expanduser(path))
+    if os.path.exists("config.ini"):
+        return os.path.abspath("config.ini")
+    return os.path.join(psycodict_home(), "config.ini")
+
+
 class Configuration():
     """
     This configuration object merges input from the command line and a configuration file.
@@ -30,21 +62,32 @@ class Configuration():
 
     - ``parser`` -- an argparse.ArgumentParser instance.  If not provided, a default will be created.
     - ``defaults`` -- a dictionary with default values for the created argument parser.  Only used if a parser is not specified.  The keys used are:
-      - ``config_file`` -- the filename for the configuration file
+      - ``config_file`` -- the filename for the configuration file.  If not
+        given, it is discovered: the ``PSYCODICT_CONFIG`` environment
+        variable, then ``config.ini`` in the current directory if it exists,
+        then ``~/.psycodict/config.ini`` (created on first use); see
+        :func:`find_config_file`.
+      - ``secrets_file`` -- the filename for the secrets file, whose values
+        override the configuration file.  If not given, ``secrets.ini`` next
+        to the configuration file.
       - ``logging_slowcutoff`` -- a float, giving the threshold above which a slow-query warning will be logged
-      - ``logging_slowlogfile`` -- a filename where slow-query warnings are printed
+      - ``logging_slowlogfile`` -- a filename where slow-query warnings are
+        printed.  The default value ``slow_queries.log`` is placed in a
+        ``logs`` directory next to the configuration file; any other value
+        is used verbatim.
       - ``postgresql_host`` -- the hostname for the database
       - ``postgresql_port`` -- an integer, the port to use when connecting to the database
       - ``postgresql_user`` -- the username when connecting to the database
       - ``postgresql_password`` -- the password for connecting to the database
-      - ``writeargstofile`` - a boolean, if config file doesn't exist, it determines if command line arguments are written to the config file instead of the default arguments
-      - ``readargs`` - a boolean, if determines if command line arguments are read
+      - ``postgresql_dbname`` -- the name of the database to connect to
+    - ``writeargstofile`` -- a boolean, if config file doesn't exist, it determines if command line arguments are written to the config file instead of the default arguments
+    - ``readargs`` -- a boolean (default False), determining whether command
+      line arguments are read.  Leave this off in libraries and applications
+      with their own command line; pass True in a script whose command line
+      psycodict should parse.
     """
-    def __init__(self, parser=None, defaults={}, writeargstofile=False, readargs=None):
-        if readargs is None:
-            import __main__ as main
-            # if a file was ran
-            readargs = hasattr(main, '__file__')
+    def __init__(self, parser=None, defaults={}, writeargstofile=False, readargs=False):
+        builtin_parser = parser is None
 
         if parser is None:
             parser = argparse.ArgumentParser(description="Default psycodict parser")
@@ -54,16 +97,17 @@ class Configuration():
                 "--config-file",
                 dest="config_file",
                 metavar="FILE",
-                help="configuration file [default: %(default)s]",
-                default=defaults.get("config_file", "config.ini"),
+                help="configuration file [default: $PSYCODICT_CONFIG, "
+                     "./config.ini if present, else ~/.psycodict/config.ini]",
+                default=defaults.get("config_file"),
             )
             parser.add_argument(
                 "-s",
                 "--secrets-file",
                 dest="secrets_file",
                 metavar="SECRETS",
-                help="secrets file [default: %(default)s]",
-                default=defaults.get("secrets_file", "secrets.ini"),
+                help="secrets file [default: secrets.ini next to the configuration file]",
+                default=defaults.get("secrets_file"),
             )
 
             logginggroup = parser.add_argument_group("Logging options:")
@@ -123,7 +167,7 @@ class Configuration():
                 dest="postgresql_dbname",
                 metavar="DBNAME",
                 help="PostgreSQL database name [default: %(default)s]",
-                default="lmfdb",
+                default=defaults.get("postgresql_dbname", "lmfdb"),
             )
 
         def sec_opt(key):
@@ -140,6 +184,19 @@ class Configuration():
         else:
             # only read config file
             args = parser.parse_args([])
+
+        # Resolve the file locations.  An explicit location (from the
+        # defaults dictionary or the command line) is used verbatim; with the
+        # builtin parser both default to None, triggering the discovery in
+        # find_config_file -- so a missing configuration file is created
+        # under ~/.psycodict (or $PSYCODICT_CONFIG), never in the working
+        # directory.
+        if args.config_file is None:
+            args.config_file = find_config_file()
+        if args.secrets_file is None:
+            args.secrets_file = os.path.join(
+                os.path.dirname(os.path.abspath(args.config_file)), "secrets.ini"
+            )
 
         args_dict = vars(args)
         default_arguments_dict = vars(parser.parse_args([]))
@@ -179,6 +236,11 @@ class Configuration():
                 for opt, val in options.items():
                     _cfgp.set(sec, opt, str(val))
 
+            # the resolved location may sit in a directory that does not
+            # exist yet (a fresh ~/.psycodict in particular)
+            confdir = os.path.dirname(args.config_file)
+            if confdir:
+                os.makedirs(confdir, exist_ok=True)
             with open(args.config_file, "w") as configfile:
                 _cfgp.write(configfile)
 
@@ -237,6 +299,21 @@ class Configuration():
         for key, val in args_dict.items():
             if key not in default_arguments_dict:
                 self.extra_options[key] = val
+
+        if builtin_parser:
+            # The default value of slowlogfile used to be created in the
+            # working directory; place it in a logs directory next to the
+            # configuration file instead.  Any other value is used verbatim.
+            # The directory must exist before PostgresDatabase attaches its
+            # FileHandler, so it is created here.  (Callers supplying their
+            # own parser own their logging semantics; they are not touched.)
+            logopts = self.options["logging"]
+            if logopts.get("slowlogfile") == "slow_queries.log":
+                logdir = os.path.join(
+                    os.path.dirname(os.path.abspath(args.config_file)), "logs"
+                )
+                os.makedirs(logdir, exist_ok=True)
+                logopts["slowlogfile"] = os.path.join(logdir, "slow_queries.log")
 
     def get_postgresql_default(self):
         res = dict(self.default_args["postgresql"])
