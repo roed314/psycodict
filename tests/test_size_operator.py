@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Tests for the ``$size`` query operator, which constrains the number of elements
-of an array or jsonb-array column: ``cardinality`` for array columns,
-``jsonb_array_length`` for jsonb columns.  The value is either an integer (an
-equality test on the length) or an operator dictionary that constrains the
-length like any integer column.
+of an array or jsonb column: ``cardinality`` for array columns, and for jsonb
+the array length or object key count (a jsonb scalar has no size, so it never
+matches and never errors).  The value is either an integer (an equality test on
+the length) or an operator dictionary that constrains the length like any
+integer column.
 """
-import psycopg
 import pytest
 
 
@@ -87,11 +87,13 @@ def test_size_sql_uses_cardinality(empty_table):
     assert 'cardinality("vec")' in sql
     assert "array_length" not in sql
     assert vals == [3]
-    # jsonb columns (and jsonb sub-arrays reached by a path) use
-    # jsonb_array_length
+    # jsonb columns (and jsonb sub-values reached by a path) dispatch on the
+    # jsonb type: array length for arrays, key count for objects, NULL else.
     stmt, vals = empty_table._parse_dict({"data.a": {"$size": 2}})
     sql = stmt.as_string(empty_table.conn)
+    assert 'jsonb_typeof("data"->\'a\')' in sql
     assert 'jsonb_array_length("data"->\'a\')' in sql
+    assert 'jsonb_object_keys("data"->\'a\')' in sql
     assert vals == [2]
 
 
@@ -160,11 +162,26 @@ def test_size_jsonb_path_subarray(filled_table):
     assert filled_table.count({"data.a": {"$size": 3}}) == 0
 
 
-def test_size_jsonb_non_array_raises(filled_table):
-    # data itself is a jsonb object, so jsonb_array_length raises at query time;
-    # psycodict lets the database error surface (as a psycopg DatabaseError)
-    with pytest.raises(psycopg.DatabaseError, match="array length"):
-        filled_table.count({"data": {"$size": 3}})
+def test_size_jsonb_object_counts_keys(filled_table):
+    # data is a jsonb *object* with three keys (a, s, nested) on every row, so
+    # $size matches it by key count -- an object has a size too, no longer an
+    # error.
+    assert filled_table.count({"data": {"$size": 3}}) == 200
+    assert filled_table.count({"data": {"$size": 2}}) == 0
+    assert filled_table.count({"data": {"$size": {"$gte": 3}}}) == 200
+    # a nested single-key object reached by a path (data.nested == {"k": ...})
+    assert filled_table.count({"data.nested": {"$size": 1}}) == 200
+
+
+def test_size_jsonb_scalar_never_matches_and_does_not_raise(filled_table):
+    # data.s is a jsonb *string* scalar: it has no size, so $size matches
+    # nothing -- and, crucially, does not raise the way a bare
+    # jsonb_array_length on a non-array would (that was the point of the CASE).
+    assert filled_table.count({"data.s": {"$size": 1}}) == 0
+    assert filled_table.count({"data.s": {"$size": 0}}) == 0
+    # even the operator-dict form, which would otherwise touch every row's
+    # scalar, stays quiet
+    assert filled_table.count({"data.s": {"$size": {"$gte": 0}}}) == 0
 
 
 # ---------------------------------------------------------------------------

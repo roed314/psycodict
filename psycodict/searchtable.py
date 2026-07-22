@@ -219,9 +219,12 @@ class PostgresSearchTable(PostgresTable):
             - ``$notcontains`` -- for json columns, the column must not contain any entry of the given value (which should be iterable)
             - ``$containedin`` -- for json columns, the column should be a subset of the given list
             - ``$overlaps`` -- the column should overlap the given array
-            - ``$size`` -- for an array or jsonb-array column, constrains the number of
-              elements.  The value is either an integer (testing equality of the length)
-              or an operator dictionary (e.g. ``{"$gte": 2}``, ``{"$in": [2, 3]}``) that
+            - ``$size`` -- constrains the number of elements of an array or jsonb column.
+              For an array column it is the cardinality; for a jsonb column it is the
+              array length or, for a jsonb object, the number of keys -- a jsonb scalar
+              (or json/SQL null) has no size, so it never matches (and does not error).
+              The value is either an integer (testing equality of the length) or an
+              operator dictionary (e.g. ``{"$gte": 2}``, ``{"$in": [2, 3]}``) that
               constrains the length like any integer column.
             - ``$exists`` -- if True, require not null; if False, require null.
             - ``$startswith`` -- for text columns, matches strings that start with the given string.
@@ -328,10 +331,22 @@ class PostgresSearchTable(PostgresTable):
                 # dimension, not the length of the outermost one.
                 length = SQL("cardinality({0})").format(col)
             elif col_type == "jsonb":
-                # jsonb_array_length raises a database error at query time if
-                # the value is a jsonb non-array (an object or a scalar).  An
-                # empty jsonb array gives 0 and a SQL NULL gives NULL.
-                length = SQL("jsonb_array_length({0})").format(col)
+                # A jsonb value has a "size" only when it is a container:
+                # jsonb_typeof dispatches to the array's element count or the
+                # object's key count.  Every other type (a scalar, or a json
+                # null), and a SQL NULL, falls through to the implicit ELSE
+                # NULL, so $size neither matches nor errors on them -- unlike a
+                # bare jsonb_array_length, which raises on any non-array.  The
+                # CASE guard is evaluated per row, so each branch's function
+                # only ever sees the jsonb type it expects.  (An empty array or
+                # object gives 0; there is no jsonb_object_length, hence the
+                # key count.)
+                length = SQL(
+                    "CASE jsonb_typeof({0}) "
+                    "WHEN 'array' THEN jsonb_array_length({0}) "
+                    "WHEN 'object' THEN (SELECT count(*)::int FROM jsonb_object_keys({0})) "
+                    "END"
+                ).format(col)
             else:
                 raise ValueError("$size requires an array or jsonb column")
             if isinstance(value, dict):
