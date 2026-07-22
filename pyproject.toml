@@ -1,17 +1,20 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+# setuptools >= 77 implements PEP 639, required for the SPDX `license` string
+# below; it is available on every interpreter >= 3.9.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "psycodict"
-version = "0.1.13"
+# Version lives in psycodict/__init__.py (__version__); see [tool.setuptools.dynamic].
+dynamic = ["version"]
 description = "dictionary-based python interface to PostgreSQL databases"
 # Required by the `twine check --strict` gate in CI: without it the package
 # has no long_description and the PyPI project page renders empty.
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [{name = "David Roe", email = "roed.math@gmail.com"}, {name = "Edgar Costa", email = "edgarc@mit.edu"}]
-license = {text = "GPL v2+"}
+license = "GPL-2.0-or-later"
 keywords = ["postgres", "database", "interface"]
 
 [project.urls]
@@ -22,6 +25,9 @@ repository = "https://github.com/roed314/psycodict"
 pgsource = ["psycopg>=3.1"]
 pgbinary = ["psycopg[binary]>=3.1"]
 test = ["pytest>=7"]
+
+[tool.setuptools.dynamic]
+version = {attr = "psycodict.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -34,7 +40,7 @@ log_cli_level = "WARNING"
 filterwarnings = ["error::DeprecationWarning:psycodict.*"]
 
 [tool.ruff]
-target-version = "py38"
+target-version = "py39"
 
 [tool.ruff.lint.per-file-ignores]
 # The psycopg2 availability check in __init__.py deliberately runs before the
