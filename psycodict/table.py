@@ -1830,10 +1830,13 @@ class PostgresTable(PostgresBase):
         """
         with DelayCommit(self, silence=True):
             if tables is None:
+                # _swap_in_tmp takes the base names and appends the _tmp
+                # itself, so record the base name (not the _tmp one) of each
+                # companion that actually has a staged _tmp copy.
                 tables = []
                 for suffix in ["", "_stats", "_counts"]:
-                    tablename = "{0}{1}_tmp".format(self.search_table, suffix)
-                    if self._table_exists(tablename):
+                    tablename = "{0}{1}".format(self.search_table, suffix)
+                    if self._table_exists(tablename + "_tmp"):
                         tables.append(tablename)
 
             self._swap_in_tmp(tables)
@@ -2115,6 +2118,19 @@ class PostgresTable(PostgresBase):
                 # in reload, so that they are built once on the final data
                 # rather than maintained through every staged write.
                 self.restore_pkeys(suffix=suffix)
+                # Staged writes are usually keyed by the label column (update,
+                # upsert and update_from_file all look rows up by it), so give
+                # the copy a plain index on it as well, turning those per-write
+                # lookups from sequential scans into index scans.  Like the
+                # other non-pkey indexes it is not part of meta_indexes; it is
+                # dropped at commit before the real indexes are rebuilt (see
+                # _staged_commit), so it never reaches the live table.
+                if self._label_col is not None and self._label_col != "id":
+                    self._execute(SQL("CREATE INDEX {0} ON {1} ({2})").format(
+                        Identifier(self.search_table + suffix + "_staged_label"),
+                        Identifier(self.search_table + suffix),
+                        Identifier(self._label_col),
+                    ))
             print(
                 "Staged copy of %s created in %.3f secs"
                 % (self.search_table, time.time() - now)
@@ -2188,6 +2204,17 @@ class PostgresTable(PostgresBase):
         - ``logid`` -- passed on to ``log_db_change``
         """
         suffix = "_tmp"
+        # Drop the staging-only label index before rebuilding the real
+        # indexes.  Committed on its own, ahead of the swap transaction below,
+        # so that even if the drift check refuses the swap (rolling that
+        # transaction back), the staged copy is left without this artifact:
+        # _swap renames indexes but does not drop them, so a leftover here
+        # would otherwise ride into the live table when the caller forces the
+        # swap with the restore_indexes/reload_final_swap recipe in the error.
+        if self._label_col is not None and self._label_col != "id":
+            with DelayCommit(self, silence=True):
+                self._execute(SQL("DROP INDEX IF EXISTS {0}").format(
+                    Identifier(self.search_table + suffix + "_staged_label")))
         aborted = True
         try:
             with DelayCommit(self, silence=True):
@@ -2207,20 +2234,27 @@ class PostgresTable(PostgresBase):
                 live_max_id = self.max_id()
                 if (live_count != staged._staged_source_count
                         or live_max_id != staged._staged_source_max_id):
+                    name = self.search_table
                     raise RuntimeError(
                         "The live table %s changed during staging: it held "
-                        "%s rows with max id %s when the staged copy was "
-                        "taken, but now holds %s rows with max id %s.  "
-                        "Refusing to swap, since the swap would discard "
-                        "those changes.  The staged tables are kept; "
-                        "db.%s.drop_tmp() discards them."
+                        "%s rows with max id %s when the staged copy was taken, "
+                        "but now holds %s rows with max id %s.  Refusing to "
+                        "swap, since the swap would discard those changes.  The "
+                        "staged tables are kept: run db.%s.drop_tmp() to discard "
+                        "the staged writes, or -- if instead you want the staged "
+                        "copy to win, discarding those concurrent changes -- "
+                        "rebuild its indexes and swap it in with "
+                        "db.%s.restore_indexes(suffix='_tmp') followed by "
+                        "db.%s.reload_final_swap()."
                         % (
-                            self.search_table,
+                            name,
                             staged._staged_source_count,
                             staged._staged_source_max_id,
                             live_count,
                             live_max_id,
-                            self.search_table,
+                            name,
+                            name,
+                            name,
                         )
                     )
                 # The staged writes could not update the meta_tables row (it

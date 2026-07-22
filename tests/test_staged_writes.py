@@ -47,6 +47,17 @@ def _tmp_leftovers(table):
     ]
 
 
+def _index_names(table, tablename):
+    """
+    The names of the postgres indexes on ``tablename``.
+    """
+    return [
+        row[0] for row in table._execute(
+            SQL("SELECT indexname FROM pg_indexes WHERE tablename = %s"), [tablename]
+        )
+    ]
+
+
 ##################################################################
 # the commit path                                                #
 ##################################################################
@@ -300,6 +311,71 @@ def test_raw_sql_drift_aborts_the_swap(db, config, filled_table):
         assert _tmp_leftovers(filled_table) == []
     finally:
         other.conn.close()
+
+
+def test_drift_error_explains_both_drop_and_force_swap(db, config, filled_table):
+    name = filled_table.search_table
+    other = PostgresDatabase(config=config)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            with filled_table.staged() as staged:
+                staged.update({"n": 1}, {"label": "staged-edit"})
+                other._execute(
+                    SQL("INSERT INTO {0} (id, n, label) VALUES (%s, %s, %s)").format(Identifier(name)),
+                    [200, 200, "raw"],
+                )
+        msg = str(excinfo.value)
+        # Both ways forward are spelled out: discard, or force the swap.
+        assert "drop_tmp()" in msg
+        assert "restore_indexes(suffix='_tmp')" in msg
+        assert "reload_final_swap()" in msg
+        filled_table.drop_tmp()
+    finally:
+        other.conn.close()
+
+
+def test_drift_force_swap_recipe_adopts_the_staged_copy(db, config, filled_table):
+    # Following the recipe in the drift error swaps the staged copy in,
+    # discarding the concurrent change -- and leaves the live table correctly
+    # indexed, with no staging-only index left behind.
+    name = filled_table.search_table
+    other = PostgresDatabase(config=config)
+    try:
+        with pytest.raises(RuntimeError, match="reload_final_swap"):
+            with filled_table.staged() as staged:
+                staged.update({"n": 1}, {"label": "staged-edit"})
+                other._execute(
+                    SQL("INSERT INTO {0} (id, n, label) VALUES (%s, %s, %s)").format(Identifier(name)),
+                    [200, 200, "raw"],
+                )
+        # The recipe: rebuild the copy's indexes (rolled back with the refused
+        # swap) and swap it in.
+        filled_table.restore_indexes(suffix="_tmp")
+        filled_table.reload_final_swap()
+        live = db[name]
+        # The staged edit won and the concurrent raw row was discarded.
+        assert live.lucky({"n": 1}, projection="label") == "staged-edit"
+        assert live.lucky({"n": 200}, projection="label") is None
+        assert _num_rows(live) == 200
+        # No staging-only label index rode into the live table.
+        assert not any("staged_label" in idx for idx in _index_names(live, name))
+        live.cleanup_from_reload()
+        assert _tmp_leftovers(live) == []
+    finally:
+        other.conn.close()
+
+
+def test_staged_copy_has_a_label_index_for_lookups(db, filled_table):
+    name = filled_table.search_table
+    with filled_table.staged() as staged:
+        # The copy carries a plain index on the label column (not just the
+        # pkey), so label-keyed staged writes are index scans.
+        staged_idxs = _index_names(filled_table, name + "_tmp")
+        assert sum("staged_label" in idx for idx in staged_idxs) == 1
+        staged.update({"label": "l5"}, {"num": 12345})
+    # The staging index is not one of the real indexes, so it must not survive
+    # the swap into the live table.
+    assert not any("staged_label" in idx for idx in _index_names(db[name], name))
 
 
 ##################################################################
