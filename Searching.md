@@ -499,9 +499,10 @@ The algorithm depends on the arguments:
   misses it raises `RuntimeError("Random selection failed!")`.  On a genuinely
   empty table (no rows) it returns `None`.
 
-> Side-effect note: the uncached non-empty-`query` branch writes the computed
-> count into the counts table directly, *regardless* of whether the stats table
-> has count-saving enabled.  See [Counts and statistics](#counts-and-statistics).
+> Side-effect note: on a counts-cache miss the uncached non-empty-`query` branch
+> computes the exact count (it materializes the full match set anyway) and
+> records it in the counts table — but only when count-saving is enabled, the
+> same rule `count` follows.  See [Counts and statistics](#counts-and-statistics).
 
 ### `random_sample`
 
@@ -620,17 +621,17 @@ depends on the `PostgresStatsTable.saving` flag, which is `False` by default in
 psycodict** (it is meant to be enabled by a subclass in a data-management
 deployment).  With the default `saving = False`:
 
-- `count(..., record=True)`, `count_distinct(..., record=True)`, `max` and
-  `min` record **nothing** — the `record` argument is effectively inert, and
+- `count(..., record=True)`, `count_distinct(..., record=True)`, `max`, `min`
+  and `sum` record **nothing** — the `record` argument is effectively inert, and
   the computed value is returned without being cached.
-- **`sum` and the uncached-`random` count are exceptions**: they write to the
-  cache tables even when `saving = False`.  This asymmetry is a known wrinkle on
-  this branch — see the accompanying report.  (Writes still fail silently if the
-  connection lacks write permission, e.g. a read-only web user.)
+- `random` behaves the same way: on a counts-cache miss it computes the exact
+  count as a side effect (it has the full match set in hand), but stores it only
+  when `saving = True`.
 
-When a subclass sets `saving = True`, all of the above record their results
-(subject to write permission), and this is the intended mode for the tools that
-populate a database.
+When a subclass sets `saving = True`, all of the above record their results and
+this is the intended mode for the tools that populate a database.  (Writes still
+fail silently if the connection lacks write permission, e.g. a read-only web
+user, so recording is best-effort even under `saving`.)
 
 <a name="joins"></a>
 ## Joins
