@@ -76,6 +76,13 @@ migration note.
   should parse; set `PSYCODICT_CONFIG` (or pass `config_file`) to pin a
   location.  Subclasses supplying their own parser (LMFDB, seminars) are
   unaffected. (#119)
+- **`sum` and `random` honor the `saving` flag.** With the default
+  `saving = False` they no longer write to the counts/stats cache tables (they
+  were the only two paths that did). *Migration:* enable `saving` on the stats
+  table — as data-management deployments already do — to persist computed
+  statistics. (#118)
+- **Python 3.9 or newer is required** (3.8 is past end of life). *Migration:*
+  upgrade the interpreter; no code changes. (#121)
 
 ### Added
 
@@ -110,15 +117,20 @@ migration note.
 - **Schema-change notifications** and a small publish/subscribe layer built on
   PostgreSQL LISTEN/NOTIFY. (#111)
 - **Documentation.** `DataManagement.md` (write side) and `Searching.md` (read
-  API), plus docstring housekeeping across the package. (#104, #105, #106)
+  API), plus docstring housekeeping across the package (#104, #105, #106);
+  `Versioning.md` states what the version number promises (#123), and
+  `CONTRIBUTING.md` and `SECURITY.md` set out the contribution workflow and
+  the security policy.
+- **A documentation site.** Sphinx/MyST build of the guides plus an autodoc
+  API reference, built warning-free in CI and publishable on Read the Docs;
+  the canonical copies of the guides stay at the repository root. (#122)
+- **`psycodict.__version__`** — the package version as an attribute, and the
+  single source of truth for packaging. (#121)
 
 ### Fixed
 
 Roughly two dozen fixes landed while splitting the search/extras tables and
 hardening standalone use; the highlights:
-
-- `postgresql_dbname` was the one option whose default ignored the `defaults`
-  dictionary passed to `Configuration`. (#119)
 
 - Counts-table totals are now maintained correctly on writes rather than drifting
   out of sync. (#61–#87)
@@ -136,12 +148,28 @@ hardening standalone use; the highlights:
   reload or rewrite. (#95)
 - `create_table_like` preserves per-column `STORAGE` / `COMPRESSION` settings and
   analyzes the copy. (#98)
+- `reload` with a metafile and resorting no longer fails with a `TypeError`.
+  (#114)
+- Non-inplace `update_from_file(restat=True)` publishes the refreshed
+  statistics it computes (they used to be left orphaned in `_tmp` tables) and
+  rebuilds the counts indexes on the table it swaps in. (#115)
+- `copy_dumps` escapes the COPY delimiter inside text, json and array values,
+  so its output round-trips through `COPY FROM` and matches `COPY TO` byte for
+  byte. (#116)
+- `postgresql_dbname` was the one option whose default ignored the `defaults`
+  dictionary passed to `Configuration`. (#119)
 
 ### Infrastructure
 
 - A test suite of 500+ tests and a continuous-integration workflow covering the
   supported Python and PostgreSQL versions, plus downstream regression jobs that
   run LMFDB and seminars against the new code. (#58)
+- `config.ini` is no longer tracked in the repository; copy
+  `config.ini.example` (or rely on the configuration discovery above). (#120)
+- A trusted-publishing release workflow: publishing a GitHub release builds
+  the distributions, checks their metadata and uploads to PyPI via OpenID
+  Connect — no long-lived token is stored anywhere. (#113)
+- `CITATION.cff`, so GitHub renders a citation for the package. (#124)
 
 ## 0.1.x and earlier
 

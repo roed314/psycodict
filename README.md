@@ -111,16 +111,17 @@ db.demo_primes.lucky({"n": 7}, projection="factors")   # {'7': 1}
 
 ## Documentation
 
-- [QueryLanguage.md](https://github.com/roed314/psycodict/blob/master/QueryLanguage.md) — how Python dictionaries become SQL `WHERE` clauses.
-- [Searching.md](https://github.com/roed314/psycodict/blob/master/Searching.md) — the read-side API: `search`, `lucky`, `lookup`, `count`, projections, sorts and joins.
-- [DataManagement.md](https://github.com/roed314/psycodict/blob/master/DataManagement.md) — the write side: creating tables, loading data, reloading and reverting, statistics.
-- [MetadataFormats.md](https://github.com/roed314/psycodict/blob/master/MetadataFormats.md) — how the layout of the meta tables is versioned, cross-format compatibility, and the checklist for changing it.
+- [QueryLanguage.md](QueryLanguage.md) — how Python dictionaries become SQL `WHERE` clauses.
+- [Searching.md](Searching.md) — the read-side API: `search`, `lucky`, `lookup`, `count`, projections, sorts and joins.
+- [DataManagement.md](DataManagement.md) — the write side: creating tables, loading data, reloading and reverting, statistics.
+- [MetadataFormats.md](MetadataFormats.md) — how the layout of the meta tables is versioned, cross-format compatibility, and the checklist for changing it.
+- [Versioning.md](Versioning.md) — what the version number promises: the public API, metadata compatibility, and the deprecation policy.
 
-See the [CHANGELOG](https://github.com/roed314/psycodict/blob/master/CHANGELOG.md) for the release history.
+See the [CHANGELOG](https://github.com/roed314/psycodict/blob/main/CHANGELOG.md) for the release history.
 
 ## Supported versions
 
-- Python 3.8 or newer.
+- Python 3.9 or newer.
 - PostgreSQL 13 through 18.
 - psycopg 3 (installed through the `pgbinary` or `pgsource` extra above).
 
@@ -199,4 +200,4 @@ psycodict was split out of the [LMFDB](https://www.lmfdb.org), where it grew as
 the project's `db` interface. It is written and maintained by David Roe and
 Edgar Costa, with contributions from the wider LMFDB community, and is
 distributed under the GNU General Public License, version 2 or later (see
-[LICENSE](LICENSE)).
+[LICENSE](https://github.com/roed314/psycodict/blob/main/LICENSE)).

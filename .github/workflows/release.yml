@@ -23,8 +23,9 @@
 #
 # RELEASE FLOW:
 #
-#   Bump `version` in pyproject.toml and update CHANGELOG.md, merge to master,
-#   then create a GitHub Release with the tag `v1.0.0` (matching the version).
+#   Bump `__version__` in psycodict/__init__.py and update CHANGELOG.md, merge
+#   to main, then create a GitHub Release with the tag `v1.0.0` (matching the
+#   version).
 #   Publishing that release triggers this workflow: the sdist and wheel are
 #   built, metadata-checked, and uploaded to PyPI.  Nothing is published on
 #   pushes, pull requests, or draft releases.
