@@ -2075,6 +2075,7 @@ class PostgresTable(PostgresBase):
             # total, so recount and store it before the reinitialization
             # below reads meta_tables.
             self.stats._set_total(self.stats._slow_count({}, record=False))
+            self._db._notify_schema_change(self.search_table)  # rides this transaction
 
         # Reinitialize object
         tabledata = self._execute(
@@ -2901,6 +2902,7 @@ class PostgresTable(PostgresBase):
                 if label:
                     self.set_label(name)
                 self.column_description(name, description)
+                self._db._notify_schema_change(self.search_table)  # rides this transaction
             aborted = False
         finally:
             self._log_db_change("add_column", logid=logid, aborted=aborted, name=name, datatype=datatype)
@@ -2949,6 +2951,7 @@ class PostgresTable(PostgresBase):
                 modifier = SQL("ALTER TABLE {0} DROP COLUMN {1}").format(Identifier(table), Identifier(name))
                 self._execute(modifier)
                 self.col_type.pop(name, None)
+                self._db._notify_schema_change(self.search_table)  # rides this transaction
             print("Column %s dropped" % (name))
             aborted = False
         finally:
