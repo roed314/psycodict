@@ -41,8 +41,12 @@ from .utils import DelayCommit
 #                  Decides warn-and-proceed versus refuse at connect time.
 #   min_compat  -- stamped into meta_format alongside the version: the oldest
 #                  META_FORMAT a psycodict may have and still safely use a
-#                  database at this format.  Kept low by additive changes,
-#                  raised by breaking ones.
+#                  database at this format.  Raised to N whenever a client that
+#                  predates format N would *mishandle* the new metadata rather
+#                  than merely miss it -- which includes a purely additive
+#                  column when older write paths would silently drop it (as an
+#                  older restore_index/reload would drop a whereclause), not
+#                  only outright breaking changes.
 #   upgrade     -- name of the PostgresDatabase method performing the DDL
 #                  (just the DDL, idempotently: stamping is done by
 #                  upgrade_metadata itself).
@@ -50,7 +54,11 @@ META_MIGRATIONS = {
     1: {
         "description": "meta_indexes/meta_indexes_hist gain a whereclause column (partial indexes)",
         "compatible": True,
-        "min_compat": 0,
+        # A format-0 client reads a format-1 database fine, but its
+        # restore_index/reload would silently rebuild a partial index as a
+        # full one and drop the predicate, so it must not *write* one: the
+        # oldest format that can safely use a format-1 database is 1 itself.
+        "min_compat": 1,
         "upgrade": "_upgrade_meta_0_to_1",
     },
 }

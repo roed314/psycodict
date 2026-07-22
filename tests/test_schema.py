@@ -811,7 +811,7 @@ def test_meta_format_is_stamped(db):
     from psycodict.base import META_FORMAT
 
     cur = db._execute(SQL("SELECT version, min_compat FROM meta_format"))
-    assert cur.fetchone() == (META_FORMAT, 0)
+    assert cur.fetchone() == (META_FORMAT, 1)
     assert db.meta_format == META_FORMAT
 
 
@@ -844,7 +844,7 @@ def test_meta_format_gates_connections(db, config, caplog):
     finally:
         db._execute(SQL("DELETE FROM meta_format"))
         db._execute(SQL("INSERT INTO meta_format (version, min_compat) VALUES (%s, %s)"),
-                    [META_FORMAT, 0])
+                    [META_FORMAT, 1])
 
 
 def test_include_nones_stored_explicitly_and_copied(db, table_factory):

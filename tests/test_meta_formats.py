@@ -226,7 +226,7 @@ def make_table(db):
 def test_upgraded_database_is_stamped_current(private_config):
     db = PostgresDatabase(config=private_config)
     try:
-        assert stamp(db) == (META_FORMAT, 0)
+        assert stamp(db) == (META_FORMAT, 1)
         assert db.meta_format == META_FORMAT
         assert has_whereclause_column(db)
     finally:
@@ -269,14 +269,14 @@ def test_upgrade_metadata_stamps_and_is_idempotent(private_config):
         db._execute(SQL("CREATE TABLE meta_version (version integer NOT NULL)"))
 
         db.upgrade_metadata()
-        assert stamp(db) == (META_FORMAT, 0)
+        assert stamp(db) == (META_FORMAT, 1)
         assert db.meta_format == META_FORMAT
         assert has_whereclause_column(db)
         assert not db._table_exists("meta_version")
 
         # Running it again on an already-current database is a no-op.
         db.upgrade_metadata()
-        assert stamp(db) == (META_FORMAT, 0)
+        assert stamp(db) == (META_FORMAT, 1)
     finally:
         db.conn.close()
 
@@ -285,7 +285,7 @@ def test_connect_with_upgrade_true_migrates(private_config):
     _degrade(private_config, unstamped=True)
     db = PostgresDatabase(config=private_config, upgrade=True)
     try:
-        assert stamp(db) == (META_FORMAT, 0)
+        assert stamp(db) == (META_FORMAT, 1)
         assert db.meta_format == META_FORMAT
         # The migrated database is fully functional for the new feature.
         table = make_table(db)
@@ -318,7 +318,7 @@ def test_future_format_stamp(private_config, caplog):
             PostgresDatabase(config=private_config)
     finally:
         db._execute(SQL("UPDATE meta_format SET version = %s, min_compat = %s"),
-                    [META_FORMAT, 0])
+                    [META_FORMAT, 1])
         db.conn.close()
 
 
@@ -332,7 +332,7 @@ def test_empty_stamp_refuses_to_connect_or_migrate(private_config):
             db.upgrade_metadata()
     finally:
         db._execute(SQL("INSERT INTO meta_format (version, min_compat) VALUES (%s, %s)"),
-                    [META_FORMAT, 0])
+                    [META_FORMAT, 1])
         db.conn.close()
 
 

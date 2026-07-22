@@ -71,6 +71,23 @@ write grants) can never migrate themselves, which is precisely why an older
 compatible format *warns* instead of refusing.  A replica inherits the
 migration when the primary is migrated.
 
+### Pre-1.0 psycodict cannot be repelled
+
+This negotiation only binds clients that implement the `meta_format`
+protocol — that is, psycodict 1.0 and later.  A **pre-1.0** psycodict knows
+nothing of `meta_format`; it will happily connect to a format-1 database and,
+because its `restore_index` and metadata reload/revert paths predate the
+`whereclause` column, it can silently rebuild a partial index as a full one
+and drop the predicate.  `meta_format` and `min_compat` cannot stop it, since
+it never reads them.
+
+> **Do not run a pre-1.0 psycodict against a database that a 1.0+ psycodict
+> has created or migrated (format ≥ 1).**  This matters only during a
+> mixed-version rollout; once every process has been upgraded to 1.0+ there is
+> nothing to watch for.  (The alternative — leaving a tombstone in the old
+> `meta_version` table so pre-1.0 clients refuse — was declined in favor of the
+> single-stamp design; the numbering aligns with the major version instead.)
+
 ## Migrating
 
 Migration is deliberate, never automatic: connecting does not alter a
