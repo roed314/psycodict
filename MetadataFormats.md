@@ -82,10 +82,17 @@ and drop the predicate.  `meta_format` and `min_compat` cannot stop it, since
 it never reads them.
 
 > **Do not run a pre-1.0 psycodict against a database that a 1.0+ psycodict
-> has created or migrated (format ≥ 1).**  If it has already happened, the
-> damage is repairable: the predicate is still recorded in `meta_indexes`, so
-> running `restore_index` from a 1.0 client rebuilds the partial index
-> correctly.  This matters only during a
+> has created or migrated (format ≥ 1).**  If it has already happened, what is
+> recoverable depends on which paths the pre-1.0 client ran.  Its
+> `restore_index` only rebuilds the physical index, leaving the predicate
+> recorded in `meta_indexes`: drop the wrongly-full index, then run
+> `restore_index` from a 1.0 client to rebuild it correctly.  (Restoring
+> without dropping first keeps the bad index behind under a `_depN` name --
+> and a unique index kept that way still over-constrains writes.)  The
+> pre-1.0 metadata *reload and revert* paths, however, rewrite the
+> `meta_indexes` rows with the six pre-1.0 columns, destroying the recorded
+> predicate -- after that the partial index cannot be reconstructed from the
+> database itself, only from a metadata backup (see *Rolling back* below).  This matters only during a
 > mixed-version rollout; once every process has been upgraded to 1.0+ there is
 > nothing to watch for.  (The alternative — leaving a tombstone in the old
 > `meta_version` table so pre-1.0 clients refuse — was declined in favor of the
@@ -109,13 +116,60 @@ of band — is harmless.  Downgrades are not supported.
 
 ### Rolling back
 
-Because downgrades are not supported, take an ordinary backup before
-migrating — `pg_dump` — and restoring it is the rollback.  This procedure has
-been rehearsed against a live format-0 database: after `pg_restore`, a
-pre-1.0 client operates exactly as before, and a 1.0 client connects with the
-usual format-0 warning and degrades, as if the migration had never run.  A
-migration touches only the meta tables, so the backup taken for this purpose
-has no reason to outlive the rollout.
+Because downgrades are not supported, take a backup before migrating, in the
+custom format that `pg_restore` consumes (the default plain-SQL format cannot
+be given to `pg_restore`):
+
+```sh
+pg_dump -F c -f pre_migration.dump $DBNAME
+```
+
+To roll back, recreate the database from the dump — restoring over the
+existing database would stop on existing-object errors and leave the new
+`meta_format` stamp in place:
+
+```sh
+pg_restore -d postgres --clean --create --exit-on-error pre_migration.dump
+# equivalently: dropdb $DBNAME && createdb $DBNAME
+#               && pg_restore -d $DBNAME pre_migration.dump
+```
+
+run as a role allowed to drop and recreate the database.  **This restores the
+whole database to the moment of the dump — application data included** — so
+quiesce writes for the migration window and roll back immediately or not at
+all.
+
+If writes cannot be stopped or lost, the surgical variant is to back up only
+the six meta tables:
+
+```sh
+pg_dump -F c -f pre_migration_meta.dump \
+    -t meta_tables -t meta_tables_hist -t meta_indexes \
+    -t meta_indexes_hist -t meta_constraints -t meta_constraints_hist \
+    $DBNAME
+```
+
+and to roll back by replacing them, leaving the application tables (and any
+writes since the dump) untouched:
+
+```sh
+psql -c 'DROP TABLE meta_tables, meta_tables_hist, meta_indexes,
+                    meta_indexes_hist, meta_constraints, meta_constraints_hist;
+         DROP TABLE IF EXISTS meta_format' $DBNAME
+pg_restore -d $DBNAME --exit-on-error pre_migration_meta.dump
+```
+
+The *metadata* still rewinds to the dump: an index or constraint created
+after it becomes an unlisted orphan (drop it by hand), a column added after
+it disappears from psycodict's view, and `count()` on the empty query answers
+from a cached total in `meta_tables` that will be stale if rows were written
+in between.  So the surgical variant, too, is best used immediately after
+migrating, before other schema activity.
+
+Both procedures have been rehearsed against a live format-0 database built
+with an actual pre-1.0 psycodict: after either restore, the pre-1.0 client
+operates exactly as before the migration, and a 1.0 client connects with the
+usual format-0 warning and degrades, as if the migration had never run.
 
 ## Exported metadata files
 
