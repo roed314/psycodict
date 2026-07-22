@@ -130,6 +130,12 @@ See the [CHANGELOG](https://github.com/roed314/psycodict/blob/main/CHANGELOG.md)
 - PostgreSQL 13 through 18.
 - psycopg 3.2.4 or newer (installed through the `pgbinary` or `pgsource` extra above).
 
+Python 3.9 and PostgreSQL 13 are already past their upstream end of life;
+psycodict keeps supporting them as legacy compatibility for downstream
+deployments.  As [Versioning](https://psycodict.readthedocs.io/en/latest/Versioning.html)
+spells out, dropping an end-of-life interpreter or server version is not a
+breaking change and can happen in a minor release.
+
 ## Setting up PostgreSQL
 
 If you do not already have a server, install
