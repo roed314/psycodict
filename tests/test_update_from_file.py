@@ -64,3 +64,31 @@ def test_non_inplace_without_restat_leaves_no_tmp_stats(saving_table, tmp_path):
     assert list(saving_table.search({"flag": False}, "id")) == []
     assert not saving_table._table_exists(saving_table.stats.counts + "_tmp")
     assert not saving_table._table_exists(saving_table.stats.stats + "_tmp")
+
+
+def test_non_inplace_restat_keeps_counts_indexes(saving_table, tmp_path):
+    # A production counts table carries the standard lookup indexes (reload
+    # builds them).  The non-inplace restat swap clones the counts table with a
+    # bare LIKE, which copies no indexes, so unless they are rebuilt on the
+    # _tmp table before the swap the indexed live counts table is replaced by
+    # an unindexed one and cached-count lookups degrade to sequential scans.
+    from psycodict.table import _counts_indexes
+
+    saving_table.stats.add_stats(["flag"])
+
+    # Establish the counts indexes the way a prior reload would have, and
+    # confirm they are present before the update.
+    counts = saving_table.search_table + "_counts"
+    index_names = [idx["name"].format(counts) for idx in _counts_indexes]
+    saving_table._create_counts_indexes()
+    assert all(saving_table._relation_exists(name) for name in index_names)
+
+    datafile = str(tmp_path / "flags.txt")
+    _write_flag_file(datafile, ["l%d" % i for i in range(200)], value=True)
+    saving_table.update_from_file(datafile, "label", inplace=False, restat=True)
+
+    # The live counts indexes must survive the swap.
+    for name in index_names:
+        assert saving_table._relation_exists(name), (
+            "counts index %s missing after non-inplace restat update" % name
+        )

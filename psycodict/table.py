@@ -1198,6 +1198,13 @@ class PostgresTable(PostgresBase):
                     tables = [self.search_table]
                     if restat and self.stats.saving:
                         tables += [self.stats.counts, self.stats.stats]
+                    if self.stats.counts in tables:
+                        # _clone built the _tmp counts table with a bare LIKE,
+                        # which copies no indexes; build the standard counts
+                        # indexes on it before the swap so the live counts
+                        # table keeps them (otherwise cached-count lookups
+                        # degrade to sequential scans).  reload does the same.
+                        self._create_counts_indexes(suffix=suffix)
                     self._swap_in_tmp(tables)
                     if ordered:
                         self._set_ordered()
