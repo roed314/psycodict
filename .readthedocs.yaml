@@ -4,7 +4,7 @@
 # https://readthedocs.org/dashboard/import/ (the psycodict GitHub App
 # integration handles builds on push and pull-request previews from then
 # on).  Once 1.0 is tagged, activate the tag under Versions so that
-# /stable/ serves the release while /latest/ tracks master.
+# /stable/ serves the release while /latest/ tracks main.
 version: 2
 
 build:
