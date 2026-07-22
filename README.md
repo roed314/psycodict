@@ -18,7 +18,7 @@ builds; install psycodict with one of the two extras:
 
 ```
 pip install "psycodict[pgbinary]"    # pulls in psycopg[binary]; no system libpq needed
-pip install "psycodict[pgsource]"    # pulls in psycopg; builds against your system libpq
+pip install "psycodict[pgsource]"    # pulls in pure-Python psycopg, which uses your system libpq
 ```
 
 ## Quickstart
@@ -128,7 +128,7 @@ See the [CHANGELOG](https://github.com/roed314/psycodict/blob/main/CHANGELOG.md)
 
 - Python 3.9 or newer.
 - PostgreSQL 13 through 18.
-- psycopg 3 (installed through the `pgbinary` or `pgsource` extra above).
+- psycopg 3.2.4 or newer (installed through the `pgbinary` or `pgsource` extra above).
 
 ## Setting up PostgreSQL
 

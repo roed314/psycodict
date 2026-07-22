@@ -37,8 +37,12 @@ Repository = "https://github.com/roed314/psycodict"
 Changelog = "https://github.com/roed314/psycodict/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-pgsource = ["psycopg>=3.1"]
-pgbinary = ["psycopg[binary]>=3.1"]
+# 3.2 introduced Connection.notifies(timeout=..., stop_after=...), which the
+# notification listener uses, and 3.2.4 fixed notifications being dropped
+# while no generator was consuming them -- essential for the pull-based
+# NotificationListener.poll().
+pgsource = ["psycopg>=3.2.4"]
+pgbinary = ["psycopg[binary]>=3.2.4"]
 test = ["pytest>=7"]
 
 [tool.setuptools.dynamic]
