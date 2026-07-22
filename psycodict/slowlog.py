@@ -246,8 +246,8 @@ def normalize_query(query):
 
     EXAMPLES::
 
-        sage: from psycodict.slowlog import normalize_query
-        sage: normalize_query("SELECT \\"a\\" FROM \\"t\\" WHERE \\"n\\" = 5 AND \\"s\\" = 'x1' LIMIT 4")
+        >>> from psycodict.slowlog import normalize_query
+        >>> normalize_query("SELECT \\"a\\" FROM \\"t\\" WHERE \\"n\\" = 5 AND \\"s\\" = 'x1' LIMIT 4")
         'SELECT "a" FROM "t" WHERE "n" = ? AND "s" = ? LIMIT ?'
     """
     out = []
@@ -409,8 +409,8 @@ def normalize_dict_query(query):
 
     EXAMPLES::
 
-        sage: from psycodict.slowlog import normalize_dict_query
-        sage: normalize_dict_query("{'n': {'$gte': 5}, 'label': 'a'}")
+        >>> from psycodict.slowlog import normalize_dict_query
+        >>> normalize_dict_query("{'n': {'$gte': 5}, 'label': 'a'}")
         "{'n': {'$gte': ?}, 'label': ?}"
     """
     out = []
@@ -1098,8 +1098,8 @@ def show_slow_report(logfile, top=20, cutoff=None, db=None):
 
     EXAMPLES::
 
-        sage: from psycodict.slowlog import show_slow_report
-        sage: show_slow_report("slow_queries.log", db=db)  # db optional
+        >>> from psycodict.slowlog import show_slow_report
+        >>> show_slow_report("slow_queries.log", db=db)  # doctest: +SKIP
     """
     report = slow_query_report(logfile, top=top, cutoff=cutoff, db=db)
     print(

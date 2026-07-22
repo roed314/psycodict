@@ -260,21 +260,12 @@ class PostgresTable(PostgresBase):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: nf = db.nf_fields
-            sage: nf.analyze({'degree':int(5)},limit=20)
-            SELECT label, coeffs, degree, r2, cm, disc_abs, disc_sign, disc_rad, ramps, galt, class_number, class_group, used_grh, oldpolredabscoeffs FROM nf_fields WHERE degree = 5 ORDER BY degree, disc_abs, disc_sign, label LIMIT 20
-            Limit  (cost=671790.56..671790.61 rows=20 width=305) (actual time=1947.351..1947.358 rows=20 loops=1)
-              ->  Sort  (cost=671790.56..674923.64 rows=1253232 width=305) (actual time=1947.348..1947.352 rows=20 loops=1)
-                    Sort Key: disc_abs, disc_sign, label COLLATE "C"
-                    Sort Method: top-N heapsort  Memory: 30kB
-                    ->  Bitmap Heap Scan on nf_fields  (cost=28589.11..638442.51 rows=1253232 width=305) (actual time=191.837..1115.096 rows=1262334 loops=1)
-                          Recheck Cond: (degree = 5)
-                          Heap Blocks: exact=35140
-                          ->  Bitmap Index Scan on nfs_ddd  (cost=0.00..28275.80 rows=1253232 width=0) (actual time=181.789..181.789 rows=1262334 loops=1)
-                                Index Cond: (degree = 5)
-            Planning time: 2.880 ms
-            Execution time: 1947.655 ms
+            >>> nf = db.test_fields
+            >>> nf.analyze({'degree': 2}, limit=4)
+            SELECT "class_group", "class_number", "degree", "disc_abs", "disc_sign", "label", "r2", "ramps" FROM "test_fields" WHERE "degree" = 2 ORDER BY "degree", "disc_abs", "label" LIMIT 4
+            Limit  (cost=... rows=4... loops=1)
+            ...
+            Execution Time: ... ms
         """
         if join is not None:
             _, selecter, values = self._join_selecter(query, projection, join, limit=limit, offset=offset, sort=sort)
@@ -1210,15 +1201,15 @@ class PostgresTable(PostgresBase):
 
         EXAMPLES:
 
-        For example, to add a new column to artin_reps that tracks the
-        signs of the galois conjugates, you would do the following::
+        For example, to add a new column to test_fields holding the signed
+        discriminant, you would do the following::
 
-            sage: from lmfdb import db
-            sage: db.artin_reps.add_column('GalConjSigns','jsonb')
-            sage: def add_signs(rec):
-            ....:     rec['GalConjSigns'] = sorted(list(set([conj['Sign'] for conj in rec['GaloisConjugates']])))
-            ....:     return rec
-            sage: db.artin_reps.rewrite(add_signs)
+            >>> nf = db.test_fields
+            >>> nf.add_column('disc', 'integer')  # doctest: +SKIP
+            >>> def add_disc(rec):
+            ...     rec['disc'] = rec['disc_sign'] * rec['disc_abs']
+            ...     return rec
+            >>> nf.rewrite(add_disc)  # doctest: +SKIP
         """
         # Fail before the expensive dump below rather than deep inside update_from_file
         self._forbid_reindex_false(kwds.get("reindex"), kwds.get("inplace"))
@@ -2399,11 +2390,10 @@ class PostgresTable(PostgresBase):
 
         EXAMPLES::
 
-            sage: from lmfdb import db
-            sage: with db.test_table.staged() as staged:  # doctest: +SKIP
-            ....:     staged.insert_many(rows)
-            ....:     staged.update({"n": 5}, {"flag": True})
-            ....:     staged.delete({"bad": True})
+            >>> with db.test_fields.staged() as staged:  # doctest: +SKIP
+            ...     staged.insert_many(rows)
+            ...     staged.update({"degree": 2}, {"flag": True})
+            ...     staged.delete({"bad": True})
         """
         return StagedWriteContext(self)
 
