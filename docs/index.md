@@ -27,3 +27,11 @@ Versioning
 
 api/index
 ```
+
+```{toctree}
+:maxdepth: 1
+:caption: Project
+
+Contributing <CONTRIBUTING>
+Security policy <SECURITY>
+```

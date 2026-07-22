@@ -25,6 +25,8 @@ _GUIDES = [
     "DataManagement.md",
     "MetadataFormats.md",
     "Versioning.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
 ]
 for _name in _GUIDES:
     shutil.copyfile(_ROOT / _name, _DOCS / _name)
