@@ -62,6 +62,19 @@ migration note.
   created or migrated — it predates `meta_format`, so it cannot be told to
   refuse, and its index/reload paths would silently drop partial-index
   predicates.  This only matters during a mixed-version rollout. (#90, #110)
+- **`Configuration` behaves like a library.** It no longer parses the host
+  program's command line by default (`readargs` was auto-enabled in scripts
+  and an unrecognized option raised `SystemExit`); with no explicit location
+  the configuration file is discovered — `$PSYCODICT_CONFIG`, then
+  `./config.ini` if it already exists, then `~/.psycodict/config.ini` — and a
+  missing file is created under `~/.psycodict`, never in the working
+  directory; the default `slow_queries.log` lands in a `logs` directory next
+  to the configuration file; and the default secrets file sits next to the
+  configuration file.  Existing `./config.ini` setups keep working unchanged.
+  *Migration:* pass `readargs=True` in a script whose command line psycodict
+  should parse; set `PSYCODICT_CONFIG` (or pass `config_file`) to pin a
+  location.  Subclasses supplying their own parser (LMFDB, seminars) are
+  unaffected. (#119)
 
 ### Added
 
@@ -102,6 +115,9 @@ migration note.
 
 Roughly two dozen fixes landed while splitting the search/extras tables and
 hardening standalone use; the highlights:
+
+- `postgresql_dbname` was the one option whose default ignored the `defaults`
+  dictionary passed to `Configuration`. (#119)
 
 - Counts-table totals are now maintained correctly on writes rather than drifting
   out of sync. (#61–#87)

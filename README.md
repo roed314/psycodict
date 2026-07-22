@@ -23,9 +23,10 @@ pip install "psycodict[pgsource]"    # pulls in psycopg; builds against your sys
 
 ## Quickstart
 
-psycodict reads its connection settings from a `config.ini` in the working
-directory (one is created with default values on first run if none exists).
-Point it at your server:
+psycodict reads its connection settings from a `config.ini`: it uses
+`$PSYCODICT_CONFIG` if set, then `config.ini` in the working directory if one
+exists, and otherwise `~/.psycodict/config.ini` (created with default values
+on first run).  Point it at your server:
 
 ```ini
 [postgresql]
