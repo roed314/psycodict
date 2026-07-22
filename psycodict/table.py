@@ -936,7 +936,32 @@ class PostgresTable(PostgresBase):
         To this end, it has a return value (defaulting to None) that is passed into the eventual
         _log_db_change in the functions that call this, and it takes a datafile as input to
         support checking the size on disk (nothing is done with this datafile by default).
+
+        While a staged copy of the table exists (see ``staged``), changes to
+        the live table are refused: the copy was taken when the context was
+        entered, so anything written to the live table afterward would be
+        silently discarded when the copy is swapped into place.  This covers
+        writes made through psycodict's API only; raw SQL from another
+        connection bypasses it, with the count check at the end of ``staged``
+        as a partial backstop.
         """
+        # Skip the staged guard when a suffix is given (the operation targets
+        # the suffixed scratch table, not the live one) and for
+        # create_table_like, which only reads this table.  Note that the
+        # staged handle itself is unaffected: its search_table already ends
+        # in _tmp, so it checks for a doubly suffixed table here.  reload is
+        # deliberately not exempted, since it would collide with the staged
+        # copy partway through; failing here gives it a clear message.
+        if not suffix and changetype != "create_table_like" and self._table_exists(self.search_table + "_tmp"):
+            raise LockError(
+                "A staged copy of %s exists (%s_tmp): a staged() context or a "
+                "reload is in progress, and writes to the live table would be "
+                "lost when the copy is swapped into place.  Exit the staged "
+                "context first, or if the copy is left over from an "
+                "interrupted operation, discard it with db.%s.drop_tmp() and "
+                "try again."
+                % (self.search_table, self.search_table, self.search_table)
+            )
         if changetype in ["upsert", "update"]:
             locktypes = "update"
         elif changetype in ["insert_many", "copy_from"]:
@@ -2032,10 +2057,13 @@ class PostgresTable(PostgresBase):
         """
         with DelayCommit(self, silence=True):
             if tables is None:
+                # _swap_in_tmp takes the base names and appends the _tmp
+                # itself, so record the base name (not the _tmp one) of each
+                # companion that actually has a staged _tmp copy.
                 tables = []
                 for suffix in ["", "_stats", "_counts"]:
-                    tablename = "{0}{1}_tmp".format(self.search_table, suffix)
-                    if self._table_exists(tablename):
+                    tablename = "{0}{1}".format(self.search_table, suffix)
+                    if self._table_exists(tablename + "_tmp"):
                         tables.append(tablename)
 
             self._swap_in_tmp(tables)
@@ -2151,6 +2179,397 @@ class PostgresTable(PostgresBase):
             for head, cur_tail, new_tail in to_swap:
                 self._swap([head], f"_old{cur_tail}", f"_old{new_tail}")
                 print(f"Swapped {head}{cur_tail} to {head}{new_tail}")
+
+    ##################################################################
+    # Staged writes                                                  #
+    ##################################################################
+
+    # Methods disabled on the staged handle yielded by ``staged``: changing
+    # the schema of the staged copy would desynchronize it from the meta_*
+    # rows describing the live table (which the swap does not touch), the
+    # reload machinery does not compose with an active staged context, and
+    # an unpaired drop_pkeys would strip the primary key from the table that
+    # the swap installs (the commit only rebuilds what meta_indexes and
+    # meta_constraints record, which does not include the primary key).
+    # drop_indexes and restore_indexes are deliberately not here: they only
+    # act on what meta_indexes and meta_constraints record for the handle's
+    # (suffixed) name, which is nothing, and the write methods call them
+    # internally when reindex is set, so they must stay working no-ops.
+    _staged_unsupported = (
+        "add_column",
+        "drop_column",
+        "create_index",
+        "drop_index",
+        "restore_index",
+        "create_constraint",
+        "drop_constraint",
+        "restore_constraint",
+        "drop_pkeys",
+        "restore_pkeys",
+        "set_sort",
+        "set_label",
+        "set_importance",
+        "reload",
+        "reload_final_swap",
+        "reload_revert",
+        "cleanup_from_reload",
+        "reload_indexes",
+        "reload_meta",
+        "reload_constraints",
+        "revert_indexes",
+        "revert_meta",
+        "revert_constraints",
+        "drop_tmp",
+        "staged",
+        "staged_force_swap",
+    )
+
+    def staged(self):
+        """
+        Returns a context manager for editing this table without ever
+        modifying the live table in place.
+
+        On entering the context, the search table is copied (data, ids and
+        primary key, but no other indexes) to a table with a ``_tmp`` suffix,
+        and empty copies of the counts and stats tables are created alongside
+        it.  The object yielded is a genuine table object pointed at the
+        copy, so the usual write methods (``insert_many``, ``update``,
+        ``upsert``, ``delete``, ``rewrite``, ...) and the search methods work
+        on it, while reads on the live table proceed as if nothing had
+        happened.
+
+        On exiting normally, the indexes and constraints recorded in
+        meta_indexes and meta_constraints are built on the copy and it is
+        swapped into place using the same renaming choreography as
+        ``reload``: the previous version is kept with an ``_old<n>`` suffix,
+        so ``reload_revert`` undoes the swap and ``cleanup_from_reload``
+        drops the backups.  The statistics are invalidated rather than
+        recomputed: the swapped-in counts and stats tables are empty and
+        stats_valid is set to false in meta_tables.
+
+        On exiting with an exception, the copies are dropped and the live
+        table is left exactly as it was.
+
+        As with ``reload``, a successful swap replaces the table object held
+        by the database, so get a fresh reference afterward (``db[name]``)
+        rather than continuing to use an old one; the staged handle is also
+        dead once the context exits.  Only one staged context (or reload) at
+        a time can be active on a table; a second one raises on entry.
+        Schema changes through the staged handle are disabled.  If the swap
+        itself fails, the staged tables are left in place so that no work is
+        lost; ``drop_tmp`` discards them and ``staged_force_swap`` adopts
+        them, discarding whatever concurrent changes made the swap refuse.
+
+        While the context is open, writes to the live table through
+        psycodict's API (``insert_many``, ``update``, ``delete``, ..., from
+        this or any other connection) raise ``LockError``, since the swap
+        would silently discard them.  Raw SQL bypasses that guard; as a
+        backstop, the commit refuses to swap if the live table's row count
+        or maximum id changed while the context was open.  In-place updates
+        change neither number and escape the backstop, so raw-SQL writers
+        must simply stay away from a table while it is being staged.
+
+        EXAMPLES::
+
+            sage: from lmfdb import db
+            sage: with db.test_table.staged() as staged:  # doctest: +SKIP
+            ....:     staged.insert_many(rows)
+            ....:     staged.update({"n": 5}, {"flag": True})
+            ....:     staged.delete({"bad": True})
+        """
+        return StagedWriteContext(self)
+
+    def _staged_tables(self):
+        """
+        The tables taking part in a staged swap: the search table together
+        with its counts and stats companions.
+        """
+        return [self.search_table, self.stats.counts, self.stats.stats]
+
+    def _staged_blocked(self, methodname):
+        """
+        Utility function producing the stub that disables ``methodname`` on
+        staged handles.
+        """
+        def blocked(*args, **kwds):
+            raise ValueError(
+                "%s is not supported on a staged table; "
+                "exit the staged context and call it on %s itself"
+                % (methodname, self.search_table)
+            )
+        return blocked
+
+    def _staged_enter(self):
+        """
+        Create the staged copy of this table; the first half of ``staged``.
+
+        OUTPUT:
+
+        A pair ``(staged, logid)`` where ``staged`` is a table object
+        pointed at the copy and ``logid`` comes from ``_check_locks``.
+        """
+        suffix = "_tmp"
+        for table in self._staged_tables():
+            if self._table_exists(table + suffix):
+                raise ValueError(
+                    "Temporary table %s already exists: another staged context "
+                    "or reload may be in progress on %s.  If it is left over "
+                    "from an interrupted one, run db.%s.drop_tmp() and try again."
+                    % (table + suffix, self.search_table, self.search_table)
+                )
+        # Creating the copy only reads the live table, so it conflicts with
+        # the same locks as the copy in create_table_like
+        logid = self._check_locks("create_table_like")
+        aborted = True
+        try:
+            now = time.time()
+            # A single transaction, so that a failure part way through leaves
+            # nothing behind; the copy becomes visible to other connections
+            # (making their staged() fail fast above) when it commits.
+            with DelayCommit(self, silence=True):
+                for table in self._staged_tables():
+                    self._clone(table, table + suffix)
+                cols = SQL(", ").join(map(Identifier, ["id"] + self.search_cols))
+                inserter = SQL("INSERT INTO {0} ({1}) SELECT {1} FROM {2}").format(
+                    Identifier(self.search_table + suffix),
+                    cols,
+                    Identifier(self.search_table),
+                )
+                total = self._execute(inserter).rowcount
+                # Reading the copy rather than the live table pins down
+                # exactly what was copied, even if the live table moves
+                # between the statements; the commit-time drift check
+                # compares the live table against this.
+                source_max_id = self.max_id(self.search_table + suffix)
+                # The primary key keeps id lookups (max_id, upserts, updates
+                # by id) fast during staging and catches id collisions as
+                # they happen; the other indexes are built at commit time as
+                # in reload, so that they are built once on the final data
+                # rather than maintained through every staged write.
+                self.restore_pkeys(suffix=suffix)
+                # Staged writes are usually keyed by the label column (update,
+                # upsert and update_from_file all look rows up by it), so give
+                # the copy a plain index on it as well, turning those per-write
+                # lookups from sequential scans into index scans.  Like the
+                # other non-pkey indexes it is not part of meta_indexes; it is
+                # dropped at commit before the real indexes are rebuilt (see
+                # _staged_commit), so it never reaches the live table.
+                if self._label_col is not None and self._label_col != "id":
+                    self._execute(SQL("CREATE INDEX {0} ON {1} ({2})").format(
+                        Identifier(self.search_table + suffix + "_staged_label"),
+                        Identifier(self.search_table + suffix),
+                        Identifier(self._label_col),
+                    ))
+            print(
+                "Staged copy of %s created in %.3f secs"
+                % (self.search_table, time.time() - now)
+            )
+            # A real table object pointed at the copy: the copy has no row in
+            # meta_tables, so it is built from the live table's metadata and
+            # the row count of the copy.  Writes through it update its cached
+            # total and flags in memory; their meta_tables updates are keyed
+            # on the suffixed name and so touch nothing.
+            staged = type(self)(
+                self._db,
+                self.search_table + suffix,
+                self._label_col,
+                sort=self._sort_orig,
+                count_cutoff=self._count_cutoff,
+                id_ordered=self._id_ordered,
+                out_of_order=self._out_of_order,
+                stats_valid=self._stats_valid,
+                total=total,
+                include_nones=self._include_nones,
+            )
+            # The stats object derives its table names from the handle's name
+            # (name_tmp_counts), but the clones follow the reload convention
+            # of suffixing the companion names (name_counts_tmp), since that
+            # is what the swap and cleanup machinery renames; repoint it.
+            staged.stats.counts = self.stats.counts + suffix
+            staged.stats.stats = self.stats.stats + suffix
+            # What the live table held when the copy was taken, for the
+            # commit-time check that it did not change during staging
+            staged._staged_source_count = total
+            staged._staged_source_max_id = source_max_id
+            for methodname in self._staged_unsupported:
+                setattr(staged, methodname, self._staged_blocked(methodname))
+            # The staged table is already a scratch copy, so updating it from
+            # a file edits it directly rather than cloning it again (rewrite
+            # goes through this path); a nested non-inplace update would also
+            # collide with the _tmp naming machinery.
+            unstaged_update_from_file = staged.update_from_file
+
+            def update_from_file(datafile, label_col=None, inplace=True, **kwds):
+                if not inplace:
+                    raise ValueError("update_from_file on a staged table is always performed in place")
+                return unstaged_update_from_file(datafile, label_col=label_col, inplace=True, **kwds)
+
+            staged.update_from_file = update_from_file
+            # With reindex set, insert_many drops the primary key around the
+            # insert and rebuilds it afterward; on the staged handle that
+            # pair is blocked (an unpaired drop would survive the swap, see
+            # _staged_unsupported), and the copy carries no other indexes to
+            # drop, so force it off rather than letting the automatic
+            # reindex=None default trip over the block on large inserts.
+            unstaged_insert_many = staged.insert_many
+
+            def insert_many(data, resort=False, reindex=None, restat=True):
+                return unstaged_insert_many(data, resort=resort, reindex=False, restat=restat)
+
+            staged.insert_many = insert_many
+            aborted = False
+            return staged, logid
+        finally:
+            if aborted:
+                self._log_db_change("staged", logid=logid, aborted=True)
+
+    def _staged_commit(self, staged, logid):
+        """
+        Swap the staged copy into place; the second half of ``staged``.
+
+        INPUT:
+
+        - ``staged`` -- the staged table object returned by ``_staged_enter``
+        - ``logid`` -- passed on to ``_log_db_change``
+        """
+        suffix = "_tmp"
+        # Drop the staging-only label index before rebuilding the real
+        # indexes.  Committed on its own, ahead of the swap transaction below,
+        # so that even if the drift check refuses the swap (rolling that
+        # transaction back), the staged copy is left without this artifact:
+        # _swap renames indexes but does not drop them, so a leftover here
+        # would otherwise ride into the live table when the caller forces the
+        # swap with the staged_force_swap recovery named in the error (which
+        # drops it again itself, but only staged tables adopted from a session
+        # that never reached this point still carry it).
+        if self._label_col is not None and self._label_col != "id":
+            with DelayCommit(self, silence=True):
+                self._execute(SQL("DROP INDEX IF EXISTS {0}").format(
+                    Identifier(self.search_table + suffix + "_staged_label")))
+        aborted = True
+        try:
+            with DelayCommit(self, silence=True):
+                # Build the indexes and constraints recorded in meta_indexes
+                # and meta_constraints, as reload does just before its swap
+                self.restore_indexes(suffix=suffix)
+                self._create_counts_indexes(suffix=suffix)
+                # Backstop against writes that reached the live table anyway
+                # (raw SQL bypasses the guard in _check_locks): if the row
+                # count or the maximum id moved since the copy was taken,
+                # the swap would silently discard those rows into the _old
+                # backup.  Checked after the index builds to keep the window
+                # between check and swap small.  In-place updates change
+                # neither number and are not caught here; the _check_locks
+                # guard is the primary defense.
+                live_count = self.stats._slow_count({}, record=False)
+                live_max_id = self.max_id()
+                if (live_count != staged._staged_source_count
+                        or live_max_id != staged._staged_source_max_id):
+                    name = self.search_table
+                    raise RuntimeError(
+                        "The live table %s changed during staging: it held "
+                        "%s rows with max id %s when the staged copy was taken, "
+                        "but now holds %s rows with max id %s.  Refusing to "
+                        "swap, since the swap would discard those changes.  The "
+                        "staged tables are kept: run db.%s.drop_tmp() to discard "
+                        "the staged writes, or -- if instead you want the staged "
+                        "copy to win, discarding those concurrent changes -- "
+                        "swap it in with db.%s.staged_force_swap()."
+                        % (
+                            name,
+                            staged._staged_source_count,
+                            staged._staged_source_max_id,
+                            live_count,
+                            live_max_id,
+                            name,
+                            name,
+                        )
+                    )
+                self._staged_swap_in(staged._out_of_order)
+            aborted = False
+        finally:
+            self._log_db_change("staged", logid=logid, aborted=aborted)
+
+    def _staged_swap_in(self, out_of_order):
+        """
+        The shared tail of ``_staged_commit`` and ``staged_force_swap``:
+        transfer the flags to the live meta_tables row and swap the staged
+        tables into place.
+
+        INPUT:
+
+        - ``out_of_order`` -- whether the live table must be marked out of
+          order, because the staged writes broke (or, in the forced case,
+          may have broken) the id ordering.
+        """
+        # The staged writes could not update the meta_tables row (it is
+        # keyed on the live name), so transfer the order flag and invalidate
+        # the statistics: the swapped-in counts and stats tables are empty,
+        # not refreshed
+        if out_of_order:
+            self._break_order()
+        self._break_stats()
+        # reload_final_swap backs the live tables up under _old<n>, renames
+        # the _tmp ones into place, recounts the total and replaces the
+        # table object held by the database
+        self.reload_final_swap(tables=self._staged_tables(), ordered=False)
+
+    def staged_force_swap(self):
+        """
+        Adopt a staged copy whose commit never happened: build its indexes
+        and swap it into place, finalized exactly as a clean ``staged`` exit
+        would have.
+
+        This is the recovery named in the error raised when a staged commit
+        refuses to swap because the live table changed during staging; it
+        also adopts staged tables left behind by a session that died before
+        its commit ran.  Unlike the commit it performs **no** drift check:
+        the staged copy wins, and whatever the live table holds is backed up
+        under ``_old<n>`` (so ``reload_revert`` still undoes this).
+
+        The staged handle that knew whether the staged writes preserved the
+        id ordering is gone, so the table is conservatively marked out of
+        order -- always safe, it merely disables a sort optimization; run
+        ``resort`` afterward to restore id order.  As with a normal staged
+        commit the statistics are invalidated, and the table object held by
+        the database is replaced, so get a fresh reference (``db[name]``)
+        afterward.
+        """
+        suffix = "_tmp"
+        missing = [
+            table + suffix
+            for table in self._staged_tables()
+            if not self._table_exists(table + suffix)
+        ]
+        if missing:
+            raise ValueError(
+                "Cannot force a staged swap on %s: %s missing"
+                % (self.search_table, ", ".join(missing))
+            )
+        with DelayCommit(self, silence=True):
+            # The staging-only label index: a commit that got as far as its
+            # drift check has already dropped it, but staged tables left by
+            # a session that died before commit still carry it, and _swap
+            # renames indexes rather than dropping them
+            if self._label_col is not None and self._label_col != "id":
+                self._execute(SQL("DROP INDEX IF EXISTS {0}").format(
+                    Identifier(self.search_table + suffix + "_staged_label")))
+            # The index builds from a refused commit were rolled back along
+            # with its transaction, so build them all here, as the commit
+            # itself would have
+            self.restore_indexes(suffix=suffix)
+            self._create_counts_indexes(suffix=suffix)
+            self._staged_swap_in(out_of_order=True)
+
+    def _staged_abort(self, logid):
+        """
+        Discard the staged copy; the exception half of ``staged``.
+        """
+        # A failed write can leave the connection in an aborted transaction;
+        # clear it so that the drops below can run
+        self.conn.rollback()
+        self.drop_tmp()
+        self._log_db_change("staged", logid=logid, aborted=True)
 
     def max_id(self, table=None):
         """
@@ -2554,3 +2973,27 @@ class PostgresTable(PostgresBase):
         """
         updater = SQL("UPDATE meta_tables SET important = %s WHERE name = %s")
         self._execute(updater, [importance, self.search_table])
+
+
+class StagedWriteContext():
+    """
+    Context manager for staging writes to a copy of a search table, swapping
+    the copy into place on a clean exit and dropping it on an exception.
+
+    Returned by the ``staged`` method on ``PostgresTable``; see its
+    documentation for details.
+    """
+
+    def __init__(self, table):
+        self.table = table
+
+    def __enter__(self):
+        self.staged, self.logid = self.table._staged_enter()
+        return self.staged
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.table._staged_commit(self.staged, self.logid)
+        else:
+            self.table._staged_abort(self.logid)
+        return False

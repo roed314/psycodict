@@ -1038,7 +1038,19 @@ class PostgresBase():
                 "Run db.%s.cleanup_from_reload() if you want to delete it and proceed."
                 % (tmp_table, table)
             )
-        creator = SQL("CREATE TABLE {0} (LIKE {1}){2}").format(Identifier(tmp_table), Identifier(table), self._tablespace_clause())
+        # A bare LIKE copies only the column names and types; carry over the
+        # per-column STORAGE settings (and COMPRESSION, once the server knows
+        # about it) so that clones -- and hence reload and staged, which swap
+        # a clone into place -- do not silently reset them to the defaults.
+        including = SQL(" INCLUDING STORAGE")
+        version = int(self._execute(
+            SQL("SELECT current_setting('server_version_num')"), silent=True
+        ).fetchone()[0])
+        if version >= 140000:
+            # INCLUDING COMPRESSION appeared in PostgreSQL 14 together with
+            # per-column compression itself
+            including += SQL(" INCLUDING COMPRESSION")
+        creator = SQL("CREATE TABLE {0} (LIKE {1}{2}){3}").format(Identifier(tmp_table), Identifier(table), including, self._tablespace_clause())
         self._execute(creator)
 
     def _check_col_datatype(self, typ):
