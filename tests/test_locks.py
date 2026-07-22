@@ -67,6 +67,29 @@ def test_show_queries_sees_other_sessions(db, capsys):
         conn.close()
 
 
+def test_show_queries_columns_line_up(db, capsys, monkeypatch):
+    # Fixed-width columns: given rows whose pid, duration and user differ in
+    # width, the user and query columns must still start at the same offset on
+    # every line (and each query's whitespace is collapsed).
+    rows = [
+        (7, "0:00:01", "alice", "SELECT 1"),
+        (1234567, "1 day, 2:03:04", "bob", "SELECT\n  2"),
+    ]
+    monkeypatch.setattr(db, "_get_queries", lambda: rows)
+    db.show_queries()
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    assert "SELECT 2" in lines[1]  # newline/indent collapsed to one space
+    assert lines[0].index("alice") == lines[1].index("bob")
+    assert lines[0].index("SELECT 1") == lines[1].index("SELECT 2")
+
+
+def test_show_queries_reports_when_idle(db, capsys, monkeypatch):
+    monkeypatch.setattr(db, "_get_queries", lambda: [])
+    db.show_queries()
+    assert "No queries currently running" in capsys.readouterr().out
+
+
 def test_show_blocked_pairs_waiter_with_holder(db, empty_table, capsys):
     name = empty_table.search_table
     holder = raw_connection()

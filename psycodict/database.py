@@ -1240,8 +1240,28 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         holding the locks shown by ``show_locks``; see ``show_blocked`` for
         statements that are stuck behind them).
         """
-        for pid, duration, user, query in self._get_queries():
-            print("pid %s  %s  %s  %s" % (pid, duration, user, " ".join(query.split())))
+        queries = self._get_queries()
+        if not queries:
+            print("No queries currently running")
+            return
+        # Collapse each query's whitespace once, up front, so the pid, duration
+        # and user columns are measured (and aligned) against what prints; the
+        # query itself is last, so it needs no padding.
+        rows = [("pid %s" % pid, str(duration), user, " ".join(query.split()))
+                for pid, duration, user, query in queries]
+        pidlen = max(len(pidstr) for pidstr, _, _, _ in rows) + 2
+        durlen = max(len(duration) for _, duration, _, _ in rows) + 2
+        userlen = max(len(user) for _, _, user, _ in rows) + 2
+        for pidstr, duration, user, query in rows:
+            print(
+                pidstr
+                + " " * (pidlen - len(pidstr))
+                + duration
+                + " " * (durlen - len(duration))
+                + user
+                + " " * (userlen - len(user))
+                + query
+            )
 
     def _get_blocked(self):
         """
