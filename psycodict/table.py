@@ -1162,7 +1162,7 @@ class PostgresTable(PostgresBase):
         - ``reindex`` -- only meaningful when ``inplace`` is set: whether to drop the indexes touching the updated columns before the update and recreate them afterward, which is faster when many rows change (by default this is done when more than 1000 rows are updated).  Without ``inplace``, all indexes are necessarily recreated on the replacement table, so ``reindex=True`` is redundant and ``reindex=False`` raises an error.
         - ``restat`` -- whether to recompute stats for the table
         - ``logging`` -- a dictionary of keyword arguments for _log_db_change
-        - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
+        - ``kwds`` -- passed on to the ``COPY`` command.  Cannot include "columns".
         """
         self._forbid_reindex_false(reindex, inplace)
         if not inplace:
@@ -1842,7 +1842,7 @@ class PostgresTable(PostgresBase):
         - ``adjust_schema`` -- If True, it will create the new tables using the
             header columns, otherwise expects the schema specified by the files
             to match the current one
-        - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
+        - ``kwds`` -- passed on to the ``COPY`` command.  Cannot include "columns".
 
         .. NOTE:
 
@@ -2170,7 +2170,7 @@ class PostgresTable(PostgresBase):
             If the number of rows is a substantial fraction of the size of the table, this will be faster.
             Defaults to true when the number of rows added is more than 1000
         - ``restat`` -- whether to recreate statistics after reloading.
-        - ``kwds`` -- passed on to psycopg2's ``copy_from``.  Cannot include "columns".
+        - ``kwds`` -- passed on to the ``COPY`` command.  Cannot include "columns".
 
         .. NOTE:
 

@@ -748,21 +748,21 @@ class PostgresBase():
             sage: db._column_types('non_existant')
             ([], {}, False)
             sage: db._column_types('test_table')
-            ([u'dim',
-              u'label',
-              u'discriminant',
-              u'bad_primes',
-              u'new_column1',
-              u'new_label',
-              u'bar'],
-             {u'bad_primes': 'jsonb',
-              u'bar': 'text',
-              u'dim': 'smallint',
-              u'discriminant': 'numeric',
-              u'id': 'bigint',
-              u'label': 'text',
-              u'new_column1': 'text',
-              u'new_label': 'text'},
+            (['dim',
+              'label',
+              'discriminant',
+              'bad_primes',
+              'new_column1',
+              'new_label',
+              'bar'],
+             {'bad_primes': 'jsonb',
+              'bar': 'text',
+              'dim': 'smallint',
+              'discriminant': 'numeric',
+              'id': 'bigint',
+              'label': 'text',
+              'new_column1': 'text',
+              'new_label': 'text'},
              True)
         """
         has_id = False
