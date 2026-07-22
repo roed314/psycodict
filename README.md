@@ -10,6 +10,7 @@ SELECT queries using a dictionary.  In addition, the package provides a number o
  * Statistics tables for storing statistics and counts (this is particularly useful in the LMFDB's context since the data changes rarely)
 
 The query language is specified in [QueryLanguage.md](QueryLanguage.md) and the read API (`search`, `lucky`, `count`, `random`, …) in [Searching.md](Searching.md).
+What the version number promises — the public API, database metadata compatibility, and the deprecation policy — is laid out in [Versioning.md](Versioning.md).
 
 # Install
 
