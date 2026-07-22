@@ -133,3 +133,9 @@ dmypy.json
 
 # Secrets file: should not be committed to repo!
 secrets.ini
+# Guides copied into docs/ at build time by docs/conf.py
+docs/README.md
+docs/QueryLanguage.md
+docs/Searching.md
+docs/DataManagement.md
+docs/MetadataFormats.md

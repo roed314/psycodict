@@ -1,11 +1,12 @@
 # Continuous integration for psycodict.
 #
-# Four jobs, cheapest first, so an obvious mistake fails in under a minute:
+# Five jobs, cheapest first, so an obvious mistake fails in under a minute:
 #
 #   lint      static checks, no interpreter matrix, no database
 #   unit      the database-free tests on every supported Python
 #   database  the full suite against real PostgreSQL service containers
 #   package   sdist/wheel build, twine metadata check, install smoke tests
+#   docs      the Sphinx build with warnings as errors, no database
 #
 # The downstream regression suites (LMFDB and seminars) live in a separate
 # workflow, downstream.yml, because they are an order of magnitude slower.
@@ -200,3 +201,26 @@ jobs:
         with:
           name: dist
           path: dist/
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # The package itself is installed so that autodoc can import it; no
+      # database is needed (importing psycodict does not connect).
+      - name: Install package and documentation dependencies
+        run: |
+          python -m pip install '.[pgbinary]' -r docs/requirements.txt
+
+      # -W turns warnings into errors: a broken cross-reference or a
+      # malformed docstring fails here rather than silently degrading the
+      # site.  Read the Docs builds with fail_on_warning to match.
+      - name: Build documentation
+        run: python -m sphinx -W --keep-going -b html docs docs/_build/html

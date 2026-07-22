@@ -1,0 +1,7 @@
+# Documentation build dependencies.  Used by the docs job in
+# .github/workflows/ci.yml and by Read the Docs (.readthedocs.yaml);
+# the package itself (with a psycopg extra) must also be installed so
+# that autodoc can import it.
+sphinx>=7
+myst-parser>=3
+furo>=2024.1.29
