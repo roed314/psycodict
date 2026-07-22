@@ -1,4 +1,17 @@
 # -*- coding: utf-8 -*-
+"""
+The connection object at the center of psycodict.
+
+:class:`PostgresDatabase` connects using a
+:class:`~psycodict.config.Configuration` and exposes each table in the
+database as an attribute (``db.nf_fields``), a
+:class:`~psycodict.searchtable.PostgresSearchTable`.  It also provides the
+database-wide operations: creating, dropping and renaming tables,
+reloading or cleaning up every table at once, schema-change notifications
+(:meth:`~PostgresDatabase.listener`), refreshing table metadata without a
+restart (:meth:`~PostgresDatabase.refresh_tables`), and the metadata
+format stamp and its migrations.
+"""
 import csv
 import logging
 from pathlib import Path
@@ -78,10 +91,20 @@ class NumericLoader(Loader):
     (Sage Integer/RealLiteral when Sage is available, int/float otherwise).
     """
     def load(self, data):
+        """
+        Convert the numeric's text representation to a Python/Sage number.
+        """
         return numeric_converter(bytes(data).decode())
 
 
 def setup_connection(conn):
+    """
+    Prepare a fresh psycopg connection for psycodict: set the client
+    encoding and register the loaders and dumpers that implement
+    psycodict's value conversion (numerics, json, arrays, and -- when Sage
+    is available -- Sage integers and reals).  Called for every connection
+    the database opens.
+    """
     # psycopg3 uses unicode (str) everywhere by default, so the psycopg2-era
     # UNICODE/UNICODEARRAY registrations are no longer needed.
     conn.execute("SET client_encoding TO 'UTF8'")
@@ -1053,7 +1076,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         include_nones=True,
     ):
         """
-        Add a new search table to the database.  See also `create_table_like`.
+        Add a new search table to the database.  See also :meth:`create_table_like`.
 
         INPUT:
 
@@ -1450,24 +1473,21 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
     ):
         """
         Reloads all tables from files in a given folder.  The filenames must match
-        the names of the tables, with `_counts` and `_stats` appended as appropriate.
+        the names of the tables, with ``_counts`` and ``_stats`` appended as appropriate.
 
         INPUT:
 
-            - ``data_folder`` -- the folder that contains files to be reloaded
-            - ``halt_on_errors`` -- whether to stop if a DatabaseError is
-                encountered while trying to reload one of the tables
-            - ``sequential_swap`` -- if True, then the whole transaction will not be wrapped in a DelayCommit, which can sometimes prevent deadlocks.
-
-        INPUTS passed to `reload` function in `PostgresTable`:
-
-                - ``resort``, ``restat``, ``adjust_schema``, and any extra keywords
-
-
+        - ``data_folder`` -- the folder that contains files to be reloaded
+        - ``halt_on_errors`` -- whether to stop if a DatabaseError is
+          encountered while trying to reload one of the tables
+        - ``sequential_swap`` -- if True, then the whole transaction will not
+          be wrapped in a DelayCommit, which can sometimes prevent deadlocks
+        - ``resort``, ``restat``, ``adjust_schema``, and any extra keywords
+          are passed on to the ``reload`` method of each
+          :class:`~psycodict.table.PostgresTable`
 
         Note that this function currently does not reload data that is not in a
         search table, such as knowls or user data.
-
         """
         data_folder = Path(data_folder)
 
@@ -1639,7 +1659,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
     def cleanup_all(self):
         """
-        Drops all `_tmp` and `_old` tables created by the reload() method.
+        Drops all ``_tmp`` and ``_old`` tables created by the reload() method.
         """
         with DelayCommit(self, silence=True):
             for tablename in self.tablenames:

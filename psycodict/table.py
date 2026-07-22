@@ -1,4 +1,16 @@
 # -*- coding: utf-8 -*-
+"""
+The write and schema half of a table.
+
+:class:`PostgresTable` manages a single search table: row-level writes
+(``insert_many``, ``update``, ``upsert``, ``delete``), the bulk file-based
+import and export that psycodict is built around (``copy_from``,
+``copy_to``, ``reload`` and its staged ``_tmp``-table machinery), and the
+table's schema -- columns, indexes, constraints and the corresponding
+``meta_*`` bookkeeping with its versioned history.  The read interface
+lives in the subclass :class:`~psycodict.searchtable.PostgresSearchTable`,
+which is what ``db.<tablename>`` actually returns.
+"""
 import csv
 import os
 import tempfile
@@ -303,10 +315,10 @@ class PostgresTable(PostgresBase):
 
         NOTE:
 
-         - not necessarily all built
-         - not necessarily a supset of all the built indexes.
+        - not necessarily all built
+        - not necessarily a superset of all the built indexes
 
-        For the current built indexes on the search table, see _list_built_indexes
+        For the current built indexes on the search table, see ``_list_built_indexes``
         """
         if self._db._meta_format >= 1:
             selecter = SQL("SELECT index_name, type, columns, modifiers, whereclause FROM meta_indexes WHERE table_name = %s")
@@ -755,10 +767,10 @@ class PostgresTable(PostgresBase):
 
         NOTE:
 
-         - not necessarily all built
-         - not necessarily a supset of all the built constraints.
+        - not necessarily all built
+        - not necessarily a superset of all the built constraints
 
-        For the current built constraints on the search table, see _list_built_constraints
+        For the current built constraints on the search table, see ``_list_built_constraints``
         """
         selecter = SQL("SELECT constraint_name, type, columns, check_func FROM meta_constraints WHERE table_name = %s")
         cur = self._execute(selecter, [self.search_table], silent=True)
@@ -946,12 +958,25 @@ class PostgresTable(PostgresBase):
     ##################################################################
 
     def copy_to_meta(self, filename, sep="|"):
+        """
+        Export this table's row of ``meta_tables`` to a file, in the format
+        accepted by :meth:`reload_meta`.
+        """
         self._copy_to_meta("meta_tables", filename, self.search_table, sep=sep)
 
     def copy_to_indexes(self, filename, sep="|"):
+        """
+        Export this table's index definitions (its rows of ``meta_indexes``)
+        to a file, in the format accepted by :meth:`reload_indexes`.
+        """
         self._copy_to_meta("meta_indexes", filename, self.search_table, sep=sep)
 
     def copy_to_constraints(self, filename, sep="|"):
+        """
+        Export this table's constraint definitions (its rows of
+        ``meta_constraints``) to a file, in the format accepted by
+        :meth:`reload_constraints`.
+        """
         self._copy_to_meta("meta_constraints", filename, self.search_table, sep=sep)
 
     def _get_current_index_version(self):
@@ -961,21 +986,67 @@ class PostgresTable(PostgresBase):
         return self._get_current_meta_version("meta_constraints", self.search_table)
 
     def reload_indexes(self, filename, sep="|"):
+        """
+        Replace this table's index definitions in ``meta_indexes`` with the
+        contents of the file (as written by :meth:`copy_to_indexes`).  The
+        definitions being replaced are archived in ``meta_indexes_hist``, so
+        :meth:`revert_indexes` can undo this.
+        """
         return self._reload_meta("meta_indexes", filename, self.search_table, sep=sep)
 
     def reload_meta(self, filename, sep="|"):
+        """
+        Replace this table's row of ``meta_tables`` with the contents of the
+        file (as written by :meth:`copy_to_meta`).  The row being replaced
+        is archived in ``meta_tables_hist``, so :meth:`revert_meta` can undo
+        this.
+        """
         return self._reload_meta("meta_tables", filename, self.search_table, sep=sep)
 
     def reload_constraints(self, filename, sep="|"):
+        """
+        Replace this table's constraint definitions in ``meta_constraints``
+        with the contents of the file (as written by
+        :meth:`copy_to_constraints`).  The definitions being replaced are
+        archived in ``meta_constraints_hist``, so :meth:`revert_constraints`
+        can undo this.
+        """
         return self._reload_meta("meta_constraints", filename, self.search_table, sep=sep)
 
     def revert_indexes(self, version=None):
+        """
+        Restore an earlier version of this table's index definitions from
+        ``meta_indexes_hist``.
+
+        INPUT:
+
+        - ``version`` -- the version to restore (default: the one before the
+          current version)
+        """
         return self._revert_meta("meta_indexes", self.search_table, version)
 
     def revert_constraints(self, version=None):
+        """
+        Restore an earlier version of this table's constraint definitions
+        from ``meta_constraints_hist``.
+
+        INPUT:
+
+        - ``version`` -- the version to restore (default: the one before the
+          current version)
+        """
         return self._revert_meta("meta_constraints", self.search_table, version)
 
     def revert_meta(self, version=None):
+        """
+        Restore an earlier version of this table's ``meta_tables`` row from
+        ``meta_tables_hist``.
+
+        INPUT:
+
+        - ``version`` -- the version to restore (default: the one before the
+          current version)
+        """
         return self._revert_meta("meta_tables", self.search_table, version)
 
     ##################################################################
@@ -1070,6 +1141,11 @@ class PostgresTable(PostgresBase):
             self._out_of_order = True
 
     def finalize_changes(self):
+        """
+        Intended to finish off a batch of data changes by updating the
+        cached total, refreshing statistics targets, and re-sorting by id.
+        Currently a placeholder that does nothing.
+        """
         # TODO
         # Update stats.total
         # Refresh stats targets
@@ -2097,12 +2173,12 @@ class PostgresTable(PostgresBase):
 
     def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|"):
         """
-        Renames the _tmp versions of `tables` to the live versions.
-        and updates the corresponding meta_tables row if `metafile` is provided
+        Renames the ``_tmp`` versions of ``tables`` to the live versions,
+        and updates the corresponding meta_tables row if ``metafile`` is provided.
 
         INPUT:
 
-        - ``tables`` -- list of strings (optional), of the tables to renamed. If None is provided, renames all the tables ending in `_tmp`
+        - ``tables`` -- list of strings (optional), of the tables to be renamed.  If None is provided, renames all the tables ending in ``_tmp``
         - ``metafile`` -- a string (optional), giving a file containing the meta information for the table.
         - ``sep`` -- a character (default ``|``) to separate columns
         """

@@ -1,4 +1,16 @@
 # -*- coding: utf-8 -*-
+"""
+The shared plumbing underneath every psycodict object.
+
+:class:`PostgresBase` is the common base of the database, table and
+statistics classes; it owns statement execution through ``_execute``
+(logging, slow-query warnings, commit/rollback bookkeeping and
+reconnection) together with helpers for inspecting tables, indexes and
+constraints.  The module also defines the layout of the ``meta_*`` tables --
+the column lists, types and creation statements shared by everything that
+reads or writes them -- and the metadata format version (``META_FORMAT``)
+stamped into ``meta_format``.
+"""
 import csv
 import logging
 import re
@@ -111,6 +123,16 @@ param_types_whitelist = {re.compile(s): cost for (s, cost) in param_types_whitel
 
 
 def jsonb_idx(cols, cols_type):
+    """
+    The positions in ``cols`` whose type is ``jsonb``, as a tuple of
+    indexes.  Used to decide which values need json decoding when reading
+    rows of the ``meta_*`` tables.
+
+    INPUT:
+
+    - ``cols`` -- a list of column names
+    - ``cols_type`` -- a dictionary mapping column names to their types
+    """
     return tuple(i for i, elt in enumerate(cols) if cols_type[elt] == "jsonb")
 
 
@@ -629,7 +651,7 @@ class PostgresBase():
 
     def _list_indexes(self, tablename):
         """
-        Lists built index names on the search table `tablename`
+        Lists built index names on the search table ``tablename``
         """
         cur = self._execute(
             SQL("SELECT indexname FROM pg_indexes WHERE tablename = %s"),
@@ -640,7 +662,7 @@ class PostgresBase():
 
     def _list_constraints(self, tablename):
         """
-        Lists constraint names on the search table `tablename`
+        Lists constraint names on the search table ``tablename``
         """
         # if we look into information_schema.table_constraints
         # we also get internal constraints, I'm not sure why

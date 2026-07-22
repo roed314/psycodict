@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-
+"""
+Helpers shared across psycodict: :class:`DelayCommit` for batching many
+writes into one transaction, the whitelist parser that admits limited raw
+arithmetic into queries (:func:`filter_sql_injection`), identifier wrapping
+with array slicers (:func:`IdentifierWrapper`), the exceptions raised during
+query parsing and locking, and small formatting utilities.
+"""
 import os.path
 import sys
 import re
@@ -39,14 +45,18 @@ postgres_infix_ops = {
 # This function is used to support the inclusion of limited raw postgres in queries
 def filter_sql_injection(clause, col, col_type, op, table, join_context=None):
     """
+    Build a comparison clause from an untrusted arithmetic expression,
+    admitting only whitelisted column names, numbers and the arithmetic
+    operators ``+-*/^()``.  Returns a pair of an SQL composable and the list
+    of values to substitute into it.
+
     INPUT:
 
     - ``clause`` -- a plain string, obtained from the website UI so NOT SAFE
     - ``col`` -- an SQL Identifier for a column in a table
     - ``col_type`` -- a string giving the type of the column
-    - ``valid_cols`` -- the column names for this table
     - ``op`` -- a string giving the operator to use
-      (`=` or one of the values in the ``postgres_infix_ops dictionary`` above)
+      (``=`` or one of the values in the ``postgres_infix_ops`` dictionary above)
     - ``table`` -- a PostgresTable object for determining which columns are valid
     - ``join_context`` -- when filtering an expression inside a joined query,
       a dictionary mapping joined table names to their table objects.  Names
@@ -186,6 +196,11 @@ def IdentifierWrapper(name, convert=True):
 
 
 class LockError(RuntimeError):
+    """
+    Raised when a data-changing operation cannot proceed because another
+    operation holds a conflicting lock on the table (for example, a reload
+    in progress, or a staged ``_tmp`` copy awaiting its swap).
+    """
     pass
 
 
@@ -195,6 +210,9 @@ class QueryLogFilter():
     """
 
     def filter(self, record):
+        """
+        Keep only records emitted from base.py (the query-execution path).
+        """
         if os.path.basename(record.pathname) == "base.py":
             return 1
         else:
@@ -205,7 +223,7 @@ class DelayCommit():
     """
     Used to set default behavior for whether to commit changes to the database connection.
 
-    Entering this context in a with statement will cause `_execute` calls to not commit by
+    Entering this context in a with statement will cause ``_execute`` calls to not commit by
     default.  When the final DelayCommit is exited, the connection will commit.
 
     Setting active=False disables the DelayCommit completely, which can be helpful since it's often used in a with context and conditionally entering that context is annoying to write with if statements.
@@ -253,6 +271,11 @@ else:
         raise exc_value
 
 def range_formatter(x):
+    """
+    Format a query-language range constraint for human display:
+    ``{"$gte": 2, "$lte": 7}`` becomes ``"2-7"``, one-sided constraints
+    become ``"2-"`` or ``"..7"``, and ``None`` becomes ``"Unknown"``.
+    """
     if x is None:
         return 'Unknown'
     elif isinstance(x, dict):
