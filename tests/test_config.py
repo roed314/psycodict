@@ -427,6 +427,76 @@ def test_a_supplied_parser_gets_no_log_redirect(isolated, paths):
     assert config.options["logging"]["slowlogfile"] == "slow_queries.log"
 
 
+needs_permissions = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permissions",
+)
+
+
+@pytest.fixture
+def read_only_config(isolated, tmp_path, monkeypatch):
+    """
+    A readable configuration file in a directory without write access, the
+    shape of a system-managed /etc/psycodict/config.ini.  Restores the
+    permissions afterward so tmp_path can be cleaned up.
+    """
+    confdir = tmp_path / "etc"
+    confdir.mkdir()
+    write_ini(str(confdir / "config.ini"), {"postgresql": {"host": "etchost"}})
+    confdir.chmod(0o555)
+    monkeypatch.setenv("PSYCODICT_CONFIG", str(confdir / "config.ini"))
+    yield confdir
+    confdir.chmod(0o755)
+
+
+@needs_permissions
+def test_a_config_in_a_read_only_directory_is_readable(isolated, read_only_config):
+    # Reading a configuration must not require write access beside it; the
+    # default slow log falls back to ~/.psycodict/logs.
+    config = Configuration(readargs=False)
+    assert config.options["postgresql"]["host"] == "etchost"
+    expected = os.path.join(str(isolated), ".psycodict", "logs", "slow_queries.log")
+    assert config.options["logging"]["slowlogfile"] == expected
+    assert os.path.isdir(os.path.dirname(expected))
+
+
+@needs_permissions
+def test_no_usable_log_directory_keeps_the_plain_name(isolated, read_only_config, monkeypatch):
+    # With the config directory read-only and no home either, the redirect
+    # gives up and the historical cwd-relative default survives.
+    monkeypatch.setattr(os.path, "expanduser", lambda path: path)
+    config = Configuration(readargs=False)
+    assert config.options["logging"]["slowlogfile"] == "slow_queries.log"
+
+
+# ---------------------------------------------------------------------------
+# missing home directory
+# ---------------------------------------------------------------------------
+
+
+def test_no_home_directory_is_a_clear_error_not_a_tilde_directory(isolated, monkeypatch):
+    # In a container with HOME unset and a uid without a passwd entry,
+    # expanduser returns the literal ~.  The home fallback must refuse
+    # loudly instead of creating ./~/.psycodict in the working directory.
+    monkeypatch.setattr(os.path, "expanduser", lambda path: path)
+    with pytest.raises(RuntimeError, match="PSYCODICT_CONFIG"):
+        Configuration(readargs=False)
+    assert not os.path.exists("~")
+
+
+def test_a_cwd_config_needs_no_home_directory(isolated, monkeypatch):
+    # The error is confined to the home fallback: with a discoverable
+    # configuration the homeless container works fine (and the log lands
+    # next to the config, not in a literal ~).
+    write_ini("config.ini", {"postgresql": {"host": "cwdhost"}})
+    monkeypatch.setattr(os.path, "expanduser", lambda path: path)
+    config = Configuration(readargs=False)
+    assert config.options["postgresql"]["host"] == "cwdhost"
+    expected = os.path.join(os.path.abspath("logs"), "slow_queries.log")
+    assert config.options["logging"]["slowlogfile"] == expected
+    assert not os.path.exists("~")
+
+
 # ---------------------------------------------------------------------------
 # postgresql_dbname
 # ---------------------------------------------------------------------------

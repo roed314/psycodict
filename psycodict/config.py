@@ -22,8 +22,21 @@ def psycodict_home():
     """
     The directory used for psycodict's own files (the configuration file and
     the slow-query log) when no explicit location is given: ``~/.psycodict``.
+
+    Raises ``RuntimeError`` when no home directory can be determined -- for
+    example a container running with ``HOME`` unset and a uid that has no
+    passwd entry, where ``expanduser`` returns the literal ``~``.  Refusing
+    loudly beats quietly creating a directory named ``~`` in the working
+    directory.
     """
-    return os.path.join(os.path.expanduser("~"), ".psycodict")
+    home = os.path.expanduser("~")
+    if not os.path.isabs(home):
+        raise RuntimeError(
+            "Cannot determine a home directory for psycodict's configuration; "
+            "set the PSYCODICT_CONFIG environment variable (or pass "
+            "config_file) to choose a location for the configuration file"
+        )
+    return os.path.join(home, ".psycodict")
 
 
 def find_config_file():
@@ -40,7 +53,8 @@ def find_config_file():
     current-directory candidate requires the file to already exist, so
     nothing is ever created in the working directory: a fresh setup gets its
     configuration under ``~/.psycodict`` (or wherever ``PSYCODICT_CONFIG``
-    points).
+    points).  When no home directory can be determined either, this raises
+    ``RuntimeError`` (see :func:`psycodict_home`).
     """
     path = os.environ.get("PSYCODICT_CONFIG")
     if path:
@@ -73,8 +87,9 @@ class Configuration():
       - ``logging_slowcutoff`` -- a float, giving the threshold above which a slow-query warning will be logged
       - ``logging_slowlogfile`` -- a filename where slow-query warnings are
         printed.  The default value ``slow_queries.log`` is placed in a
-        ``logs`` directory next to the configuration file; any other value
-        is used verbatim.
+        ``logs`` directory next to the configuration file, falling back to
+        ``~/.psycodict/logs`` when that location is not writable; any other
+        value is used verbatim.
       - ``postgresql_host`` -- the hostname for the database
       - ``postgresql_port`` -- an integer, the port to use when connecting to the database
       - ``postgresql_user`` -- the username when connecting to the database
@@ -303,17 +318,46 @@ class Configuration():
         if builtin_parser:
             # The default value of slowlogfile used to be created in the
             # working directory; place it in a logs directory next to the
-            # configuration file instead.  Any other value is used verbatim.
-            # The directory must exist before PostgresDatabase attaches its
-            # FileHandler, so it is created here.  (Callers supplying their
-            # own parser own their logging semantics; they are not touched.)
+            # configuration file instead, falling back to ~/.psycodict/logs
+            # when that location cannot be written (a system-managed
+            # configuration in a read-only directory, say -- reading a
+            # configuration must not require write access beside it).  Any
+            # other value is used verbatim.  (Callers supplying their own
+            # parser own their logging semantics; they are not touched.)
             logopts = self.options["logging"]
             if logopts.get("slowlogfile") == "slow_queries.log":
-                logdir = os.path.join(
-                    os.path.dirname(os.path.abspath(args.config_file)), "logs"
-                )
-                os.makedirs(logdir, exist_ok=True)
-                logopts["slowlogfile"] = os.path.join(logdir, "slow_queries.log")
+                logdir = self._default_log_dir(args.config_file)
+                if logdir is not None:
+                    logopts["slowlogfile"] = os.path.join(logdir, "slow_queries.log")
+
+    @staticmethod
+    def _default_log_dir(config_file):
+        """
+        The directory for the default slow-query log: the first of
+        ``<config dir>/logs`` and ``~/.psycodict/logs`` that exists or can be
+        created, and is writable.
+
+        The directory must exist and be writable before PostgresDatabase
+        attaches its FileHandler, so the candidates are probed by creating
+        them.  Returns None when neither candidate is usable (the plain
+        default name is then kept, preserving the historical behavior of
+        writing in the working directory).
+        """
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(config_file)), "logs")
+        ]
+        try:
+            candidates.append(os.path.join(psycodict_home(), "logs"))
+        except RuntimeError:
+            pass
+        for candidate in candidates:
+            try:
+                os.makedirs(candidate, exist_ok=True)
+            except OSError:
+                continue
+            if os.access(candidate, os.W_OK | os.X_OK):
+                return candidate
+        return None
 
     def get_postgresql_default(self):
         res = dict(self.default_args["postgresql"])
