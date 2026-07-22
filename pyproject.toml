@@ -25,12 +25,14 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 
 [project.urls]
 Homepage = "https://github.com/roed314/psycodict"
+Documentation = "https://psycodict.readthedocs.io/"
 Repository = "https://github.com/roed314/psycodict"
 Changelog = "https://github.com/roed314/psycodict/blob/main/CHANGELOG.md"
 

@@ -26,14 +26,15 @@ pip install "psycodict[pgsource]"    # pulls in psycopg; builds against your sys
 psycodict reads its connection settings from a `config.ini`: it uses
 `$PSYCODICT_CONFIG` if set, then `config.ini` in the working directory if one
 exists, and otherwise `~/.psycodict/config.ini` (created with default values
-on first run).  Point it at your server:
+on first run).  Point it at your server — here the user and database from
+[Setting up PostgreSQL](#setting-up-postgresql) below:
 
 ```ini
 [postgresql]
 host = localhost
 port = 5432
-user = postgres
-password =
+user = myuser
+password = a good password
 dbname = mydb
 ```
 
@@ -91,9 +92,9 @@ db.demo_primes.lucky({"n": 7}, projection="factors")   # {'7': 1}
   `"table.column"` qualification usable in queries, projections, sorts, `$col`
   and `$raw`.
 - **Bulk data management.** Load and dump whole tables to and from files
-  (`copy_from` / `copy_to`), reload a table from a file and `revert` to the
-  previous contents if something is wrong, and group writes into `staged()`
-  transactional uploads with write exclusion and drift detection.
+  (`copy_from` / `copy_to`), reload a table from a file and `reload_revert`
+  back to the previous contents if something is wrong, and group writes into
+  `staged()` transactional uploads with write exclusion and drift detection.
 - **Cached statistics and counts.** Counts and statistics tables let search
   pages report totals and distributions without re-scanning a dataset that
   rarely changes.
@@ -111,11 +112,15 @@ db.demo_primes.lucky({"n": 7}, projection="factors")   # {'7': 1}
 
 ## Documentation
 
-- [QueryLanguage.md](QueryLanguage.md) — how Python dictionaries become SQL `WHERE` clauses.
-- [Searching.md](Searching.md) — the read-side API: `search`, `lucky`, `lookup`, `count`, projections, sorts and joins.
-- [DataManagement.md](DataManagement.md) — the write side: creating tables, loading data, reloading and reverting, statistics.
-- [MetadataFormats.md](MetadataFormats.md) — how the layout of the meta tables is versioned, cross-format compatibility, and the checklist for changing it.
-- [Versioning.md](Versioning.md) — what the version number promises: the public API, metadata compatibility, and the deprecation policy.
+- [QueryLanguage](https://psycodict.readthedocs.io/en/latest/QueryLanguage.html) — how Python dictionaries become SQL `WHERE` clauses.
+- [Searching](https://psycodict.readthedocs.io/en/latest/Searching.html) — the read-side API: `search`, `lucky`, `lookup`, `count`, projections, sorts and joins.
+- [DataManagement](https://psycodict.readthedocs.io/en/latest/DataManagement.html) — the write side: creating tables, loading data, reloading and reverting, statistics.
+- [MetadataFormats](https://psycodict.readthedocs.io/en/latest/MetadataFormats.html) — how the layout of the meta tables is versioned, cross-format compatibility, and the checklist for changing it.
+- [Versioning](https://psycodict.readthedocs.io/en/latest/Versioning.html) — what the version number promises: the public API, metadata compatibility, and the deprecation policy.
+
+The same documents live at the repository root as Markdown, next to an
+[API reference](https://psycodict.readthedocs.io/en/latest/api/index.html)
+generated from the docstrings.
 
 See the [CHANGELOG](https://github.com/roed314/psycodict/blob/main/CHANGELOG.md) for the release history.
 
