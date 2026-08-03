@@ -35,6 +35,7 @@ from .validation import (
     MAX_IDENTIFIER_LENGTH,
     column_type_sql,
     derived_identifier,
+    identifier_bytes,
     index_modifier_sql,
     parse_check_function,
     physical_table_name,
@@ -1860,14 +1861,42 @@ class PostgresTable(PostgresBase):
         types = [self.col_type[col] for col in cols]
         F.write("%s\n%s\n\n" % (sep.join(cols), sep.join(types)))
 
+    def _staged_label_index_name(self, suffix="_tmp"):
+        """
+        The transient index a staged write builds on the staged copy's label
+        column.
+
+        One formula, called by the path that creates it and by both paths that
+        drop it, so that they cannot disagree -- which they would for a table
+        near the identifier limit, where the concatenation would have been left
+        to the server to truncate.
+        """
+        return derived_identifier(self.search_table + suffix, "_staged_label")
+
     def _next_backup_number(self):
         """
         Finds the next unused backup number, for use in reload.
+
+        The number is what makes a backup name longer than the table's own, and
+        a new table name reserves room for it (see
+        ``MAX_SEARCH_TABLE_NAME_LENGTH``).  A table old enough, or a legacy name
+        long enough, to run past that reservation is refused here rather than
+        left to PostgreSQL, which would truncate two backups into one relation.
         """
         backup_number = 1
         for ext in ["", "_counts", "_stats"]:
             while self._table_exists("{0}{1}_old{2}".format(self.search_table, ext, backup_number)):
                 backup_number += 1
+        for ext in ["", "_counts", "_stats"]:
+            backup = "{0}{1}_old{2}".format(self.search_table, ext, backup_number)
+            if identifier_bytes(backup) > MAX_IDENTIFIER_LENGTH:
+                raise ValueError(
+                    "The backup this reload would make, %s, is %s bytes, over "
+                    "PostgreSQL's %s byte limit: drop or rename some of %s's "
+                    "existing backups, or rename the table to something shorter"
+                    % (backup, identifier_bytes(backup), MAX_IDENTIFIER_LENGTH,
+                       self.search_table)
+                )
         return backup_number
 
     def _swap_in_tmp(self, tables):
@@ -2269,7 +2298,7 @@ class PostgresTable(PostgresBase):
             [self.search_table],
         ).fetchone()
         table = self._db._search_table_class_(self._db, *tabledata)
-        self._db.__dict__[self.search_table] = table
+        self._db.tables[self.search_table] = table
 
     def drop_tmp(self):
         """
@@ -2554,7 +2583,7 @@ class PostgresTable(PostgresBase):
                 # _staged_commit), so it never reaches the live table.
                 if self._label_col is not None and self._label_col != "id":
                     self._execute(SQL("CREATE INDEX {0} ON {1} ({2})").format(
-                        Identifier(self.search_table + suffix + "_staged_label"),
+                        Identifier(self._staged_label_index_name(suffix)),
                         Identifier(self.search_table + suffix),
                         Identifier(self._label_col),
                     ))
@@ -2643,7 +2672,7 @@ class PostgresTable(PostgresBase):
         if self._label_col is not None and self._label_col != "id":
             with DelayCommit(self, silence=True):
                 self._execute(SQL("DROP INDEX IF EXISTS {0}").format(
-                    Identifier(self.search_table + suffix + "_staged_label")))
+                    Identifier(self._staged_label_index_name(suffix))))
         aborted = True
         try:
             with DelayCommit(self, silence=True):
@@ -2751,7 +2780,7 @@ class PostgresTable(PostgresBase):
             # renames indexes rather than dropping them
             if self._label_col is not None and self._label_col != "id":
                 self._execute(SQL("DROP INDEX IF EXISTS {0}").format(
-                    Identifier(self.search_table + suffix + "_staged_label")))
+                    Identifier(self._staged_label_index_name(suffix))))
             # The index builds from a refused commit were rolled back along
             # with its transaction, so build them all here, as the commit
             # itself would have
