@@ -21,6 +21,7 @@ from psycopg import DatabaseError
 from psycopg.sql import SQL, Identifier, Literal
 
 from .base import PostgresBase
+from .validation import physical_table_name
 from .encoding import Json, numeric_converter
 from .utils import DelayCommit, KeyedDefaultDict, make_tuple
 
@@ -242,8 +243,11 @@ class PostgresStatsTable(PostgresBase):
         PostgresBase.__init__(self, table.search_table, table._db)
         self.table = table
         self.search_table = st = table.search_table
-        self.stats = st + "_stats"
-        self.counts = st + "_counts"
+        # One formula for these, shared with creation, reload and cleanup: see
+        # physical_table_name for why they are concatenated rather than
+        # shortened.
+        self.stats = physical_table_name(st, "stats")
+        self.counts = physical_table_name(st, "counts")
         self._init_total(total)
 
     def _init_total(self, total=None):

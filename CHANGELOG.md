@@ -190,6 +190,50 @@ hardening standalone use; the highlights:
   statement now lives in its own module, `psycodict.validation`; the names are
   re-exported from `psycodict.base`, where they used to be.
 
+- **Index and constraint definitions are validated when imported and again
+  when used.** `meta_indexes` and `meta_constraints` hold what an index or
+  constraint is rebuilt from, sometimes years and several psycodict versions
+  after it was created, and in between the rows can be edited with plain SQL,
+  exported to a file, carried to another database and imported, or restored
+  from history. `create_index` and `create_constraint` checked their arguments,
+  but nothing rechecked a row on the way back out, and the access method,
+  column modifiers, storage-parameter names, check function and partial-index
+  predicate were formatted into the statement as text. A poisoned
+  `meta_indexes` row could therefore run its own statements the next time the
+  index was restored. Definitions are now checked by
+  `validate_index_definition` / `validate_constraint_definition` at import
+  (`reload_indexes`, `reload_constraints`, the `revert_*` methods) and again
+  immediately before the DDL is built, and everything they are built from is
+  either a quoted identifier or fixed SQL selected by a validated key. An
+  invalid definition raises `InvalidDefinitionError` (a `ValueError`). Names
+  are held to what they must be rather than to a convention: every identifier
+  is quoted, so a name may contain punctuation, spaces or non-ASCII characters,
+  and what is refused is an empty name, a control character, or a name over
+  PostgreSQL's 63-*byte* limit that the server would truncate into something
+  the metadata does not name — refused wherever it arrives, including from a
+  reloaded file, a reverted history version or a row edited in place, and
+  refused rather than shortened, since a stored name is what the relation is
+  called. Names psycodict *derives* — `_tmp`, `_oldN`, `_depN`, `_pkey` — go
+  through one helper that keeps the suffix and shortens the base on a UTF-8
+  character boundary, so no path relies on server-side truncation and no two
+  paths can disagree about a derived name. A search table's own relations
+  (`_counts`, `_stats` and their `_tmp`/`_oldN` copies) are concatenated rather
+  than shortened, because PostgreSQL truncates consistently and an existing
+  database already has them under the truncated spelling; creating one under an
+  over-long name is refused instead. A
+  `CHECK` constraint's function may be schema-qualified and is emitted as
+  `"schema"."function"` rather than as one identifier. Boolean index storage
+  parameters accept PostgreSQL's spellings (`on`, `yes`, `t`, `1`) and are
+  stored normalized, floats are refused, and `gin_pending_list_limit` no longer
+  carries a client-side maximum, since its ceiling depends on the server's
+  architecture. Because
+  the import runs inside the reload transaction, the metadata that was there
+  before survives intact. A partial-index predicate remains raw administrative
+  SQL, but may no longer contain a semicolon, a comment, a dollar-quoted string
+  or control characters. The unused, unvalidated `_copy_from_meta` helper is
+  gone. These rules live in `psycodict.validation`, next to the column-type
+  grammar; `psycodict.base` no longer holds any of them.
+
 ### Infrastructure
 
 - A test suite of 500+ tests and a continuous-integration workflow covering the

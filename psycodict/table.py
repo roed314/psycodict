@@ -28,42 +28,27 @@ from .base import (
     _meta_cols_types_jsonb_idx,
     jsonb_idx,
 )
-from .validation import column_type_sql
+# The index vocabulary lives in validation.py, next to the validators that
+# check definitions against it; these names are re-exported for callers that
+# have always imported them from here.
+from .validation import (
+    MAX_IDENTIFIER_LENGTH,
+    column_type_sql,
+    derived_identifier,
+    index_modifier_sql,
+    parse_check_function,
+    physical_table_name,
+    validate_constraint_definition,
+    validate_index_definition,
+    validate_index_predicate,
+    validate_relation_name,
+    _operator_classes,
+    _valid_storage_params,
+    _valid_constraint_types,
+)
 from .statstable import PostgresStatsTable
 
-
-# the non-default operator classes, used in creating indexes
-_operator_classes = {
-    "brin": ["inet_minmax_ops"],
-    "btree": [
-        "bpchar_pattern_ops",
-        "cidr_ops",
-        "record_image_ops",
-        "text_pattern_ops",
-        "varchar_ops",
-        "varchar_pattern_ops",
-    ],
-    "gin": ["jsonb_path_ops", "array_ops"],
-    "gist": ["inet_ops"],
-    "hash": [
-        "bpchar_pattern_ops",
-        "cidr_ops",
-        "text_pattern_ops",
-        "varchar_ops",
-        "varchar_pattern_ops",
-    ],
-    "spgist": ["kd_point_ops"],
-}
-
-# Valid storage parameters by type, used in creating indexes
-_valid_storage_params = {
-    "brin": ["pages_per_range", "autosummarize"],
-    "btree": ["fillfactor"],
-    "gin": ["fastupdate", "gin_pending_list_limit"],
-    "gist": ["fillfactor", "buffering"],
-    "hash": ["fillfactor"],
-    "spgist": ["fillfactor"],
-}
+assert _operator_classes and _valid_storage_params
 
 
 ##################################################################
@@ -348,17 +333,26 @@ class PostgresTable(PostgresBase):
     def _create_index_statement(self, name, table, type, columns, modifiers, storage_params, whereclause=None):
         """
         Utility function for making the create index SQL statement.
+
+        The definition is validated here rather than only where it was created,
+        because it may have reached this point out of ``meta_indexes``, a
+        metadata file or the history table since then.  Everything the
+        statement is built from is either quoted as an identifier or an ``SQL``
+        constant selected by a validated key, so validation is not the only
+        thing standing between a metadata row and the statement.
         """
-        # We whitelisted the type, modifiers and storage parameters
-        # when creating the index so the following is safe from SQL injection
-        if storage_params:
-            # The keys of storage_params have been whitelisted; the values are
-            # inlined as literals because DDL statements cannot take bound
-            # parameters under psycopg3's server-side binding.
+        validate_relation_name(name, "Index")
+        definition = validate_index_definition(
+            name, table, type, columns, modifiers, storage_params, whereclause,
+            valid_columns=self._relation_columns(table),
+        )
+        if definition.storage_params:
+            # Values are inlined as literals because DDL statements cannot take
+            # bound parameters under psycopg3's server-side binding.
             storage_params = SQL(" WITH ({0})").format(
                 SQL(", ").join(
-                    SQL("{0} = {{0}}".format(param)).format(Literal(val))
-                    for param, val in storage_params.items()
+                    SQL("{0} = {1}").format(Identifier(param), Literal(val))
+                    for param, val in definition.storage_params.items()
                 )
             )
         else:
@@ -366,21 +360,26 @@ class PostgresTable(PostgresBase):
         tablespace = self._tablespace_clause()
         # A partial index restricts the rows it covers to those matching a
         # predicate.  The clause is raw SQL supplied by an administrator (see
-        # create_index), so it is inlined directly, like the whitelisted type
-        # and modifiers above; it must come last, after WITH and TABLESPACE.
-        if whereclause:
-            where = SQL(" WHERE " + whereclause)
+        # create_index); validate_index_predicate has checked that it cannot
+        # end the statement.  It must come last, after WITH and TABLESPACE.
+        if definition.whereclause:
+            where = SQL(" WHERE ") + SQL(definition.whereclause)
         else:
             where = SQL("")
-        modifiers = [" " + " ".join(mods) if mods else "" for mods in modifiers]
-        # The inner % operator is on strings prior to being wrapped by SQL: modifiers have been whitelisted.
         columns = SQL(", ").join(
-            SQL("{0}%s" % mods).format(Identifier(col))
-            for col, mods in zip(columns, modifiers)
+            SQL(" ").join([Identifier(col)] + [index_modifier_sql(mod, definition.access_method) for mod in mods])
+            for col, mods in zip(definition.columns, definition.modifiers)
         )
-        # The inner % operator is on strings prior to being wrapped by SQL: type has been whitelisted.
-        creator = SQL("CREATE INDEX {0} ON {1} USING %s ({2}){3}{4}{5}" % (type))
-        return creator.format(Identifier(name), Identifier(table), columns, storage_params, tablespace, where)
+        creator = SQL("CREATE INDEX {0} ON {1} USING {2} ({3}){4}{5}{6}")
+        return creator.format(
+            Identifier(definition.name),
+            Identifier(definition.table),
+            Identifier(definition.access_method),
+            columns,
+            storage_params,
+            tablespace,
+            where,
+        )
 
     def _create_counts_indexes(self, suffix="", warning_only=False):
         """
@@ -391,7 +390,7 @@ class PostgresTable(PostgresBase):
         with DelayCommit(self, silence=True):
             for index in _counts_indexes:
                 now = time.time()
-                name = index["name"].format(tablename) + suffix
+                name = derived_identifier(index["name"].format(tablename), suffix)
                 if self._relation_exists(name):
                     message = "Relation with name {} already exists".format(name)
                     if warning_only:
@@ -426,7 +425,14 @@ class PostgresTable(PostgresBase):
 
         - ``name`` -- string, the name of an index or constraint
         - ``kind`` -- either ``"Index"`` or ``"Constraint"``
+
+        The name is also held to the identifier limit here: it goes into
+        ``meta_indexes`` or ``meta_constraints`` as the name of the relation
+        PostgreSQL is about to create, and PostgreSQL truncates a name over the
+        limit, so a longer one would leave the metadata naming a relation the
+        catalog does not have.
         """
+        validate_relation_name(name, kind, max_length=MAX_IDENTIFIER_LENGTH)
         self._check_restricted_suffix(name, kind)
 
         if self._relation_exists(name):  # this also works for constraints
@@ -494,6 +500,10 @@ class PostgresTable(PostgresBase):
         now = time.time()
         if type not in _operator_classes:
             raise ValueError("Unrecognized index type")
+        if where is not None:
+            # Checked here as well as in _create_index_statement so that an
+            # unusable predicate is refused before a name is generated for it.
+            where = validate_index_predicate(where)
         if where is not None and self._db._meta_format < 1:
             raise ValueError(
                 "Partial indexes need metadata format 1, but this database "
@@ -514,45 +524,46 @@ class PostgresTable(PostgresBase):
                 modifiers = [mod(col) for col in columns]
             else:
                 modifiers = [[]] * len(columns)
-        else:
-            if len(modifiers) != len(columns):
-                raise ValueError("modifiers must have same length as columns")
-            for mods in modifiers:
-                for mod in mods:
-                    if (
-                        mod.lower()
-                        not in ["asc", "desc", "nulls first", "nulls last"]
-                        + _operator_classes[type]
-                    ):
-                        raise ValueError("Invalid modifier %s" % (mod,))
         if storage_params is None:
             if type in ["btree", "hash", "gist", "spgist"]:
                 storage_params = {"fillfactor": 100}
             else:
                 storage_params = {}
-        else:
-            for key in storage_params:
-                if key not in _valid_storage_params[type]:
-                    raise ValueError("Invalid storage parameter %s" % key)
-        for col in columns:
-            if col != "id" and col not in self.search_cols:
-                raise ValueError("%s not a column" % (col))
+        # The definition is checked in full here, before a name is generated
+        # and before anything is written to meta_indexes; _create_index_statement
+        # checks it again when it builds the DDL.
+        definition = validate_index_definition(
+            name, self.search_table, type, columns, modifiers, storage_params,
+            where, valid_columns=set(self.search_cols) | {"id"},
+        )
+        # meta_indexes keeps the modifiers as the caller spelled them; the
+        # canonical spellings the validator returns are what the DDL is built
+        # from, here and on every later restore.  Storage parameters are stored
+        # normalized, so that a boolean written as "on" reads back as the same
+        # value the DDL was built from.
+        columns = definition.columns
+        storage_params = definition.storage_params
         if name is None:
-            # Postgres has a maximum name length of 64 bytes
-            # It will truncate if longer, but that causes suffixes of _tmp to be indistinguishable.
+            # PostgreSQL's identifier limit is 63 bytes, and it truncates a
+            # longer name rather than refusing it -- which would leave
+            # meta_indexes naming a relation the catalog does not have.
             if len(columns) <= 2:
                 name = "_".join([self.search_table] + columns + ([] if type == "btree" else [type]))
             elif len(columns) <= 8:
                 name = "_".join([self.search_table] + [col[:2] for col in columns])
             else:
                 name = "_".join([self.search_table] + ["".join(col[0] for col in columns)])
-            if len(name) >= 64:
-                name = name[:63]
+            # PostgreSQL truncates a name over the limit, which would leave
+            # meta_indexes recording a name the catalog does not have, so the
+            # generated name is cut here -- by bytes, on a character boundary --
+            # and a disambiguator's bytes are reserved before the cut rather
+            # than appended to a name that is already full.
+            name = derived_identifier(name)
             if self._relation_exists(name):
                 disamb = 0
-                while self._relation_exists(name + str(disamb)):
+                while self._relation_exists(derived_identifier(name, str(disamb))):
                     disamb += 1
-                name += str(disamb)
+                name = derived_identifier(name, str(disamb))
 
         with DelayCommit(self, silence=True):
             self._check_index_name(name, "Index")
@@ -593,7 +604,9 @@ class PostgresTable(PostgresBase):
         if permanent:
             deleter = SQL("DELETE FROM meta_indexes WHERE table_name = %s AND index_name = %s")
             self._execute(deleter, [self.search_table, name])
-        dropper = SQL("DROP INDEX IF EXISTS {0}").format(Identifier(name + suffix))
+        dropper = SQL("DROP INDEX IF EXISTS {0}").format(
+            Identifier(derived_identifier(name, suffix))
+        )
         self._execute(dropper)
         print("Dropped index %s in %.3f secs" % (name, time.time() - now))
 
@@ -626,14 +639,22 @@ class PostgresTable(PostgresBase):
             elif cur.rowcount == 0:
                 raise ValueError("Index %s does not exist in meta_indexes" % (name,))
             type, columns, modifiers, storage_params, whereclause = cur.fetchone()
-            creator = self._create_index_statement(
-                name + suffix,
-                self.search_table + suffix,
-                type,
-                columns,
-                modifiers,
-                storage_params,
+            # The row is validated as it stands, before a physical name is
+            # derived from it: derived_identifier would turn an unusable
+            # metadata name into a usable physical one, which would build the
+            # index under a name the metadata does not have.
+            definition = validate_index_definition(
+                name, self.search_table, type, columns, modifiers, storage_params,
                 whereclause,
+            )
+            creator = self._create_index_statement(
+                derived_identifier(definition.name, suffix),
+                self.search_table + suffix,
+                definition.access_method,
+                definition.columns,
+                definition.modifiers,
+                definition.storage_params,
+                definition.whereclause,
             )
             # this avoids clashes with deprecated indexes/constraints
             self._rename_if_exists(name, suffix)
@@ -713,7 +734,7 @@ class PostgresTable(PostgresBase):
             # indexes, since they end in _pkey rather than the suffix.
             self._execute(command.format(
                 Identifier(self.search_table + suffix),
-                Identifier(self.search_table + suffix + "_pkey"),
+                Identifier(derived_identifier(self.search_table + suffix, "_pkey")),
             ))
         print("%s primary key on %s in %.3f secs" % (action, self.search_table, time.time() - now))
 
@@ -775,24 +796,42 @@ class PostgresTable(PostgresBase):
         if not verbose:
             return output
 
-    @staticmethod
-    def _create_constraint_statement(name, table, type, columns, check_func):
+    def _create_constraint_statement(self, name, table, type, columns, check_func):
         """
         Utility function for making the create constraint SQL statement.
+
+        Like ``_create_index_statement``, this validates the definition it is
+        given: a constraint is rebuilt from ``meta_constraints`` long after
+        ``create_constraint`` checked it, and the row may have been imported or
+        edited in between.  The check function is quoted as an identifier
+        rather than formatted into the statement.
         """
-        # We whitelisted the type and check function so the following is safe
-        cols = SQL(", ").join(Identifier(col) for col in columns)
-        # from SQL injection
-        if type == "NOT NULL":
-            return SQL("ALTER TABLE {0} ALTER COLUMN {1} SET NOT NULL").format(Identifier(table), cols)
-        elif type == "UNIQUE":
+        definition = validate_constraint_definition(
+            name, table, type, columns, check_func,
+            valid_columns=self._relation_columns(table),
+            valid_check_functions=self._valid_check_functions,
+        )
+        cols = SQL(", ").join(Identifier(col) for col in definition.columns)
+        if definition.constraint_type == "NOT NULL":
+            return SQL("ALTER TABLE {0} ALTER COLUMN {1} SET NOT NULL").format(
+                Identifier(definition.table), cols
+            )
+        elif definition.constraint_type == "UNIQUE":
             return SQL(
                 "ALTER TABLE {0} ADD CONSTRAINT {1} UNIQUE ({2}) WITH (fillfactor=100)"
-            ).format(Identifier(table), Identifier(name), cols)
-        elif type == "CHECK":
-            return SQL(
-                "ALTER TABLE {0} ADD CONSTRAINT {1} CHECK (%s({2}))" % check_func
-            ).format(Identifier(table), Identifier(name), cols)
+            ).format(Identifier(definition.table), Identifier(definition.name), cols)
+        else:
+            # A qualified function is two identifiers: quoting "schema.function"
+            # as one would name a function whose own name contains a dot.
+            components = parse_check_function(
+                definition.check_func, self._valid_check_functions
+            )
+            return SQL("ALTER TABLE {0} ADD CONSTRAINT {1} CHECK ({2}({3}))").format(
+                Identifier(definition.table),
+                Identifier(definition.name),
+                Identifier(*components),
+                cols,
+            )
 
     @staticmethod
     def _drop_constraint_statement(name, table, type, columns):
@@ -808,8 +847,13 @@ class PostgresTable(PostgresBase):
                 Identifier(table), Identifier(name)
             )
 
-    _valid_constraint_types = ["UNIQUE", "CHECK", "NOT NULL"]
-    _valid_check_functions = []  # defined in utils.psql
+    # The constraint types psycodict creates, and the functions a CHECK
+    # constraint may call.  A check function is emitted as a quoted identifier,
+    # but it also has to be one an administrator has approved here: it is a
+    # call psycodict makes on the table's behalf, not something a metadata row
+    # gets to choose.
+    _valid_constraint_types = list(_valid_constraint_types)
+    _valid_check_functions = []  # e.g. those defined in LMFDB's utils.psql
 
     def create_constraint(self, columns, type, name=None, check_func=None):
         """
@@ -829,37 +873,38 @@ class PostgresTable(PostgresBase):
             to prevent SQL injection attacks
         """
         now = time.time()
+        if not isinstance(type, str):
+            raise ValueError("Unrecognized constraint type")
         type = type.upper()
         if isinstance(columns, str):
             columns = [columns]
-        if type not in self._valid_constraint_types:
-            raise ValueError("Unrecognized constraint type")
-        if check_func is not None and check_func not in self._valid_check_functions:
-            # If the following line fails, add the desired function to the list defined above
-            raise ValueError("%s not in list of approved check functions (edit db_backend to add)")
-        if (check_func is None) == (type == "CHECK"):
-            raise ValueError("check_func should specified just for CHECK constraints")
-        if type == "NOT NULL" and len(columns) != 1:
-            raise ValueError("NOT NULL only supports one column")
-        if all(col == "id" for col in columns):
+        if not isinstance(columns, (list, tuple)) or all(col == "id" for col in columns):
             raise ValueError("Must specify non-id columns")
-        for col in columns:
-            if col != "id" and col not in self.search_cols:
-                raise ValueError("%s not a column" % (col))
+        # Checked in full here, before anything is written to meta_constraints,
+        # and again in _create_constraint_statement when the definition becomes
+        # DDL.  The name is checked there: it may still be generated below.
+        validate_constraint_definition(
+            None, self.search_table, type, columns, check_func,
+            valid_columns=set(self.search_cols) | {"id"},
+            valid_check_functions=self._valid_check_functions,
+        )
         if name is None:
-            # Postgres has a maximum name length of 64 bytes
-            # It will truncate if longer, but that causes suffixes of _tmp to be indistinguishable.
             if len(columns) <= 2:
                 name = "_".join([self.search_table] + ["c"] + columns)
             elif len(columns) <= 8:
                 name = "_".join([self.search_table] + ["c"] + [col[:2] for col in columns])
             else:
                 name = "_".join([self.search_table] + ["c"] + ["".join(col[0] for col in columns)])
+            # A generated name is fitted to the identifier limit; a name the
+            # caller chose is refused if it does not fit (below), since
+            # silently creating a constraint under a different name is worse
+            # than saying so.
+            name = derived_identifier(name)
 
         with DelayCommit(self, silence=True):
             self._check_index_name(name, "Constraint")  # also works for constraints
             table = self.search_table
-            creator = self._create_constraint_statement(name, table, type, columns, check_func)
+            creator = self._create_constraint_statement(name, table, type, list(columns), check_func)
             self._execute(creator)
             inserter = SQL(
                 "INSERT INTO meta_constraints "
@@ -908,7 +953,9 @@ class PostgresTable(PostgresBase):
         now = time.time()
         with DelayCommit(self, silence=True):
             type, columns, _, table = self._get_constraint_data(name, suffix)
-            dropper = self._drop_constraint_statement(name + suffix, table, type, columns)
+            dropper = self._drop_constraint_statement(
+                derived_identifier(name, suffix), table, type, columns
+            )
             if permanent:
                 deleter = SQL("DELETE FROM meta_constraints WHERE table_name = %s AND constraint_name = %s")
                 self._execute(deleter, [self.search_table, name])
@@ -927,9 +974,21 @@ class PostgresTable(PostgresBase):
         now = time.time()
         with DelayCommit(self, silence=True):
             type, columns, check_func, table = self._get_constraint_data(name, suffix)
+            # As in restore_index: the stored row is checked before a physical
+            # name is derived from it.
+            definition = validate_constraint_definition(
+                name, self.search_table, type, columns, check_func,
+                valid_check_functions=self._valid_check_functions,
+            )
             # this avoids clashes with deprecated indexes/constraints
             self._rename_if_exists(name, suffix)
-            creator = self._create_constraint_statement(name + suffix, table, type, columns, check_func)
+            creator = self._create_constraint_statement(
+                derived_identifier(definition.name, suffix),
+                table,
+                definition.constraint_type,
+                definition.columns,
+                definition.check_func,
+            )
             self._execute(creator)
         print("Created constraint %s in %.3f secs" % (name, time.time() - now))
 
@@ -1419,8 +1478,8 @@ class PostgresTable(PostgresBase):
                 if restat and self.stats.saving:
                     if not inplace:
                         for table in [self.stats.counts, self.stats.stats]:
-                            if not self._table_exists(table + "_tmp"):
-                                self._clone(table, table + "_tmp")
+                            if not self._table_exists(physical_table_name(table, lifecycle="_tmp")):
+                                self._clone(table, physical_table_name(table, lifecycle="_tmp"))
                     self.stats.refresh_stats(suffix=suffix)
                 if not inplace:
                     # Swap in the refreshed counts/stats alongside the search
@@ -1723,8 +1782,12 @@ class PostgresTable(PostgresBase):
         # Given that our tables are readonly, we should just dump sorted and reload
         return None
         search_table = Identifier(self.search_table + suffix)
-        tmp_table = Identifier(self.search_table + suffix + "_sorter")
-        tmp_seq = Identifier(self.search_table + suffix + "_sorter" + '_newid_seq')
+        # Transient: created and dropped inside this transaction, and named
+        # nowhere else, so these are shortened rather than left to the server.
+        tmp_table = Identifier(derived_identifier(self.search_table + suffix, "_sorter"))
+        tmp_seq = Identifier(
+            derived_identifier(self.search_table + suffix, "_sorter_newid_seq")
+        )
         sort_order = self._sort if sort is None else self._sort_str(sort)
         if sort_order is None:
             print("resort failed, no sort order given")
@@ -2132,8 +2195,8 @@ class PostgresTable(PostgresBase):
                     for table in [self.stats.counts, self.stats.stats]:
                         if table not in tables:
                             # Create _tmp version if it doesn't exist
-                            if not self._table_exists(table + suffix):
-                                self._clone(table, table + suffix)
+                            if not self._table_exists(physical_table_name(table, lifecycle=suffix)):
+                                self._clone(table, physical_table_name(table, lifecycle=suffix))
                             # Add to tables list so it gets backed up in the swap
                             tables.append(table)
 

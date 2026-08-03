@@ -45,6 +45,16 @@ with untrusted input. Injection caused solely by deliberately passing untrusted
 input through `$raw` is not considered a psycodict vulnerability. A way to
 inject SQL through an interface that is intended to be safe is in scope.
 
+The `where=` predicate of a partial index (`create_index`) is likewise an
+administrative SQL expression: psycodict does not parse it, and it must not be
+built from untrusted input. It is validated to the extent that it must remain a
+predicate — it may not contain a statement terminator, a comment or a
+dollar-quoted string — so that a predicate stored in `meta_indexes` cannot turn
+a later `CREATE INDEX` into two statements. Index and constraint definitions
+read back out of the `meta_*` tables, out of an exported metadata file or out
+of the history tables are validated before they are turned into DDL, so a
+poisoned metadata row is in scope.
+
 Problems in PostgreSQL, psycopg, or another dependency should normally be
 reported to that project unless psycodict uses the dependency unsafely.
 Ordinary bugs without a security impact may be reported through the public
