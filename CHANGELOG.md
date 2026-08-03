@@ -161,6 +161,32 @@ hardening standalone use; the highlights:
 - `postgresql_dbname` was the one option whose default ignored the `defaults`
   dictionary passed to `Configuration`. (#119)
 
+### Security
+
+- **Column types are validated against the whole string, not a prefix.** The
+  type of a column has to be interpolated into `CREATE TABLE` and `ALTER TABLE`
+  as SQL text, since PostgreSQL has no placeholder for a type. The check that
+  guarded that interpolation matched a prefix, so a type beginning with a valid
+  type — `text; ...`, `varchar(16); ...` — was accepted with the rest attached
+  and executed. `create_table`, `create_table_like`, `add_column` and the
+  column types read from the header of a reloaded data file
+  (`reload(adjust_schema=True)`, `reload_all(adjust_schema=True)`) were all
+  affected. Types are now validated by `psycodict.base.validate_column_type`,
+  which matches the complete string and returns the spelling that callers must
+  emit; the character-type grammar it replaces was also malformed, so
+  `varchar(N)`, `char(N)` and `character varying(N)` are now described
+  deliberately rather than accepted as prefixes of `varchar`. A declaration is
+  read in the order PostgreSQL writes it — a scalar type, then any array
+  brackets, then a collation — so arrays of parameterized types and
+  multidimensional arrays (`varchar(16)[]`, `numeric(10, 2)[][]`,
+  `varchar(16)[] COLLATE "C"`) compose without a pattern for every combination,
+  and a `COLLATE` clause is accepted only on a collatable type. An interval
+  precision is a fractional-seconds precision, so it is now accepted only
+  without a field restriction or with one that reaches `SECOND`
+  (`interval day to second(6)`, not `interval day(3)`). An invalid type raises
+  `InvalidColumnTypeError`, a subclass of both `ValueError` and the
+  `RuntimeError` raised before.
+
 ### Infrastructure
 
 - A test suite of 500+ tests and a continuous-integration workflow covering the

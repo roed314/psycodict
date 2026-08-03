@@ -26,6 +26,7 @@ from .base import PostgresBase, _meta_table_name
 from .utils import DelayCommit, IdentifierWrapper, LockError
 from .base import (
     _meta_cols_types_jsonb_idx,
+    column_type_sql,
     jsonb_idx,
 )
 from .statstable import PostgresStatsTable
@@ -1739,10 +1740,10 @@ class PostgresTable(PostgresBase):
                         "CREATE TEMP SEQUENCE {0} MINVALUE 0 START 0 CACHE 10000"
                     ).format(tmp_seq))
 
-                    id_type = self.col_type["id"]
+                    id_type = column_type_sql(self.col_type["id"])
                     self._execute(SQL(
-                        "CREATE TEMP TABLE {0} (oldid %s, newid %s NOT NULL DEFAULT nextval('{1}')) ON COMMIT DROP" % (id_type, id_type)
-                    ).format(tmp_table, tmp_seq))
+                        "CREATE TEMP TABLE {0} (oldid {2}, newid {3} NOT NULL DEFAULT nextval('{1}')) ON COMMIT DROP"
+                    ).format(tmp_table, tmp_seq, id_type, id_type))
 
                     self._execute(SQL(
                         "ALTER SEQUENCE {0} OWNED BY {1}.newid"
@@ -3025,16 +3026,17 @@ class PostgresTable(PostgresBase):
         logid = self._check_locks("add_column")
         aborted = True
         try:
-            self._check_col_datatype(datatype)
-            self.col_type[name] = datatype
+            # Validate before touching the in-memory schema, and emit the
+            # spelling the validator returns rather than the argument: an
+            # invalid type must leave both the table and this object alone.
+            datatype = self._check_col_datatype(datatype)
             table = self.search_table
             with DelayCommit(self, silence=True):
-                # Since we have run the datatype through the whitelist,
-                # the following string substitution is safe
-                modifier = SQL("ALTER TABLE {0} ADD COLUMN {1} %s" % datatype).format(
-                    Identifier(table), Identifier(name)
+                modifier = SQL("ALTER TABLE {0} ADD COLUMN {1} {2}").format(
+                    Identifier(table), Identifier(name), column_type_sql(datatype)
                 )
                 self._execute(modifier)
+                self.col_type[name] = datatype
                 if name != "id":
                     self.search_cols.insert(bisect(self.search_cols, name), name)
                 if label:
