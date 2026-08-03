@@ -18,6 +18,8 @@ Generated from the docstrings.  The map of the library:
   PostgreSQL, including the file formats used by the bulk operations.
 - {mod}`psycodict.config` — configuration discovery and parsing
   (`config.ini`, command-line arguments, `$PSYCODICT_CONFIG`).
+- {mod}`psycodict.grants` — {class}`~psycodict.grants.GrantPolicy`, the
+  privileges the relations psycodict creates come into existence with.
 - {mod}`psycodict.utils` — {class}`~psycodict.utils.DelayCommit` and other
   helpers shared across the library.
 - {mod}`psycodict.notifications` — LISTEN/NOTIFY support: schema-change
@@ -40,6 +42,7 @@ table
 statstable
 encoding
 config
+grants
 utils
 notifications
 dbdiff

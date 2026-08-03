@@ -43,6 +43,7 @@ from psycodict.validation import (
 )
 from psycodict.encoding import Json
 from psycodict.table import PostgresTable
+from psycodict.grants import GrantPolicy, LMFDBGrantPolicy
 from psycodict.utils import safe_child_path
 
 import conftest
@@ -2560,3 +2561,296 @@ def test_two_keepers_of_different_kinds_may_share_a_name(db, table_factory, chec
             SQL("DELETE FROM meta_constraints WHERE constraint_name = %s"), [shared]
         )
         db.drop_table(new, force=True)
+##################################################################
+# what a new relation is readable by                             #
+##################################################################
+
+
+def role_grants(db, table):
+    """
+    The (grantee, privilege) pairs on a table, excluding the owner's own.
+    """
+    cur = db._execute(
+        SQL(
+            "SELECT grantee, privilege_type FROM information_schema.role_table_grants "
+            "WHERE table_name = %s AND grantee <> grantor"
+        ),
+        [table],
+    )
+    return sorted((grantee, privilege) for grantee, privilege in cur)
+
+
+@pytest.fixture
+def roles(db):
+    """
+    Two disposable roles, or a skip where the test user may not make them.
+    """
+    names = ["psycodict_test_reader", "psycodict_test_writer"]
+    try:
+        for name in names:
+            db._execute(SQL("CREATE ROLE {0}").format(Identifier(name)))
+        db.conn.commit()
+    except Exception:
+        db.conn.rollback()
+        pytest.skip("this test user may not create roles")
+    yield names
+    for name in names:
+        db._execute(SQL("DROP OWNED BY {0}").format(Identifier(name)))
+        db._execute(SQL("DROP ROLE {0}").format(Identifier(name)))
+    db.conn.commit()
+
+
+def test_the_default_policy_grants_nothing(db, table_factory):
+    """
+    A new table is not readable by anyone merely because a role exists.
+    """
+    table = table_factory()
+    name = table.search_table
+    for relation in [name, name + "_counts", name + "_stats"]:
+        assert role_grants(db, relation) == []
+    for relation in ["meta_tables", "meta_indexes", "meta_constraints", "meta_format"]:
+        assert role_grants(db, relation) == []
+
+
+def test_an_explicit_policy_grants_exactly_what_it_says(db, table_factory, roles, monkeypatch):
+    reader, writer = roles
+    monkeypatch.setattr(
+        db,
+        "grant_policy",
+        GrantPolicy({
+            "search": {"SELECT": (reader,)},
+            "counts": {"SELECT": (reader,), "INSERT": (writer,)},
+        }),
+    )
+    table = table_factory()
+    name = table.search_table
+    assert role_grants(db, name) == [(reader, "SELECT")]
+    assert role_grants(db, name + "_counts") == [(reader, "SELECT"), (writer, "INSERT")]
+    # a kind the policy says nothing about gets nothing
+    assert role_grants(db, name + "_stats") == []
+
+
+def test_the_lmfdb_policy_reproduces_the_old_behavior(db, roles, monkeypatch):
+    policy = LMFDBGrantPolicy()
+    assert policy.for_kind("search") == {"SELECT": ("lmfdb", "webserver")}
+    assert policy.for_kind("counts") == {
+        "SELECT": ("lmfdb", "webserver"),
+        "INSERT": ("webserver",),
+    }
+    # and nothing for the tables a reload leaves behind
+    assert policy.for_kind("backup") == {}
+    # the legacy statistics import was only ever readable
+    assert policy.for_kind("oldstats") == {"SELECT": ("lmfdb", "webserver")}
+
+
+def test_a_missing_role_is_refused_and_nothing_is_created(db, monkeypatch):
+    name = "test_%s" % uuid.uuid4().hex[:12]
+    monkeypatch.setattr(
+        db,
+        "grant_policy",
+        GrantPolicy({"search": {"SELECT": ("no_such_role",)}}, missing_role="error"),
+    )
+    with pytest.raises(ValueError, match="do not exist"):
+        db.create_table(name, [("n", "integer")], "n")
+    # the whole creation rolled back
+    assert not table_exists(db, name)
+    assert name not in db.tablenames
+    assert not db._execute(
+        SQL("SELECT 1 FROM meta_tables WHERE name = %s"), [name]
+    ).fetchone()
+
+
+def test_a_missing_role_can_be_skipped_instead(db, table_factory, monkeypatch):
+    monkeypatch.setattr(
+        db,
+        "grant_policy",
+        GrantPolicy({"search": {"SELECT": ("no_such_role",)}}, missing_role="skip"),
+    )
+    table = table_factory()
+    assert table.search_table in db.tablenames
+    assert role_grants(db, table.search_table) == []
+
+
+def test_a_reload_leaves_the_live_table_with_the_policy_and_the_backup_without(
+    db, filled_table, roles, monkeypatch, tmp_path
+):
+    """
+    A rename carries privileges with it, so the table a reload pushes aside
+    would keep the live table's readers unless the policy is applied to it too.
+    """
+    reader, _ = roles
+    monkeypatch.setattr(
+        db,
+        "grant_policy",
+        GrantPolicy({"search": {"SELECT": (reader,)}}),
+    )
+    name = filled_table.search_table
+    db._apply_grant_policy(name, "search")
+    assert role_grants(db, name) == [(reader, "SELECT")]
+
+    searchfile = str(tmp_path / "search.txt")
+    filled_table.copy_to(searchfile)
+    filled_table.reload(searchfile)
+
+    table = db[name]
+    assert table.count() == 200
+    # the replacement is readable by exactly what the policy says
+    assert role_grants(db, name) == [(reader, "SELECT")]
+    # and the backup, which holds what was live a moment ago, is not
+    assert table._table_exists(name + "_old1")
+    assert role_grants(db, name + "_old1") == []
+    for relation in [name + "_old1", name + "_counts_old1", name + "_stats_old1"]:
+        if table._table_exists(relation):
+            db._execute(SQL("DROP TABLE {0}").format(Identifier(relation)))
+
+
+def test_a_policy_rejects_what_it_cannot_apply():
+    with pytest.raises(ValueError, match="relation kind"):
+        GrantPolicy({"nosuchkind": {"SELECT": ("r",)}})
+    with pytest.raises(ValueError, match="action"):
+        GrantPolicy({"search": {"TRUNCATE": ("r",)}})
+    with pytest.raises(ValueError, match="missing_role"):
+        GrantPolicy({}, missing_role="ignore")
+    with pytest.raises(ValueError, match="sequence of role names"):
+        GrantPolicy({"search": {"SELECT": "lmfdb"}})
+    with pytest.raises(ValueError, match="iterable of role names"):
+        GrantPolicy({"search": {"SELECT": 17}})
+    with pytest.raises(ValueError, match="role name"):
+        GrantPolicy({"search": {"SELECT": ("",)}})
+    with pytest.raises(ValueError, match="control character"):
+        GrantPolicy({"search": {"SELECT": ("role\x00",)}})
+
+
+def test_a_role_name_carrying_sql_cannot_build_a_statement(db, monkeypatch):
+    """
+    Role names are quoted, and which role names are legal is PostgreSQL's
+    business, so a name carrying SQL is not refused for its shape -- it is
+    refused because no role is called that.
+    """
+    marker = marker_name()
+    role = 'r"; CREATE TABLE %s (x integer); --' % marker
+    monkeypatch.setattr(
+        db, "grant_policy", GrantPolicy({"search": {"SELECT": (role,)}})
+    )
+    name = "test_%s" % uuid.uuid4().hex[:12]
+    with pytest.raises(ValueError, match="do not exist"):
+        db.create_table(name, [("n", "integer")], "n")
+    assert not table_exists(db, marker)
+    assert not table_exists(db, name)
+
+
+def test_the_manual_grant_methods_need_explicit_roles(db, empty_table):
+    with pytest.raises(TypeError):
+        db.grant_select(empty_table.search_table)
+    with pytest.raises(TypeError):
+        db.grant_insert(empty_table.search_table)
+
+
+def test_a_reload_that_takes_access_away_says_so(db, filled_table, roles, caplog, tmp_path):
+    """
+    A reload swaps in a clone, which PostgreSQL creates with no privileges, so
+    a policy that grants nothing silently takes away what the live table had.
+    It should not be discovered by a website going dark.
+    """
+    reader, _ = roles
+    name = filled_table.search_table
+    db.grant_select(name, [reader])
+    assert role_grants(db, name) == [(reader, "SELECT")]
+
+    searchfile = str(tmp_path / "search.txt")
+    filled_table.copy_to(searchfile)
+    with caplog.at_level("WARNING"):
+        filled_table.reload(searchfile)
+    assert reader in caplog.text
+    assert "grant_policy" in caplog.text
+    for relation in [name + "_old1", name + "_counts_old1", name + "_stats_old1"]:
+        if db._table_exists(relation):
+            db._execute(SQL("DROP TABLE {0}").format(Identifier(relation)))
+
+
+def test_a_policy_materializes_one_shot_role_iterables():
+    """
+    Validating a generator would consume it, and the policy would then name
+    nobody -- failing closed, but silently and against what it was given.
+    """
+    roles = (role for role in ["reader", "writer"])
+    policy = GrantPolicy({"search": {"SELECT": roles}})
+    assert policy.for_kind("search")["SELECT"] == ("reader", "writer")
+    assert policy.roles == ["reader", "writer"]
+
+
+def test_the_relation_kind_comes_from_identity_not_the_name(db, table_factory):
+    """
+    A search table may be called something ending in _stats, so the kind has to
+    be looked up rather than read off the name.
+    """
+    table = table_factory()
+    assert table._grant_kind_for_relation(table.search_table) == "search"
+    assert table._grant_kind_for_relation(table.stats.counts) == "counts"
+    assert table._grant_kind_for_relation(table.stats.stats) == "stats"
+
+
+def test_a_revert_gives_each_relation_back_its_own_privileges(
+    db, filled_table, roles, monkeypatch, tmp_path
+):
+    """
+    PostgreSQL privileges follow a relation through a rename, so a revert
+    exchanges the live table's ACL with its backup's just as a reload does.
+    Both directions have to say again what each relation is.
+    """
+    reader, _ = roles
+    monkeypatch.setattr(
+        db, "grant_policy", GrantPolicy({"search": {"SELECT": (reader,)}})
+    )
+    name = filled_table.search_table
+    db._apply_grant_policy(name, "search")
+    assert role_grants(db, name) == [(reader, "SELECT")]
+
+    searchfile = str(tmp_path / "search.txt")
+    filled_table.copy_to(searchfile)
+    filled_table.reload(searchfile)
+    table = db[name]
+    assert role_grants(db, name) == [(reader, "SELECT")]
+    assert role_grants(db, name + "_old1") == []
+
+    try:
+        # revert: the backup goes live and the live table becomes the backup
+        table.reload_revert(1)
+        assert role_grants(db, name) == [(reader, "SELECT")]
+        assert role_grants(db, name + "_old1") == []
+
+        # and back again -- reload_revert toggles
+        db[name].reload_revert(1)
+        assert role_grants(db, name) == [(reader, "SELECT")]
+        assert role_grants(db, name + "_old1") == []
+    finally:
+        for relation in [name + "_old1", name + "_counts_old1", name + "_stats_old1"]:
+            if db._table_exists(relation):
+                db._execute(SQL("DROP TABLE {0}").format(Identifier(relation)))
+
+
+def test_the_legacy_statistics_import_is_not_an_ordinary_stats_table(
+    db, empty_table, roles, monkeypatch, tmp_path
+):
+    """
+    create_oldstats granted SELECT and nothing else; classifying its relation
+    as a stats table would hand the website INSERT on it under the LMFDB
+    policy.
+    """
+    reader, writer = roles
+    monkeypatch.setattr(
+        db,
+        "grant_policy",
+        GrantPolicy({
+            "stats": {"SELECT": (reader,), "INSERT": (writer,)},
+            "oldstats": {"SELECT": (reader,)},
+        }),
+    )
+    empty = tmp_path / "oldstats.txt"
+    empty.write_text("")
+    name = empty_table.search_table + "_oldstats"
+    empty_table.stats.create_oldstats(str(empty))
+    try:
+        assert role_grants(db, name) == [(reader, "SELECT")]
+    finally:
+        db._execute(SQL("DROP TABLE IF EXISTS {0}").format(Identifier(name)))

@@ -2155,7 +2155,7 @@ ORDER BY v.ord LIMIT %s"""
         with DelayCommit(self, silence=True):
             creator = SQL('CREATE TABLE {0} (_id text COLLATE "C", data jsonb)').format(Identifier(name))
             self._execute(creator)
-            self._db.grant_select(name)
+            self._db._apply_grant_policy(name, "oldstats")
             with open(filename) as F:
                 try:
                     self._copy_from_stdin(F, self.search_table + "_oldstats")

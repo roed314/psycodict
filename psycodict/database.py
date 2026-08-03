@@ -50,6 +50,7 @@ from .validation import (
     validate_search_table_name,
     validate_search_table_registry,
 )
+from .grants import GRANT_ACTIONS, GrantPolicy
 from .searchtable import PostgresSearchTable
 from .utils import DelayCommit, safe_child_path
 
@@ -521,7 +522,7 @@ class PostgresDatabase(PostgresBase):
         self._objects.append(obj)
 
     def __init__(self, config=None, secretsfile=None, create=False, upgrade=False,
-                 session_settings=None, **kwargs):
+                 session_settings=None, grant_policy=None, **kwargs):
         if config is None:
             from .config import Configuration
             config = Configuration()
@@ -536,11 +537,24 @@ class PostgresDatabase(PostgresBase):
         # or database than the sender writes to).
         self._connect_kwargs = dict(kwargs)
         self._session_settings = self._resolve_session_settings(session_settings)
+        # What the relations psycodict creates are readable and writable by.
+        # The default grants nothing: a deployment that wants the LMFDB's roles
+        # asks for them (see psycodict.grants).
+        self.grant_policy = GrantPolicy() if grant_policy is None else grant_policy
         self.conn = self._new_connection()
         self._user = self.conn.info.user
         # What a replacement connection has to reach to be adopted.
         self._identity = (self.conn.info.dbname, self.conn.info.user)
         PostgresBase.__init__(self, "db_all", self)
+
+        # Check the policy's roles here, rather than when the first relation is
+        # created: a policy naming a role this cluster does not have is a
+        # mistake worth hearing about before it interrupts a bootstrap or a
+        # reload halfway through.
+        if self.grant_policy.roles:
+            self._existing_roles(
+                self.grant_policy.roles, missing=self.grant_policy.missing_role
+            )
 
         if create:
             # Create any missing metadata tables before the read-only detection
@@ -694,34 +708,122 @@ class PostgresDatabase(PostgresBase):
         """
         pass
 
-    def _existing_roles(self, users):
+    def _existing_roles(self, users, missing="error"):
         """
-        Filters a list of role names down to those that exist in the cluster.
+        The roles among ``users`` that the cluster actually has.
 
-        Missing roles produce a warning rather than an error, so that table
-        creation works on clusters without the LMFDB roles (lmfdb, webserver).
+        INPUT:
+
+        - ``users`` -- role names
+        - ``missing`` -- ``"error"`` to refuse when one of them does not exist,
+          ``"skip"`` to warn and leave it out
+
+        A policy that names a role the cluster does not have has not been
+        applied, whatever it says; the default is to say so rather than to
+        leave the caller believing otherwise.
         """
         existing = {rec[0] for rec in self._execute(SQL("SELECT rolname FROM pg_roles"))}
-        missing = [user for user in users if user not in existing]
-        if missing:
+        absent = [user for user in users if user not in existing]
+        if absent:
+            if missing == "error":
+                raise ValueError(
+                    "Postgres role(s) %s do not exist, so the grant policy "
+                    "cannot be applied; create them, correct the policy, or "
+                    "use a policy with missing_role='skip'"
+                    % (", ".join(absent),)
+                )
             logging.warning(
                 "Postgres role(s) %s do not exist; skipping grants",
-                ", ".join(missing),
+                ", ".join(absent),
             )
         return [user for user in users if user in existing]
 
-    def _grant(self, action, table_name, users):
+    def _grant(self, action, table_name, users, missing="error"):
         """
         Utility function for granting permissions on tables.
         """
         action = action.upper()
-        if action not in ["SELECT", "INSERT", "UPDATE", "DELETE"]:
+        if action not in GRANT_ACTIONS:
             raise ValueError("%s is not a valid action" % action)
-        grantor = SQL("GRANT %s ON TABLE {0} TO {1}" % action)
-        for user in self._existing_roles(users):
+        grantor = SQL("GRANT " + action + " ON TABLE {0} TO {1}")
+        for user in self._existing_roles(users, missing=missing):
             self._execute(grantor.format(Identifier(table_name), Identifier(user)), silent=True)
 
-    def grant_select(self, table_name, users=["lmfdb", "webserver"]):
+    def _apply_grant_policy(self, table_name, kind):
+        """
+        Give a relation psycodict has just created the privileges the policy
+        says a relation of its kind has.
+
+        INPUT:
+
+        - ``table_name`` -- the relation
+        - ``kind`` -- one of ``psycodict.grants.RELATION_KINDS``
+
+        The policy is authoritative for the roles it names: the actions it
+        manages are revoked from all of them first, so a relation ends up with
+        what the policy says rather than with that plus whatever it inherited.
+        A rename carries privileges with it, which is how a backup table would
+        otherwise keep the live table's, so this matters most there.  Roles the
+        policy does not name are not touched at all.
+        """
+        policy = self.grant_policy
+        if not policy.roles:
+            # the default policy: nothing to grant, and nothing to look up
+            return
+        roles = self._existing_roles(policy.roles, missing=policy.missing_role)
+        if not roles:
+            return
+        self._execute(
+            SQL("REVOKE {0} ON TABLE {1} FROM {2}").format(
+                SQL(", ").join(SQL(action) for action in GRANT_ACTIONS),
+                Identifier(table_name),
+                SQL(", ").join(Identifier(role) for role in roles),
+            ),
+            silent=True,
+        )
+        for action, granted in policy.for_kind(kind).items():
+            wanted = [role for role in granted if role in roles]
+            if wanted:
+                self._grant(action, table_name, wanted, missing=policy.missing_role)
+
+    def _grantees(self, table_name):
+        """
+        The roles that have been granted something on a relation, other than
+        the grantor's own privileges on it.
+        """
+        cur = self._execute(
+            SQL(
+                "SELECT DISTINCT grantee FROM information_schema.role_table_grants "
+                "WHERE table_name = %s AND grantee <> grantor"
+            ),
+            [table_name],
+            silent=True,
+        )
+        return {rec[0] for rec in cur}
+
+    def _warn_if_access_was_lost(self, table_name, previous_name):
+        """
+        Say so when a swap has replaced a relation others could read with one
+        they cannot.
+
+        A reload swaps in a clone, which PostgreSQL creates with no privileges
+        of its own, so under a policy that says nothing about the relation the
+        replacement is reachable only by its owner -- an application role that
+        could read the table a moment ago now cannot.  That is what the policy
+        asks for, but it should not be discovered by a website going dark.
+        """
+        lost = self._grantees(previous_name) - self._grantees(table_name)
+        if lost:
+            logging.warning(
+                "%s was replaced by a copy that %s cannot access; the grant "
+                "policy in force grants them nothing on it. Pass a grant_policy "
+                "to PostgresDatabase (LMFDBGrantPolicy() reproduces psycodict's "
+                "pre-1.0 grants) if they should keep it.",
+                table_name,
+                ", ".join(sorted(lost)),
+            )
+
+    def grant_select(self, table_name, users):
         """
         Grant users the ability to run SELECT statements on a given table
 
@@ -729,10 +831,14 @@ class PostgresDatabase(PostgresBase):
 
         - ``table_name`` -- a string, the name of the table
         - ``users`` -- a list of users to grant this permission
+
+        Note that this grants exactly what it is asked to, to exactly the roles
+        it is given: what a relation psycodict creates starts out with is the
+        grant policy's business (see :class:`psycodict.grants.GrantPolicy`).
         """
         self._grant("SELECT", table_name, users)
 
-    def grant_insert(self, table_name, users=["webserver"]):
+    def grant_insert(self, table_name, users):
         """
         Grant users the ability to run INSERT statements on a given table
 
@@ -743,7 +849,7 @@ class PostgresDatabase(PostgresBase):
         """
         self._grant("INSERT", table_name, users)
 
-    def grant_update(self, table_name, users=["webserver"]):
+    def grant_update(self, table_name, users):
         """
         Grant users the ability to run UPDATE statements on a given table
 
@@ -754,7 +860,7 @@ class PostgresDatabase(PostgresBase):
         """
         self._grant("UPDATE", table_name, users)
 
-    def grant_delete(self, table_name, users=["webserver"]):
+    def grant_delete(self, table_name, users):
         """
         Grant users the ability to run DELETE statements on a given table
 
@@ -986,7 +1092,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             parts.append(part)
         tbl = meta_name + ("_hist" if hist else "")
         self._execute(SQL("CREATE TABLE {0} ({1})").format(Identifier(tbl), SQL(", ").join(parts)))
-        self.grant_select(tbl)
+        self._apply_grant_policy(tbl, "meta_hist" if hist else "meta")
 
     @property
     def meta_format(self):
@@ -1172,7 +1278,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 ))
                 self._execute(SQL("INSERT INTO meta_format (version, min_compat) VALUES (%s, %s)"),
                               [version, min_compat])
-                self.grant_select("meta_format")
+                self._apply_grant_policy("meta_format", "meta_format")
             self._execute(SQL("DROP TABLE IF EXISTS meta_version"))
         print("Stamped metadata format %s (min_compat %s)" % (version, min_compat))
 
@@ -1526,7 +1632,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         with DelayCommit(self, silence=True):
             self._create_table(name, search_columns, addid=id_type, tablespace=tablespace)
-            self.grant_select(name)
+            self._apply_grant_policy(name, "search")
             tablespace = self._tablespace_clause(tablespace)
             creator = SQL(
                 "CREATE TABLE {0} "
@@ -1537,8 +1643,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 Identifier(physical_table_name(name, "counts")), tablespace
             )
             self._execute(creator)
-            self.grant_select(name + "_counts")
-            self.grant_insert(name + "_counts")
+            self._apply_grant_policy(name + "_counts", "counts")
             creator = SQL(
                 "CREATE TABLE {0} "
                 '(cols jsonb, stat text COLLATE "C", value numeric, '
@@ -1548,8 +1653,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 Identifier(physical_table_name(name, "stats")), tablespace
             )
             self._execute(creator)
-            self.grant_select(name + "_stats")
-            self.grant_insert(name + "_stats")
+            self._apply_grant_policy(name + "_stats", "stats")
             # FIXME use global constants ?
             # include_nones is written explicitly rather than left to the
             # column default: existing databases keep the DDL default their
