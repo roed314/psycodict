@@ -21,7 +21,7 @@ from psycopg import DatabaseError
 from psycopg.sql import SQL, Identifier, Literal
 
 from .base import PostgresBase
-from .validation import physical_table_name
+from .validation import column_type_sql, physical_table_name
 from .encoding import Json, numeric_converter
 from .utils import DelayCommit, KeyedDefaultDict, make_tuple
 
@@ -1651,21 +1651,24 @@ class PostgresStatsTable(PostgresBase):
         """
         if col not in self.table.search_cols:
             raise ValueError("Column %s not a search column for %s" % (col, self.search_table))
+        # reltuples has to come from the table these frequencies are about.  It
+        # used to be read from a hard-coded public.nf_fields, so on any other
+        # table the estimate was that table's frequencies scaled by an
+        # unrelated row count.
         selecter = SQL(
             """SELECT v.{0}, (c.reltuples * freq)::int as estimate_ct
 FROM pg_stats s
 CROSS JOIN LATERAL
-   unnest(s.most_common_vals::text::"""
-            + self.table.col_type[col]
-            + """[]
+   unnest(s.most_common_vals::text::{1}[]
         , s.most_common_freqs) WITH ORDINALITY v ({0}, freq, ord)
 CROSS  JOIN (
-   SELECT reltuples FROM pg_class
-   WHERE oid = regclass 'public.nf_fields') c
-WHERE schemaname = 'public' AND tablename = %s AND attname = %s
+   SELECT c.reltuples FROM pg_class c
+   JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = current_schema() AND c.relname = %s) c
+WHERE schemaname = current_schema() AND tablename = %s AND attname = %s
 ORDER BY v.ord LIMIT %s"""
-        ).format(Identifier(col))
-        cur = self._execute(selecter, [self.search_table, col, n])
+        ).format(Identifier(col), column_type_sql(self.table.col_type[col]))
+        cur = self._execute(selecter, [self.search_table, self.search_table, col, n])
         return [tuple(x) for x in cur]
 
     def _common_cols(self, threshold=700):
