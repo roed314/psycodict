@@ -339,6 +339,28 @@ hardening standalone use; the highlights:
   Connect — no long-lived token is stored anywhere. (#113)
 - `CITATION.cff`, so GitHub renders a citation for the package. (#124)
 
+### Release candidates
+
+1.0.0 is published as a sequence of release candidates first. `pip` ignores
+them unless asked (`pip install --pre psycodict`), so a deployment can run
+against the real artifact before the version everybody gets by default exists.
+Each candidate is the whole of 1.0.0 as it stood when it was built; this list
+records only what changed between them.
+
+- **1.0.0rc2** — adds everything under **Security** above: the five findings of
+  the August 2026 audit, two of which were confirmed exploitable end to end
+  (a column type carrying its own statements into DDL, and a poisoned
+  `meta_indexes` row executing on `restore_index`). Also `psycodict.validation`,
+  the module those checks now live in. **rc1 has none of this; upgrade rather
+  than pin to it.** One of the five changes a default a deployment may be
+  relying on: the default grant policy grants nothing, so a deployment that
+  wants the privileges psycodict used to hand out has to say so with
+  `grant_policy=`. Read the *Migration* note on that entry before upgrading
+  anything that creates or reloads tables. (#133–#137)
+- **1.0.0rc1** — the first candidate, and the rehearsal of the trusted-publishing
+  path: it created the project on PyPI without touching the version `pip`
+  installs by default.
+
 ## 0.1.x and earlier
 
 Pre-1.0 releases did not keep a changelog.
