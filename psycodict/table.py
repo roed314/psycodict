@@ -328,7 +328,10 @@ class PostgresTable(PostgresBase):
         """
         Determine the tablespace hosting this table (which is then used for indexes and constraints)
         """
-        cur = self._execute(SQL("SELECT tablespace FROM pg_tables WHERE tablename=%s"), [self.search_table])
+        cur = self._execute(
+            SQL("SELECT tablespace FROM pg_tables WHERE schemaname = %s AND tablename = %s"),
+            [self._db.schema, self.search_table],
+        )
         return cur.fetchone()[0]
 
     def _create_index_statement(self, name, table, type, columns, modifiers, storage_params, whereclause=None):
@@ -2063,9 +2066,11 @@ class PostgresTable(PostgresBase):
                 SQL(
                     "SELECT rel.relname, con.conname FROM pg_constraint con "
                     "JOIN pg_class rel ON rel.oid = con.conrelid "
-                    "WHERE rel.relname = ANY(%s) AND con.conname ~ %s"
+                    "JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace "
+                    "WHERE nsp.nspname = %s AND rel.relname = ANY(%s) "
+                    "AND con.conname ~ %s"
                 ),
-                [tables, pattern],
+                [self._db.schema, tables, pattern],
                 silent=True,
             )
         ]
@@ -2078,9 +2083,9 @@ class PostgresTable(PostgresBase):
             for tbl, name in self._execute(
                 SQL(
                     "SELECT tablename, indexname FROM pg_indexes "
-                    "WHERE tablename = ANY(%s) AND indexname ~ %s"
+                    "WHERE schemaname = %s AND tablename = ANY(%s) AND indexname ~ %s"
                 ),
-                [tables, pattern],
+                [self._db.schema, tables, pattern],
                 silent=True,
             )
             if (tbl, name) not in found

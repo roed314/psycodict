@@ -1733,11 +1733,14 @@ CROSS JOIN LATERAL
 CROSS  JOIN (
    SELECT c.reltuples FROM pg_class c
    JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = current_schema() AND c.relname = %s) c
-WHERE schemaname = current_schema() AND tablename = %s AND attname = %s
+   WHERE n.nspname = %s AND c.relname = %s) c
+WHERE schemaname = %s AND tablename = %s AND attname = %s
 ORDER BY v.ord LIMIT %s"""
         ).format(Identifier(col), column_type_sql(self.table.col_type[col]))
-        cur = self._execute(selecter, [self.search_table, self.search_table, col, n])
+        schema = self._db.schema
+        cur = self._execute(
+            selecter, [schema, self.search_table, schema, self.search_table, col, n]
+        )
         return [tuple(x) for x in cur]
 
     def _common_cols(self, threshold=700):

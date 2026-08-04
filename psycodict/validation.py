@@ -574,6 +574,19 @@ def utf8_prefix(name, max_bytes):
     return encoded[:max_bytes].decode("utf-8", "ignore")
 
 
+def validate_schema_name(name):
+    """
+    Check a PostgreSQL schema name psycodict will operate in.
+
+    A schema name is an identifier like any other, and it is quoted wherever
+    psycodict emits it, so the rules are the identifier rules: not empty, no
+    control characters, and short enough that the server will not truncate it
+    into a different schema.  It is checked once, in the constructor, rather
+    than at each use.
+    """
+    return validate_relation_name(name, kind="Schema", max_length=MAX_IDENTIFIER_LENGTH)
+
+
 def catalog_identifier(name):
     """
     The spelling the catalog holds ``name`` under.

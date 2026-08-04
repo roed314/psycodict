@@ -64,6 +64,14 @@ Copies the column layout, `label_col`, `sort`, `id_ordered`, `id` type and descr
 
 psycodict keeps its own bookkeeping in a handful of tables that live alongside your search tables:
 
+psycodict operates in one PostgreSQL schema, `public` unless the constructor is
+given another (`PostgresDatabase(schema="myschema")`).  Every relation it
+creates goes there, every relation it looks for is looked for there, and every
+catalog query is filtered to it, so a relation of the same name in another
+schema is neither mistaken for one of these nor merged with it.  The schema is
+pinned in each connection's `search_path`, including replacement connections
+after a reconnect.
+
  * **`meta_tables`** — one row per search table, holding `name`, `sort`, `count_cutoff`, `id_ordered`, `out_of_order`, `stats_valid`, `label_col`, `total`, `important` and `include_nones`.  This is the source of truth psycodict reads on connection to reconstruct each table object.
  * **`meta_indexes`** and **`meta_constraints`** — one row per index / constraint, recording how to rebuild it.  `reload` and `restore_indexes` rebuild from these rows, **not** from whatever is physically on the table (see [reload](#reload)).
  * **`meta_tables_hist`**, **`meta_indexes_hist`**, **`meta_constraints_hist`** — versioned history of the three tables above, so that `reload_meta`/`revert_meta` can roll a table's metadata forward and back.

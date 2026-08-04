@@ -423,14 +423,25 @@ class PostgresBase():
 
         - ``tablename`` -- a string, the name of the table
         """
-        cur = self._execute(SQL("SELECT 1 FROM pg_tables where tablename=%s"), [tablename], silent=True)
+        cur = self._execute(
+            SQL("SELECT 1 FROM pg_tables WHERE schemaname = %s AND tablename = %s"),
+            [self._db.schema, tablename],
+            silent=True,
+        )
         return cur.fetchone() is not None
 
     def _all_tablenames(self):
         """
         Return all (postgres) table names in the database
         """
-        return [rec[0] for rec in self._execute(SQL("SELECT tablename FROM pg_tables ORDER BY tablename"), silent=True)]
+        return [
+            rec[0]
+            for rec in self._execute(
+                SQL("SELECT tablename FROM pg_tables WHERE schemaname = %s ORDER BY tablename"),
+                [self._db.schema],
+                silent=True,
+            )
+        ]
 
     def _get_locks(self):
         return self._execute(SQL(
@@ -535,15 +546,18 @@ class PostgresBase():
         """
         if tablename:
             cur = self._execute(
-                SQL("SELECT 1 FROM pg_indexes WHERE indexname = %s AND tablename = %s"),
-                [indexname, tablename],
+                SQL(
+                    "SELECT 1 FROM pg_indexes "
+                    "WHERE schemaname = %s AND indexname = %s AND tablename = %s"
+                ),
+                [self._db.schema, indexname, tablename],
                 silent=True,
             )
             return cur.fetchone() is not None
         else:
             cur = self._execute(
-                SQL("SELECT tablename FROM pg_indexes WHERE indexname=%s"),
-                [indexname],
+                SQL("SELECT tablename FROM pg_indexes WHERE schemaname = %s AND indexname = %s"),
+                [self._db.schema, indexname],
                 silent=True,
             )
             table = cur.fetchone()
@@ -560,7 +574,13 @@ class PostgresBase():
 
         - ``name`` -- a string, the name of the relation
         """
-        cur = self._execute(SQL("SELECT 1 FROM pg_class where relname = %s"), [name])
+        cur = self._execute(
+            SQL(
+                "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND c.relname = %s"
+            ),
+            [self._db.schema, name],
+        )
         return cur.fetchone() is not None
 
     def _constraint_exists(self, constraintname, tablename=None):
@@ -582,9 +602,9 @@ class PostgresBase():
             cur = self._execute(
                 SQL(
                     "SELECT 1 from information_schema.table_constraints "
-                    "WHERE table_name=%s and constraint_name=%s"
+                    "WHERE table_schema = %s AND table_name = %s AND constraint_name = %s"
                 ),
-                [tablename, constraintname],
+                [self._db.schema, tablename, constraintname],
                 silent=True,
             )
             return cur.fetchone() is not None
@@ -592,9 +612,9 @@ class PostgresBase():
             cur = self._execute(
                 SQL(
                     "SELECT table_name from information_schema.table_constraints "
-                    "WHERE constraint_name=%s"
+                    "WHERE table_schema = %s AND constraint_name = %s"
                 ),
-                [constraintname],
+                [self._db.schema, constraintname],
                 silent=True,
             )
             table = cur.fetchone()
@@ -608,8 +628,8 @@ class PostgresBase():
         Lists built index names on the search table ``tablename``
         """
         cur = self._execute(
-            SQL("SELECT indexname FROM pg_indexes WHERE tablename = %s"),
-            [tablename],
+            SQL("SELECT indexname FROM pg_indexes WHERE schemaname = %s AND tablename = %s"),
+            [self._db.schema, tablename],
             silent=True,
         )
         return [elt[0] for elt in cur]
@@ -629,9 +649,9 @@ class PostgresBase():
                 "           ON rel.oid = con.conrelid "
                 "INNER JOIN pg_catalog.pg_namespace nsp "
                 "           ON nsp.oid = connamespace "
-                "WHERE rel.relname = %s"
+                "WHERE nsp.nspname = %s AND rel.relname = %s"
             ),
-            [tablename],
+            [self._db.schema, tablename],
             silent=True,
         )
         return [elt[0] for elt in cur]
@@ -809,9 +829,9 @@ class PostgresBase():
                 cur = self._execute(
                     SQL(
                         "SELECT column_name, udt_name::regtype FROM information_schema.columns "
-                        "WHERE table_name = %s ORDER BY ordinal_position"
+                        "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
                     ),
-                    [tname],
+                    [self._db.schema, tname],
                 )
             else:
                 cur = data_types[tname]
@@ -838,8 +858,11 @@ class PostgresBase():
         one about columns.
         """
         cur = self._execute(
-            SQL("SELECT column_name FROM information_schema.columns WHERE table_name = %s"),
-            [table],
+            SQL(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s"
+            ),
+            [self._db.schema, table],
             silent=True,
             commit=False,
         )

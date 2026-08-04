@@ -402,6 +402,19 @@ hardening standalone use; the highlights:
   through the one helper they share; `copy_from` analyzes the live table it
   loaded into.
 
+- **A database operates in exactly one schema.** `PostgresDatabase` takes a
+  `schema=` argument (default `"public"`, so nothing changes for existing
+  deployments), validates it as an identifier, and pins `search_path` to it on
+  the first connection and on every replacement. Catalog inspection was
+  previously a mixture of hard-coded `'public'` and no filter at all -- 30-odd
+  queries across `pg_tables`, `pg_indexes`, `pg_class`, `pg_constraint` and
+  `information_schema` -- so with two schemas holding a relation of the same
+  name, column discovery could mix their columns, an index or constraint in
+  the other schema counted as present, and `_all_tablenames` listed the name
+  twice. Every one is now filtered to the selected schema, which is bound as a
+  value rather than interpolated. *Migration:* none unless you were relying on
+  psycodict seeing relations outside `public`, which it did only by accident.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores
