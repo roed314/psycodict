@@ -574,6 +574,24 @@ def utf8_prefix(name, max_bytes):
     return encoded[:max_bytes].decode("utf-8", "ignore")
 
 
+def catalog_identifier(name):
+    """
+    The spelling the catalog holds ``name`` under.
+
+    PostgreSQL truncates an over-long identifier as it parses the statement,
+    so a relation created as ``<57 bytes>_counts`` is in ``pg_class`` under the
+    first 63 bytes of that name.  SQL keeps reaching it by the long spelling --
+    the same truncation happens every time, which is why
+    :func:`physical_table_name` concatenates rather than shortens -- and a
+    comparison the *server* makes is fine too, since ``pg_class.relname`` is of
+    type ``name`` and a bound value is coerced to it.
+
+    What is not fine is comparing the long spelling to a catalog name in
+    Python, where nothing truncates anything.  Put a name through here first.
+    """
+    return utf8_prefix(name, MAX_IDENTIFIER_LENGTH)
+
+
 def derived_identifier(base, suffix="", max_length=MAX_IDENTIFIER_LENGTH):
     """
     The name of a relation psycodict derives from another one.
@@ -723,6 +741,253 @@ def validate_column_name(name):
             raise InvalidDefinitionError(
                 "Column name %r contains the control character %r" % (name, char)
             )
+    return name
+
+
+# A search table's name is used in three namespaces at once: as a PostgreSQL
+# identifier, as the key a table object is reached by on the database, and as
+# the stem of the files an export writes.  The grammar below is what all three
+# can agree on -- and it is the LMFDB's existing convention.
+_SEARCH_TABLE_NAME = re.compile(r"[a-z][a-z0-9_]*")
+
+# The relations every search table owns: itself, and the two named after it.
+_SEARCH_TABLE_COMPONENTS = ("search", "counts", "stats")
+_SEARCH_TABLE_COMPANIONS = tuple(
+    _TABLE_COMPONENT_SUFFIX[component]
+    for component in _SEARCH_TABLE_COMPONENTS
+    if component != "search"
+)
+
+# Suffixes psycodict appends to a search table's name to make the names of its
+# companion relations and of the temporary and backup tables it swaps through.
+# A *new* search table called foo_counts would collide with the counts table of
+# a search table called foo.
+_RESERVED_TABLE_SUFFIXES = _SEARCH_TABLE_COMPANIONS + ("_pkey", "_tmp")
+_RESERVED_TABLE_SUFFIX_PATTERNS = (r".*_old[0-9]+", r".*_dep[0-9]+")
+
+# Suffixes that are psycodict's scratch space rather than a name anything is
+# permanently called.  Unlike _counts and _stats these are refused whatever the
+# source: a meta_tables row naming one would make a reload's temporary table or
+# a backup look like a search table.
+_SCRATCH_TABLE_SUFFIXES = ("_pkey", "_tmp")
+_SCRATCH_TABLE_SUFFIX_PATTERNS = _RESERVED_TABLE_SUFFIX_PATTERNS
+
+# psycodict's own relations, which are not search tables however meta_tables
+# describes them.
+_META_RELATION_NAMES = frozenset({
+    "meta_tables", "meta_indexes", "meta_constraints",
+    "meta_tables_hist", "meta_indexes_hist", "meta_constraints_hist",
+    "meta_format",
+    # the 0.x stamp, replaced by meta_format but still recognized on migration
+    "meta_version",
+})
+
+# How much of the identifier limit a new search table's name has to leave
+# unused.  psycodict names the table's companions, temporaries and backups
+# after it, and the longest of those is <name>_counts_old<N>; PostgreSQL
+# truncates a name over the limit rather than refusing it, which would make two
+# of those relations the same relation.
+MAX_BACKUP_NUMBER_DIGITS = 3
+RESERVED_SEARCH_TABLE_SUFFIX_LENGTH = len("_counts_old") + MAX_BACKUP_NUMBER_DIGITS
+MAX_SEARCH_TABLE_NAME_LENGTH = (
+    MAX_IDENTIFIER_LENGTH - RESERVED_SEARCH_TABLE_SUFFIX_LENGTH
+)
+
+
+def search_table_family(name):
+    """
+    The relations a search table owns: itself and its companions.
+
+    The spellings :func:`physical_table_name` produces, which are the ones
+    psycodict puts into DDL.  For the spellings the catalog holds them under,
+    put each through :func:`catalog_identifier`.
+    """
+    return tuple(
+        physical_table_name(name, component)
+        for component in _SEARCH_TABLE_COMPONENTS
+    )
+
+
+def validate_search_table_registry(names, relations):
+    """
+    Check the recorded search-table names as a set, against what the database
+    actually has.
+
+    INPUT:
+
+    - ``names`` -- the names recorded in ``meta_tables``
+    - ``relations`` -- the names of the relations in psycodict's schema
+
+    OUTPUT:
+
+    ``names``, unchanged.
+
+    Validating one name at a time is not enough: what makes a name a search
+    table is that it owns a whole family of relations -- itself, its counts
+    table and its stats table -- and that nothing else owns any of them.  A row
+    naming ``foo_counts`` when ``foo`` is a search table would otherwise put
+    ``foo``'s counts table into the registry as a table in its own right, and
+    every write to one would go to the other.
+
+    That is a rule about ownership rather than about spelling, which is why a
+    name ending in ``_stats`` is not refused out of hand: the LMFDB has a
+    search table called ``hgcwa_per_group_stats``, and it owns
+    ``hgcwa_per_group_stats``, ``hgcwa_per_group_stats_counts`` and
+    ``hgcwa_per_group_stats_stats`` -- a complete family that overlaps nothing.
+
+    ``relations`` holds catalog spellings, so the family is put through
+    :func:`catalog_identifier` before being looked up in it.  A legacy table
+    whose name leaves fewer than seven bytes for ``_counts`` has that relation
+    in the catalog under a truncated name, and asking for the untruncated one
+    here would report a table the database plainly has as missing -- which
+    ``refresh_tables`` runs before building anything, so it would refuse to
+    connect at all.
+    """
+    seen = set()
+    for name in names:
+        if name in seen:
+            raise InvalidDefinitionError(
+                "meta_tables records the search table %r more than once" % (name,)
+            )
+        seen.add(name)
+
+    owner = {}
+    for name in names:
+        family = search_table_family(name)
+        # Compare the spellings the catalog holds, not the ones psycodict
+        # emits: a legacy table long enough that <name>_counts is over 63 bytes
+        # has that relation under the truncated name, and the two are the same
+        # relation only as far as the *server* is concerned.  Python is not the
+        # server.
+        stored = tuple(catalog_identifier(relation) for relation in family)
+
+        claimed = {}
+        for component, relation, spelling in zip(_SEARCH_TABLE_COMPONENTS, family, stored):
+            # Two of a table's own relations sharing a catalog name is a
+            # different failure from two tables colliding, and a worse one: no
+            # renaming of anything else can separate them.
+            if spelling in claimed:
+                raise InvalidDefinitionError(
+                    "The search table %r is %s bytes, so PostgreSQL stores its "
+                    "%s and %s relations under one name, %r: they are a single "
+                    "relation, and psycodict would write both to it"
+                    % (name, identifier_bytes(name), claimed[spelling], component, spelling)
+                )
+            claimed[spelling] = component
+
+            other = owner.get(spelling)
+            if other is not None and other != name:
+                raise InvalidDefinitionError(
+                    "The search tables %r and %r both claim the relation %r"
+                    % (other, name, spelling)
+                )
+            owner[spelling] = name
+
+        missing = [
+            (relation, spelling)
+            for relation, spelling in zip(family, stored)
+            if spelling not in relations
+        ]
+        if missing:
+            raise InvalidDefinitionError(
+                "meta_tables records the search table %r, but this database "
+                "has no %s; a search table owns itself, its counts table and "
+                "its stats table"
+                % (name, " or ".join(
+                    repr(relation) if relation == spelling
+                    else "%r (which PostgreSQL stores as %r)" % (relation, spelling)
+                    for relation, spelling in missing
+                ))
+            )
+    return names
+
+
+def validate_search_table_name(name, reserved=(), strict=True):
+    """
+    Check that ``name`` can be used as the name of a search table.
+
+    INPUT:
+
+    - ``name`` -- the proposed or recorded name
+    - ``reserved`` -- names that are taken for another purpose on the database
+      object (its attributes and methods), which a new table may not shadow
+    - ``strict`` -- whether to apply the conventions a *new* name must follow,
+      as opposed to the rules that keep an existing one safe to use
+
+    OUTPUT:
+
+    ``name`` itself.
+
+    A search table's name is used in more places than a relation name: as an
+    identifier, as the key of a table object on the database, and as the stem
+    of the files ``copy_to`` generates.  A name containing a path separator or
+    a ``..`` component would send an export outside the directory it was asked
+    for, so that much is checked of every name, however it arrives.
+
+    The rest -- lowercase spelling, and staying clear of the suffixes psycodict
+    appends to a search table's own name -- is a convention for names psycodict
+    is being asked to create.  It is not applied to a name a database already
+    has, since that database is a fact: the LMFDB, for one, has a search table
+    called ``hgcwa_per_group_stats``, and refusing to connect to a database on
+    account of a name that has worked for years would be a worse failure than
+    the one being prevented.
+    """
+    # The byte limit applies to every name, whatever its source: a longer
+    # string cannot be the name of a PostgreSQL relation at all, since the
+    # server truncates it, so keeping it as a registry key and a file stem
+    # while the SQL reaches a shorter relation is an alias, not compatibility.
+    validate_relation_name(name, "Search table", max_length=MAX_IDENTIFIER_LENGTH)
+    if name in _META_RELATION_NAMES:
+        raise InvalidDefinitionError(
+            "%r is one of psycodict's own relations, not a search table" % (name,)
+        )
+    for suffix in _SCRATCH_TABLE_SUFFIXES:
+        if name.endswith(suffix):
+            raise InvalidDefinitionError(
+                "Search table name %r ends with %s, which psycodict appends to "
+                "name the relations it swaps through" % (name, suffix)
+            )
+    for pattern in _SCRATCH_TABLE_SUFFIX_PATTERNS:
+        if re.fullmatch(pattern, name):
+            raise InvalidDefinitionError(
+                "Search table name %r ends with a suffix psycodict appends to "
+                "name the relations it swaps through" % (name,)
+            )
+    if not strict:
+        return name
+    # A new name additionally has to leave room for the relations psycodict
+    # will name after it.
+    if identifier_bytes(name) > MAX_SEARCH_TABLE_NAME_LENGTH:
+        raise InvalidDefinitionError(
+            "Search table name %r is %s bytes; a new name may be at most %s, "
+            "so that psycodict can name its companion, temporary and backup "
+            "relations (the longest is %s_counts_old%s) without PostgreSQL "
+            "truncating them at %s bytes"
+            % (name, identifier_bytes(name), MAX_SEARCH_TABLE_NAME_LENGTH,
+               name, "9" * MAX_BACKUP_NUMBER_DIGITS, MAX_IDENTIFIER_LENGTH)
+        )
+    if not _SEARCH_TABLE_NAME.fullmatch(name):
+        raise InvalidDefinitionError(
+            "Search table name %r must be lowercase letters, digits and "
+            "underscores, starting with a letter" % (name,)
+        )
+    for suffix in _RESERVED_TABLE_SUFFIXES:
+        if name.endswith(suffix):
+            raise InvalidDefinitionError(
+                "Search table name %r ends with %s, which psycodict appends to "
+                "a search table's own name" % (name, suffix)
+            )
+    for pattern in _RESERVED_TABLE_SUFFIX_PATTERNS:
+        if re.fullmatch(pattern, name):
+            raise InvalidDefinitionError(
+                "Search table name %r ends with a suffix psycodict appends to "
+                "the tables it swaps through" % (name,)
+            )
+    if name in reserved:
+        raise InvalidDefinitionError(
+            "Search table name %r is the name of something else on the "
+            "database object" % (name,)
+        )
     return name
 
 

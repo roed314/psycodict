@@ -16,6 +16,7 @@ then asserts that no marker exists, that the intended relation or column was
 not partially created, and that the Python objects were not mutated -- an
 exception raised after the damage was done would satisfy the first check alone.
 """
+import os.path
 import uuid
 
 import pytest
@@ -25,17 +26,24 @@ from psycopg.sql import SQL, Identifier
 from psycodict.validation import (
     InvalidColumnTypeError,
     InvalidDefinitionError,
+    MAX_BACKUP_NUMBER_DIGITS,
     MAX_IDENTIFIER_LENGTH,
+    MAX_SEARCH_TABLE_NAME_LENGTH,
+    catalog_identifier,
     check_new_table_name,
     derived_identifier,
+    identifier_bytes,
     normalize_storage_param,
     physical_table_name,
+    search_table_family,
     types_whitelist,
     validate_column_type,
     validate_index_predicate,
+    validate_search_table_name,
 )
 from psycodict.encoding import Json
 from psycodict.table import PostgresTable
+from psycodict.utils import safe_child_path
 
 import conftest
 
@@ -1390,8 +1398,8 @@ def test_a_legacy_long_table_cannot_silently_alias_its_own_backup(db):
 
 def test_a_long_name_table_reloads_and_backs_up_through_canonical_names(db, tmp_path):
     """
-    End to end at the longest name psycodict will create: the _tmp copies, the
-    swap and the _old1 backups all address the relations the helper names.
+    End to end: the _tmp copies, the swap and the _old1 backups all address the
+    relations the helper names.
     """
     # long enough to be interesting, short enough that every derived name fits
     name = "t" + "e" * 39
@@ -1475,3 +1483,1080 @@ def test_create_table_refuses_a_relation_it_would_have_to_truncate(db):
     with pytest.raises(InvalidDefinitionError, match="truncated"):
         db._create_table(name, [("n", "integer")])
     assert name[:MAX_IDENTIFIER_LENGTH] not in schema_relations(db)
+##################################################################
+# search table names, and the files they generate                #
+##################################################################
+
+
+BAD_TABLE_NAMES = [
+    "/tmp/escape",
+    "../escape",
+    "foo/bar",
+    "foo\\bar",
+    ".",
+    "..",
+    "",
+    " tab",
+    "tab ",
+    "foo bar",
+    "foo;bar",
+    'foo"bar',
+    "Foo_bar",          # a search table name is lowercase
+    "1foo",             # and starts with a letter
+    "foo\x00bar",
+    "tablе_x",     # Cyrillic lookalike
+    # names psycodict itself makes out of a search table's name
+    "foo_tmp",
+    "foo_old1",
+    "foo_dep2",
+    "foo_counts",
+    "foo_stats",
+    "foo_pkey",
+    "foo_dep3",
+    # names the database object already uses
+    "conn",
+    "config",
+    "tables",
+    "tablenames",
+    "_execute",
+    "reset_connection",
+    # over PostgreSQL's identifier limit
+    "t" + "o" * 63,
+]
+
+
+@pytest.mark.parametrize("name", BAD_TABLE_NAMES)
+def test_create_table_rejects_unusable_names(db, name):
+    with pytest.raises(ValueError):
+        db.create_table(name, [("n", "integer")], "n")
+    assert name not in db.tablenames
+
+
+@pytest.mark.parametrize("name", BAD_TABLE_NAMES)
+def test_rename_table_rejects_unusable_names(db, empty_table, name):
+    with pytest.raises(ValueError):
+        db.rename_table(empty_table.search_table, name)
+    # the table is still there under its own name
+    assert empty_table.search_table in db.tablenames
+
+
+def test_core_attributes_survive_a_table_named_after_them(db, empty_table):
+    """
+    A table object cannot take the place of the connection or a method.
+
+    Table objects used to be stored in the database object's instance
+    dictionary, where a table called `conn` would have replaced the connection.
+    """
+    conn, config = db.conn, db.config
+    db.tables["conn"] = empty_table
+    db.tables["_execute"] = empty_table
+    try:
+        assert db.conn is conn
+        assert db.config is config
+        assert callable(db._execute)
+        # the real attributes win; the table is still reachable by subscript
+        assert db["conn"] is empty_table
+    finally:
+        del db.tables["conn"]
+        del db.tables["_execute"]
+
+
+def test_refresh_tables_rejects_a_poisoned_meta_tables_row(db, empty_table, tmp_path):
+    """
+    meta_tables is a table like any other, and a name in it becomes an
+    identifier, an attribute name and the stem of an export's filenames.
+    """
+    conn, config = db.conn, db.config
+    tablenames = db.tablenames
+    escape = str(tmp_path / "escaped")
+    db._execute(
+        SQL("UPDATE meta_tables SET name = %s WHERE name = %s"),
+        [escape, empty_table.search_table],
+    )
+    try:
+        with pytest.raises(ValueError):
+            db.refresh_tables()
+        assert db.conn is conn
+        assert db.config is config
+        assert callable(db._execute)
+        assert not os.path.exists(escape)
+    finally:
+        db._execute(
+            SQL("UPDATE meta_tables SET name = %s WHERE name = %s"),
+            [empty_table.search_table, escape],
+        )
+        db.refresh_tables()
+    assert db.tablenames == tablenames
+
+
+def test_attribute_and_subscript_access_agree(db, empty_table):
+    name = empty_table.search_table
+    assert getattr(db, name) is db[name]
+    assert name in db.tablenames
+
+
+def test_a_dropped_table_is_gone_from_both_kinds_of_access(db, table_factory):
+    table = table_factory()
+    name = table.search_table
+    assert getattr(db, name) is db[name]
+    db.drop_table(name, force=True)
+    assert name not in db.tablenames
+    assert not hasattr(db, name)
+    with pytest.raises(ValueError):
+        db[name]
+
+
+def test_a_renamed_table_moves_in_both_kinds_of_access(db, table_factory, tmp_path):
+    table = table_factory()
+    old = table.search_table
+    new = "test_%s" % uuid.uuid4().hex[:12]
+    db.rename_table(old, new)
+    try:
+        assert new in db.tablenames
+        assert old not in db.tablenames
+        assert getattr(db, new) is db[new]
+        assert not hasattr(db, old)
+    finally:
+        db.drop_table(new, force=True)
+
+
+def test_generated_export_paths_stay_in_the_export_folder(tmp_path):
+    root = tmp_path / "export"
+    root.mkdir()
+    assert safe_child_path(root, "table.txt") == (root / "table.txt").resolve()
+    for escape in ["../escape.txt", "/tmp/escape.txt", "a/../../escape.txt"]:
+        with pytest.raises(ValueError):
+            safe_child_path(root, escape)
+
+
+def test_a_symlink_out_of_the_export_folder_is_not_inside_it(tmp_path):
+    root = tmp_path / "export"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside)
+    with pytest.raises(ValueError):
+        safe_child_path(root, "link/escape.txt")
+
+
+def test_copy_to_writes_only_inside_the_folder(db, filled_table, tmp_path):
+    folder = tmp_path / "data"
+    db.copy_to([filled_table.search_table], str(folder))
+    written = list(folder.glob("*"))
+    assert written
+    for path in written:
+        assert path.resolve().parent == folder.resolve()
+
+
+def rename_family(db, old, new):
+    """
+    Rename a search table's whole family, in the database and in meta_tables,
+    the way an administrator renaming a legacy table would.
+
+    Through a scratch name, since the interesting case renames ``foo`` to
+    ``foo_stats``, which is what ``foo``'s stats table is already called.
+    """
+    scratch = "swap_%s" % uuid.uuid4().hex[:10]
+    for source, target in ((old, scratch), (scratch, new)):
+        for suffix in ("", "_counts", "_stats"):
+            db._execute(
+                SQL("ALTER TABLE {0} RENAME TO {1}").format(
+                    Identifier(source + suffix), Identifier(target + suffix)
+                )
+            )
+    db._execute(
+        SQL("UPDATE meta_tables SET name = %s WHERE name = %s"), [new, old]
+    )
+
+
+def legacy_family(db, name):
+    """
+    Build a search table's whole family behind psycodict's back, the way a
+    database predating MAX_SEARCH_TABLE_NAME_LENGTH has it, and record it in
+    meta_tables.  Returns a callable that takes it all away again.
+    """
+    db._execute(SQL("CREATE TABLE {0} (id bigint, label text)").format(
+        Identifier(physical_table_name(name))))
+    db._execute(SQL(
+        "CREATE TABLE {0} (cols jsonb, values jsonb, count bigint, extra boolean, "
+        "split boolean)").format(Identifier(physical_table_name(name, "counts"))))
+    db._execute(SQL(
+        "CREATE TABLE {0} (cols jsonb, stat text, value numeric, constraint_cols jsonb, "
+        "constraint_values jsonb, threshold integer)").format(
+            Identifier(physical_table_name(name, "stats"))))
+    db._execute(
+        SQL("INSERT INTO meta_tables (name, sort, id_ordered, out_of_order, "
+            "stats_valid, label_col, total) VALUES (%s, NULL, false, false, "
+            "true, 'label', 0)"),
+        [name],
+    )
+
+    def drop():
+        db._execute(SQL("DELETE FROM meta_tables WHERE name = %s"), [name])
+        for component in ("search", "counts", "stats"):
+            db._execute(SQL("DROP TABLE IF EXISTS {0}").format(
+                Identifier(physical_table_name(name, component))))
+
+    return drop
+
+
+@pytest.mark.parametrize("length", [57, 58, 59, 60, 61])
+def test_a_legacy_long_family_still_loads_through_refresh_tables(db, length):
+    """
+    A legacy name long enough that <name>_counts does not fit in 63 bytes.
+    PostgreSQL holds that relation under the truncated spelling; psycodict goes
+    on addressing it by the long one, and the registry check -- which
+    refresh_tables runs before it builds anything, so a false negative here
+    means the database cannot be connected to at all -- has to compare the
+    spelling the catalog actually holds.
+    """
+    name = "legacy%s_" % length + "n" * (length - 7 - len(str(length)))
+    assert identifier_bytes(name) == length
+    counts = physical_table_name(name, "counts")
+    assert identifier_bytes(counts) > MAX_IDENTIFIER_LENGTH
+    drop = legacy_family(db, name)
+    try:
+        # the premise: PostgreSQL really did store the counts table short
+        relations = schema_relations(db)
+        assert counts not in relations
+        assert catalog_identifier(counts) in relations
+
+        db.refresh_tables()
+        assert name in db.tablenames
+        assert db[name].count() == 0
+        # and the companions, whose names are the truncated ones, are reached
+        table = db[name]
+        assert table.stats.counts == counts and table.stats.stats == \
+            physical_table_name(name, "stats")
+        table.insert_many([{"label": "a"}, {"label": "b"}])
+        assert table.count({}, record=True) == 2
+        table.stats._record_count({}, 2)
+        assert table.stats.quick_count({}) == 2
+        table.stats.add_stats(["label"])
+        # rows really landed in the relations the catalog holds truncated
+        for companion in (counts, physical_table_name(name, "stats")):
+            cur = db._execute(SQL("SELECT count(*) FROM {0}").format(Identifier(companion)))
+            assert cur.fetchone()[0] > 0, companion
+    finally:
+        drop()
+        db.refresh_tables()
+    assert name not in db.tablenames
+
+
+@pytest.mark.parametrize("length", [62, 63])
+def test_a_legacy_name_with_indistinguishable_companions_is_refused(db, length):
+    """
+    At 62 bytes <name>_counts and <name>_stats both truncate to <name>_, and at
+    63 the whole family collapses onto the search table.  Those really are one
+    relation, so the failure has to be reported rather than papered over by
+    comparing catalog spellings.
+    """
+    name = "z" * length
+    family = search_table_family(name)
+    assert len({catalog_identifier(relation) for relation in family}) < len(family)
+    for relation in {catalog_identifier(relation) for relation in family}:
+        db._execute(SQL("CREATE TABLE {0} (id bigint)").format(Identifier(relation)))
+    db._execute(
+        SQL("INSERT INTO meta_tables (name, sort, id_ordered, out_of_order, "
+            "stats_valid, label_col, total) VALUES (%s, NULL, false, false, "
+            "true, NULL, 0)"),
+        [name],
+    )
+    before = dict(db.tables)
+    try:
+        with pytest.raises(InvalidDefinitionError, match="single relation"):
+            db.refresh_tables()
+        assert db.tables == before
+    finally:
+        db._execute(SQL("DELETE FROM meta_tables WHERE name = %s"), [name])
+        for relation in {catalog_identifier(relation) for relation in family}:
+            db._execute(SQL("DROP TABLE IF EXISTS {0}").format(Identifier(relation)))
+        db.refresh_tables()
+
+
+def test_a_missing_companion_is_still_reported_for_a_long_name(db):
+    """
+    Comparing catalog spellings must not turn the missing-relation check into a
+    no-op: a long name whose counts table is genuinely absent is still refused,
+    and the message names both spellings.
+    """
+    name = "legacy_absent_" + "n" * 43
+    assert identifier_bytes(name) == 57
+    drop = legacy_family(db, name)
+    db._execute(SQL("DROP TABLE {0}").format(
+        Identifier(physical_table_name(name, "counts"))))
+    try:
+        with pytest.raises(InvalidDefinitionError, match="PostgreSQL stores as"):
+            db.refresh_tables()
+    finally:
+        drop()
+        db.refresh_tables()
+
+
+def test_a_legacy_name_ending_in_stats_is_accepted_with_its_family(db, empty_table):
+    """
+    What makes a name a search table is owning a complete family, not how it is
+    spelled: the LMFDB has a search table called hgcwa_per_group_stats, whose
+    own counts and stats tables are hgcwa_per_group_stats_counts and
+    hgcwa_per_group_stats_stats.
+    """
+    old = empty_table.search_table
+    new = old + "_stats"
+    rename_family(db, old, new)
+    try:
+        db.refresh_tables()
+        assert new in db.tablenames
+        assert db[new].count() == 0
+    finally:
+        rename_family(db, new, old)
+        db.refresh_tables()
+    assert old in db.tablenames
+
+
+def test_a_row_claiming_another_tables_companion_is_refused(db, empty_table):
+    """
+    A row naming foo_counts when foo is a search table would put foo's counts
+    table into the registry as a table in its own right.
+    """
+    name = empty_table.search_table
+    before = dict(db.tables)
+    db._execute(
+        SQL("INSERT INTO meta_tables (name, sort, id_ordered, out_of_order, "
+            "stats_valid, label_col, total) VALUES (%s, NULL, false, false, "
+            "true, NULL, 0)"),
+        [name + "_counts"],
+    )
+    try:
+        with pytest.raises(ValueError, match="claim"):
+            db.refresh_tables()
+        # nothing was registered, and the tables that were there are the same
+        # objects they were
+        assert db.tables == before
+    finally:
+        db._execute(SQL("DELETE FROM meta_tables WHERE name = %s"), [name + "_counts"])
+        db.refresh_tables()
+
+
+@pytest.mark.parametrize(
+    "poison", ["meta_tables", "meta_indexes", "meta_format", "meta_constraints_hist"]
+)
+def test_a_row_naming_a_metadata_relation_is_refused(db, empty_table, poison):
+    before = dict(db.tables)
+    db._execute(
+        SQL("INSERT INTO meta_tables (name, sort, id_ordered, out_of_order, "
+            "stats_valid, label_col, total) VALUES (%s, NULL, false, false, "
+            "true, NULL, 0)"),
+        [poison],
+    )
+    try:
+        with pytest.raises(ValueError, match="psycodict's own relations"):
+            db.refresh_tables()
+        assert db.tables == before
+        with pytest.raises(ValueError):
+            db[poison]
+    finally:
+        db._execute(SQL("DELETE FROM meta_tables WHERE name = %s"), [poison])
+        db.refresh_tables()
+
+
+@pytest.mark.parametrize("suffix", ["_tmp", "_old1", "_dep0", "_pkey"])
+def test_a_row_naming_scratch_space_is_refused(db, empty_table, suffix):
+    name = empty_table.search_table + suffix
+    before = dict(db.tables)
+    db._execute(
+        SQL("INSERT INTO meta_tables (name, sort, id_ordered, out_of_order, "
+            "stats_valid, label_col, total) VALUES (%s, NULL, false, false, "
+            "true, NULL, 0)"),
+        [name],
+    )
+    try:
+        with pytest.raises(ValueError, match="swaps through"):
+            db.refresh_tables()
+        assert db.tables == before
+    finally:
+        db._execute(SQL("DELETE FROM meta_tables WHERE name = %s"), [name])
+        db.refresh_tables()
+
+
+def test_a_family_missing_its_companions_is_refused(db, empty_table):
+    """
+    Renaming only the base relation leaves a name whose counts and stats
+    tables are somebody else's -- or nobody's.
+    """
+    old = empty_table.search_table
+    new = old + "x"
+    before = dict(db.tables)
+    db._execute(
+        SQL("ALTER TABLE {0} RENAME TO {1}").format(Identifier(old), Identifier(new))
+    )
+    db._execute(SQL("UPDATE meta_tables SET name = %s WHERE name = %s"), [new, old])
+    try:
+        with pytest.raises(ValueError, match="counts table and its stats table"):
+            db.refresh_tables()
+        assert db.tables == before
+    finally:
+        db._execute(
+            SQL("ALTER TABLE {0} RENAME TO {1}").format(
+                Identifier(new), Identifier(old)
+            )
+        )
+        db._execute(SQL("UPDATE meta_tables SET name = %s WHERE name = %s"), [old, new])
+        db.refresh_tables()
+
+
+def test_a_name_over_the_identifier_limit_is_refused_from_metadata(db, empty_table):
+    """
+    A string longer than 63 bytes cannot be the name of a PostgreSQL relation:
+    the server truncates it, so keeping the longer string as a registry key
+    while the SQL reaches a shorter relation is an alias.
+    """
+    with pytest.raises(InvalidDefinitionError, match="byte limit"):
+        validate_search_table_name("a" * 64, strict=False)
+    assert validate_search_table_name("a" * 63, strict=False)
+
+    name = empty_table.search_table
+    before = dict(db.tables)
+    db._execute(
+        SQL("UPDATE meta_tables SET name = %s WHERE name = %s"), ["a" * 64, name]
+    )
+    try:
+        with pytest.raises(ValueError, match="byte limit"):
+            db.refresh_tables()
+        assert db.tables == before
+    finally:
+        db._execute(
+            SQL("UPDATE meta_tables SET name = %s WHERE name = %s"), [name, "a" * 64]
+        )
+        db.refresh_tables()
+
+
+##################################################################
+# room for the names psycodict generates                         #
+##################################################################
+
+
+def test_the_longest_accepted_name_survives_a_whole_reload(db, tmp_path):
+    """
+    A new name has to leave room for the relations psycodict names after it:
+    the companions at creation, then _tmp on a reload and _oldN for the backup.
+    """
+    name = "t" + "e" * (MAX_SEARCH_TABLE_NAME_LENGTH - 1)
+    assert len(name) == MAX_SEARCH_TABLE_NAME_LENGTH
+    db.create_table(name, [("n", "integer"), ("label", "text")], "label")
+    try:
+        table = db[name]
+        table.insert_many([{"n": 1, "label": "one"}])
+        searchfile = str(tmp_path / "search.txt")
+        table.copy_to(searchfile)
+        table.reload(searchfile)
+
+        # every relation the reload made is the one psycodict names, untruncated
+        relations = db._schema_relations()
+        for component in ("search", "counts", "stats"):
+            assert physical_table_name(name, component) in relations
+            # and the _tmp copies are gone again
+            assert physical_table_name(name, component, "_tmp") not in relations
+        assert physical_table_name(name, "search", "_old1") in relations
+        # every relation it could name still fits
+        for suffix in ["_counts_old1", "_stats_old1", "_counts_tmp",
+                       "_counts_old%s" % ("9" * MAX_BACKUP_NUMBER_DIGITS)]:
+            assert len((name + suffix).encode("utf-8")) <= MAX_IDENTIFIER_LENGTH
+        assert db[name].count() == 1
+
+        # a second reload makes a second backup, distinct from the first
+        db[name].reload(searchfile)
+        relations = db._schema_relations()
+        assert physical_table_name(name, "search", "_old1") in relations
+        assert physical_table_name(name, "search", "_old2") in relations
+    finally:
+        for lifecycle in ("_old1", "_old2", "_tmp"):
+            for component in ("search", "counts", "stats"):
+                db._execute(
+                    SQL("DROP TABLE IF EXISTS {0}").format(
+                        Identifier(physical_table_name(name, component, lifecycle))
+                    )
+                )
+        db.drop_table(name, force=True)
+
+
+def test_one_byte_past_the_limit_creates_nothing(db):
+    name = "t" + "e" * MAX_SEARCH_TABLE_NAME_LENGTH
+    with pytest.raises(ValueError, match="at most %s" % MAX_SEARCH_TABLE_NAME_LENGTH):
+        db.create_table(name, [("n", "integer")], "n")
+    relations = db._schema_relations()
+    for suffix in ["", "_counts", "_stats"]:
+        assert name + suffix not in relations
+    assert name not in db.tablenames
+    assert not db._execute(
+        SQL("SELECT 1 FROM meta_tables WHERE name = %s"), [name]
+    ).fetchone()
+
+
+def test_rename_table_refuses_a_destination_with_no_room(db, empty_table):
+    name = empty_table.search_table
+    too_long = "t" + "e" * MAX_SEARCH_TABLE_NAME_LENGTH
+    with pytest.raises(ValueError, match="at most"):
+        db.rename_table(name, too_long)
+    # the original family is untouched
+    relations = db._schema_relations()
+    for suffix in ["", "_counts", "_stats"]:
+        assert name + suffix in relations
+    assert name in db.tablenames
+
+
+def test_no_two_generated_relation_names_collide_after_truncation():
+    """
+    The reserved room is only useful if it covers every suffix psycodict
+    appends to a search table's name.
+    """
+    name = "t" * MAX_SEARCH_TABLE_NAME_LENGTH
+    suffixes = [""]
+    for companion in ["", "_counts", "_stats"]:
+        suffixes.append(companion)
+        suffixes.append(companion + "_tmp")
+        for backup in range(1, 10 ** MAX_BACKUP_NUMBER_DIGITS):
+            if backup > 3 and backup < 10 ** MAX_BACKUP_NUMBER_DIGITS - 1:
+                continue
+            suffixes.append("%s_old%s" % (companion, backup))
+    generated = [name + suffix for suffix in suffixes]
+    for relation in generated:
+        assert len(relation.encode("utf-8")) <= MAX_IDENTIFIER_LENGTH, relation
+    truncated = [relation.encode("utf-8")[:MAX_IDENTIFIER_LENGTH] for relation in generated]
+    assert len(set(truncated)) == len(set(generated))
+
+
+def test_a_name_that_could_escape_the_export_folder_is_refused_anywhere(db, empty_table, tmp_path):
+    """
+    What is checked of every name, however it arrives, is what would make it
+    unsafe to use.
+    """
+    name = empty_table.search_table
+    for bad in [str(tmp_path / "escape"), "../escape", "foo/bar", "foo bar"]:
+        db._execute(
+            SQL("UPDATE meta_tables SET name = %s WHERE name = %s"), [bad, name]
+        )
+        try:
+            with pytest.raises(ValueError):
+                db.refresh_tables()
+        finally:
+            db._execute(
+                SQL("UPDATE meta_tables SET name = %s WHERE name = %s"), [name, bad]
+            )
+    db.refresh_tables()
+    assert name in db.tablenames
+
+
+##################################################################
+# names psycodict derives when a table is renamed                #
+##################################################################
+
+
+def test_a_long_index_name_survives_a_table_rename(db, table_factory):
+    """
+    Renaming a table renames its indexes by substituting the table's name, and
+    a short name replaced by a long one can push the result past the identifier
+    limit.  Both the metadata and the catalog have to get the same fitted name,
+    or every later drop and restore looks for a relation that is not there.
+    """
+    table = table_factory()
+    old = table.search_table
+    index = (old + "_i" + "x" * MAX_IDENTIFIER_LENGTH)[:MAX_IDENTIFIER_LENGTH]
+    table.create_index(["n"], name=index)
+
+    new = "r" + "e" * (MAX_SEARCH_TABLE_NAME_LENGTH - 1)
+    candidate = index.replace(old, new)
+    assert len(candidate.encode("utf-8")) > MAX_IDENTIFIER_LENGTH
+
+    db.rename_table(old, new)
+    try:
+        renamed = list(db[new].list_indexes())
+        assert len(renamed) == 1
+        stored = renamed[0]
+        assert len(stored.encode("utf-8")) <= MAX_IDENTIFIER_LENGTH
+        assert stored == derived_identifier(candidate)
+        # what psycodict recorded is what PostgreSQL has, and the truncation
+        # the server would have produced is not standing in for it
+        built = catalog_index_names(db, new)
+        assert stored in built
+        assert candidate[:MAX_IDENTIFIER_LENGTH] not in built or stored == candidate[
+            :MAX_IDENTIFIER_LENGTH
+        ]
+        assert index not in built
+        # and the metadata name is usable
+        db[new].drop_index(stored, permanent=False)
+        db[new].restore_index(stored)
+        assert stored in catalog_index_names(db, new)
+    finally:
+        db.drop_table(new, force=True)
+
+
+def test_a_long_constraint_name_survives_a_table_rename(db, table_factory):
+    table = table_factory()
+    old = table.search_table
+    constraint = (old + "_c" + "x" * MAX_IDENTIFIER_LENGTH)[:MAX_IDENTIFIER_LENGTH]
+    table.create_constraint(["label"], "unique", name=constraint)
+
+    new = "r" + "e" * (MAX_SEARCH_TABLE_NAME_LENGTH - 1)
+    candidate = constraint.replace(old, new)
+    assert len(candidate.encode("utf-8")) > MAX_IDENTIFIER_LENGTH
+
+    db.rename_table(old, new)
+    try:
+        stored = list(db[new].list_constraints())[0]
+        assert len(stored.encode("utf-8")) <= MAX_IDENTIFIER_LENGTH
+        assert stored == derived_identifier(candidate)
+        assert stored in catalog_constraint_names(db, new)
+        db[new].drop_constraint(stored)
+        db[new].restore_constraint(stored)
+        assert stored in catalog_constraint_names(db, new)
+    finally:
+        db.drop_table(new, force=True)
+
+
+def test_current_and_history_metadata_agree_after_a_rename(db, table_factory, tmp_path):
+    """
+    The same old name occurs in meta_indexes and meta_indexes_hist; both have
+    to be rewritten to the same thing.
+    """
+    table = table_factory()
+    old = table.search_table
+    index = (old + "_i" + "x" * MAX_IDENTIFIER_LENGTH)[:MAX_IDENTIFIER_LENGTH]
+    table.create_index(["n"], name=index)
+    path = str(tmp_path / "indexes.txt")
+    table.copy_to_indexes(path)
+    table.reload_indexes(path)          # writes a history version
+
+    new = "r" + "e" * (MAX_SEARCH_TABLE_NAME_LENGTH - 1)
+    db.rename_table(old, new)
+    try:
+        current = {rec[0] for rec in db._execute(
+            SQL("SELECT index_name FROM meta_indexes WHERE table_name = %s"), [new]
+        )}
+        history = {rec[0] for rec in db._execute(
+            SQL("SELECT index_name FROM meta_indexes_hist WHERE table_name = %s"), [new]
+        )}
+        assert current == history
+        assert len(current) == 1
+        assert current.pop() == derived_identifier(index.replace(old, new))
+    finally:
+        db.drop_table(new, force=True)
+
+
+def test_a_rename_whose_fitted_name_is_taken_picks_another(db, table_factory):
+    """
+    Two indexes whose fitted names would collide must not both become the same
+    relation.
+    """
+    table = table_factory()
+    old = table.search_table
+    first = (old + "_i" + "x" * MAX_IDENTIFIER_LENGTH)[:MAX_IDENTIFIER_LENGTH]
+    second = first[:-1] + "y"
+    table.create_index(["n"], name=first)
+    table.create_index(["label"], name=second)
+
+    new = "r" + "e" * (MAX_SEARCH_TABLE_NAME_LENGTH - 1)
+    db.rename_table(old, new)
+    try:
+        stored = sorted(db[new].list_indexes())
+        assert len(stored) == 2
+        assert len(set(stored)) == 2
+        built = catalog_index_names(db, new)
+        for name in stored:
+            assert len(name.encode("utf-8")) <= MAX_IDENTIFIER_LENGTH
+            assert name in built
+    finally:
+        db.drop_table(new, force=True)
+
+
+##################################################################
+# the transient index a staged write builds                      #
+##################################################################
+
+
+def test_a_staged_write_on_the_longest_name_uses_a_fitted_index(db, tmp_path):
+    """
+    <49 bytes>_tmp_staged_label is 66 bytes, so the transient index has to be
+    fitted -- and by the same call in the path that creates it and the paths
+    that drop it.
+    """
+    name = "s" + "t" * (MAX_SEARCH_TABLE_NAME_LENGTH - 1)
+    db.create_table(name, [("n", "integer"), ("label", "text")], "label")
+    try:
+        table = db[name]
+        table.insert_many([{"n": 1, "label": "one"}])
+        expected = derived_identifier(name + "_tmp", "_staged_label")
+        raw = name + "_tmp_staged_label"
+        assert len(raw.encode("utf-8")) > MAX_IDENTIFIER_LENGTH
+        assert len(expected.encode("utf-8")) <= MAX_IDENTIFIER_LENGTH
+
+        with db[name].staged() as staged:
+            built = catalog_index_names(db, name + "_tmp")
+            assert expected in built
+            staged.update({"n": 1}, {"label": "changed"})
+
+        # the transient index is gone, under either spelling
+        relations = db._schema_relations()
+        assert expected not in relations
+        assert raw[:MAX_IDENTIFIER_LENGTH] not in relations
+        assert name + "_tmp" not in relations
+        assert db[name].lucky({"n": 1}, "label") == "changed"
+    finally:
+        for lifecycle in ("_old1", "_tmp"):
+            for component in ("search", "counts", "stats"):
+                db._execute(
+                    SQL("DROP TABLE IF EXISTS {0}").format(
+                        Identifier(physical_table_name(name, component, lifecycle))
+                    )
+                )
+        db.drop_table(name, force=True)
+
+
+def test_the_staged_label_index_is_in_the_generated_name_set():
+    name = "t" * MAX_SEARCH_TABLE_NAME_LENGTH
+    staged = derived_identifier(name + "_tmp", "_staged_label")
+    assert len(staged.encode("utf-8")) <= MAX_IDENTIFIER_LENGTH
+    # and it is distinct from the relations of the same table
+    others = {
+        physical_table_name(name, component, lifecycle)
+        for component in ("search", "counts", "stats")
+        for lifecycle in ("", "_tmp", "_old1")
+    }
+    assert staged not in others
+
+
+def test_a_table_rename_leaves_a_custom_index_name_alone(db, table_factory):
+    """
+    An index whose name does not mention the table keeps it -- and psycodict
+    must not ask PostgreSQL to rename it to itself, which is an error rather
+    than a no-op.  Its metadata still moves to the new table.
+    """
+    table = table_factory()
+    old = table.search_table
+    index = "custom_index_%s" % uuid.uuid4().hex[:8]
+    table.create_index(["n"], name=index)
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+
+    db.rename_table(old, new)
+    try:
+        assert list(db[new].list_indexes()) == [index]
+        assert index in catalog_index_names(db, new)
+        # and the metadata followed the table
+        rows = meta_index_rows(db, new)
+        assert [row["index_name"] for row in rows] == [index]
+        assert meta_index_rows(db, old) == []
+        db[new].drop_index(index, permanent=False)
+        db[new].restore_index(index)
+        assert index in catalog_index_names(db, new)
+    finally:
+        db.drop_table(new, force=True)
+
+
+def test_a_table_rename_leaves_a_custom_constraint_name_alone(db, table_factory):
+    table = table_factory()
+    old = table.search_table
+    constraint = "custom_constraint_%s" % uuid.uuid4().hex[:8]
+    table.create_constraint(["label"], "unique", name=constraint)
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+
+    db.rename_table(old, new)
+    try:
+        assert list(db[new].list_constraints()) == [constraint]
+        assert constraint in catalog_constraint_names(db, new)
+        db[new].drop_constraint(constraint)
+        db[new].restore_constraint(constraint)
+        assert constraint in catalog_constraint_names(db, new)
+    finally:
+        db.drop_table(new, force=True)
+
+
+def test_a_rename_target_taken_by_an_unrelated_index_is_moved_aside(db, table_factory):
+    """
+    The name a renamed index would take may already belong to an index on some
+    other table.  An index is a pg_class relation, not a table, so a planner
+    that only looked at pg_tables would not see it.
+    """
+    table = table_factory()
+    old = table.search_table
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+    table.create_index(["n"])
+    source_index = old + "_n"
+    would_take = source_index.replace(old, new)
+
+    # an unrelated table already has an index by that name
+    other = table_factory()
+    other.create_index(["n"], name=would_take)
+
+    db.rename_table(old, new)
+    try:
+        stored = list(db[new].list_indexes())
+        assert len(stored) == 1
+        assert stored[0] != would_take
+        assert stored[0] in catalog_index_names(db, new)
+        # the unrelated index is where it was
+        assert would_take in catalog_index_names(db, other.search_table)
+        db[new].drop_index(stored[0], permanent=False)
+        db[new].restore_index(stored[0])
+        assert stored[0] in catalog_index_names(db, new)
+    finally:
+        db.drop_table(new, force=True)
+
+
+def test_planned_rename_targets_are_shared_across_kinds(db, table_factory, monkeypatch):
+    """
+    An index target and a constraint target are allocated from one set: two
+    dependents must not be given the same name merely because they are of
+    different kinds.
+    """
+    table = table_factory()
+    old = table.search_table
+    table.create_index(["n"], name=old + "_shared")
+    table.create_constraint(["label"], "unique", name=old + "_shared_c")
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+
+    # make both candidates collapse to the same name, which is what the shared
+    # set has to resolve
+    import psycodict.database as database_module
+
+    real = database_module.derived_identifier
+    monkeypatch.setattr(
+        database_module,
+        "derived_identifier",
+        lambda base, suffix="": real(new + "_collide", suffix),
+    )
+    plan = db._dependent_rename_plan(old, new)
+    targets = [entry["target"] for entries in plan.values() for entry in entries.values()]
+    assert len(targets) == 2
+    assert len(set(targets)) == 2
+
+
+def test_renaming_one_table_leaves_another_tables_metadata_alone(
+    db, table_factory, check_function, tmp_path
+):
+    """
+    A constraint name is only unique within its table, so two tables can share
+    one.  Updating metadata by the constraint's name alone would move the other
+    table's rows -- current and historical.
+    """
+    first, second = table_factory(), table_factory()
+    shared = "shared_check_%s" % uuid.uuid4().hex[:8]
+    for table in (first, second):
+        table.create_constraint(["n"], "check", name=shared, check_func=check_function)
+        path = str(tmp_path / ("%s.txt" % table.search_table))
+        table.copy_to_constraints(path)
+        table.reload_constraints(path)          # gives each table history
+
+    def rows(table_name, meta):
+        cur = db._execute(
+            SQL("SELECT constraint_name FROM {0} WHERE table_name = %s").format(
+                Identifier(meta)
+            ),
+            [table_name],
+        )
+        return sorted(rec[0] for rec in cur)
+
+    old, other = first.search_table, second.search_table
+    before_other = (rows(other, "meta_constraints"), rows(other, "meta_constraints_hist"))
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+
+    db.rename_table(old, new)
+    try:
+        # the renamed table's rows moved, current and historical
+        assert rows(new, "meta_constraints") == [shared]
+        assert rows(new, "meta_constraints_hist") == [shared]
+        assert rows(old, "meta_constraints") == []
+        assert rows(old, "meta_constraints_hist") == []
+        # the other table's did not
+        assert (rows(other, "meta_constraints"), rows(other, "meta_constraints_hist")) == before_other
+        # and both constraints are still on their own tables
+        assert shared in catalog_constraint_names(db, new)
+        assert shared in catalog_constraint_names(db, other)
+    finally:
+        db[new].drop_constraint(shared, permanent=True)
+        db.drop_table(new, force=True)
+
+
+def test_a_check_constraint_keeping_its_name_is_reserved_first(
+    db, table_factory, check_function
+):
+    """
+    A CHECK constraint has no backing index, so pg_class has no row for its
+    name -- only pg_constraint does.  Renaming a table with constraints
+    ``<old>_guard`` and ``<new>_guard`` therefore has two dependents wanting
+    the same name: the first is renamed into it, the second already has it.
+
+    The one that keeps its name is allocated first, so the outcome does not
+    depend on the order the metadata query happened to return, which has no
+    ORDER BY.  (A UNIQUE constraint would not show this: it *is* visible in
+    pg_class, through its index.)
+    """
+    table = table_factory()
+    old = table.search_table
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+    keeps_name = new + "_guard"
+    table.create_constraint(["n"], "check", name=old + "_guard", check_func=check_function)
+    table.create_constraint(["n"], "check", name=keeps_name, check_func=check_function)
+
+    plan = db._dependent_rename_plan(old, new)["constraint"]
+    assert plan[keeps_name]["target"] == keeps_name
+    assert plan[keeps_name]["rename_physical"] is False
+    # the one that would have taken that name is moved aside
+    assert plan[old + "_guard"]["target"] != keeps_name
+    targets = [entry["target"] for entry in plan.values()]
+    assert len(set(targets)) == len(targets)
+
+    db.rename_table(old, new)
+    try:
+        stored = sorted(db[new].list_constraints())
+        assert len(set(stored)) == 2
+        built = catalog_constraint_names(db, new)
+        for name in stored:
+            assert name in built
+        assert keeps_name in stored
+    finally:
+        for name in list(db[new].list_constraints()):
+            db[new].drop_constraint(name, permanent=True)
+        db.drop_table(new, force=True)
+
+
+def test_an_unmanaged_constraint_name_is_not_handed_out(db, table_factory, check_function):
+    """
+    Reserving from pg_constraint rather than from meta_constraints also covers
+    a constraint psycodict did not create.
+    """
+    table = table_factory()
+    old = table.search_table
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+    table.create_constraint(["n"], "check", name=old + "_guard", check_func=check_function)
+    # added behind psycodict's back, so it is in no metadata
+    db._execute(
+        SQL("ALTER TABLE {0} ADD CONSTRAINT {1} CHECK (n IS NOT NULL)").format(
+            Identifier(old), Identifier(new + "_guard")
+        )
+    )
+    plan = db._dependent_rename_plan(old, new)["constraint"]
+    assert plan[old + "_guard"]["target"] != new + "_guard"
+
+
+def test_a_history_only_name_that_keeps_itself_is_reserved_too(db, table_factory, tmp_path):
+    """
+    A name only the history remembers has no relation behind it, so nothing in
+    the catalog reserves it.  If it keeps its name -- it does not mention the
+    table -- a current dependent whose new name lands on it would take it, and
+    the two metadata rows would end up calling different indexes the same
+    thing.  The dependents that keep their names are allocated first for
+    exactly this reason.
+    """
+    table = table_factory()
+    old = table.search_table
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+    survivor = new + "_n"
+
+    # a name that lives only in the history: created, recorded, then dropped
+    table.create_index(["n"], name=survivor)
+    path = str(tmp_path / "indexes.txt")
+    table.copy_to_indexes(path)
+    table.reload_indexes(path)
+    table.drop_index(survivor, permanent=True)
+    # and a current index whose renamed name would be exactly that
+    table.create_index(["n"])
+    assert derived_identifier((old + "_n").replace(old, new)) == survivor
+
+    plan = db._dependent_rename_plan(old, new)["index"]
+    assert plan[survivor]["target"] == survivor
+    assert plan[survivor]["rename_physical"] is False
+    assert plan[old + "_n"]["target"] != survivor
+    targets = [entry["target"] for entry in plan.values()]
+    assert len(set(targets)) == len(targets)
+
+
+def test_a_history_only_constraint_reserves_its_name_against_an_index(
+    db, table_factory, check_function, tmp_path
+):
+    """
+    The reservation has to be global, not per kind.
+
+    A CHECK constraint that only the history remembers has no row in
+    pg_constraint and none in pg_class, so nothing in the catalog holds its
+    name.  If indexes were allocated before constraints were even read, a
+    current index's new name would take it -- and restoring that constraint
+    later would make _rename_if_exists move the index aside, leaving the
+    index's metadata naming a relation that is no longer there.
+    """
+    table = table_factory()
+    old = table.search_table
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+    survivor = new + "_n"
+
+    # a constraint that lives only in the history
+    table.create_constraint(["n"], "check", name=survivor, check_func=check_function)
+    path = str(tmp_path / "constraints.txt")
+    table.copy_to_constraints(path)
+    table.reload_constraints(path)
+    table.drop_constraint(survivor, permanent=True)
+    assert survivor not in catalog_constraint_names(db, old)
+
+    # and a current index whose renamed name would be exactly that
+    table.create_index(["n"])
+    assert derived_identifier((old + "_n").replace(old, new)) == survivor
+
+    plan = db._dependent_rename_plan(old, new)
+    assert plan["constraint"][survivor]["target"] == survivor
+    assert plan["constraint"][survivor]["rename_physical"] is False
+    assert plan["index"][old + "_n"]["target"] != survivor
+    targets = [entry["target"] for entries in plan.values() for entry in entries.values()]
+    assert len(set(targets)) == len(targets)
+
+    db.rename_table(old, new)
+    try:
+        index = list(db[new].list_indexes())[0]
+        assert index != survivor
+        assert index in catalog_index_names(db, new)
+        # the history kept the constraint's name, on the new table
+        history = {rec[0] for rec in db._execute(
+            SQL("SELECT constraint_name FROM meta_constraints_hist WHERE table_name = %s"),
+            [new],
+        )}
+        assert history == {survivor}
+    finally:
+        db.drop_table(new, force=True)
+
+
+def test_two_keepers_of_different_kinds_may_share_a_name(db, table_factory, check_function):
+    """
+    PostgreSQL keeps index names and constraint names in different catalogs, so
+    an index and a CHECK constraint on one table may be called the same thing.
+    psycodict will not create that itself -- create_constraint refuses a name a
+    relation already has -- but a database can arrive in that state from
+    outside, and a rename that moves neither of them must not object.
+    """
+    table = table_factory()
+    old = table.search_table
+    new = "renamed_%s" % uuid.uuid4().hex[:8]
+    shared = "shared_%s" % uuid.uuid4().hex[:8]
+    table.create_index(["n"], name=shared)
+    # added the way an older psycodict or an administrator would have
+    db._execute(
+        SQL("ALTER TABLE {0} ADD CONSTRAINT {1} CHECK ({2}({3}))").format(
+            Identifier(old), Identifier(shared),
+            Identifier(*check_function.split(".")), Identifier("n"),
+        )
+    )
+    db._execute(
+        SQL("INSERT INTO meta_constraints (constraint_name, table_name, type, "
+            "columns, check_func) VALUES (%s, %s, %s, %s, %s)"),
+        [shared, old, "CHECK", Json(["n"]), check_function],
+    )
+
+    plan = db._dependent_rename_plan(old, new)
+    assert plan["index"][shared]["target"] == shared
+    assert plan["constraint"][shared]["target"] == shared
+
+    db.rename_table(old, new)
+    try:
+        assert shared in catalog_index_names(db, new)
+        assert shared in catalog_constraint_names(db, new)
+    finally:
+        db._execute(
+            SQL("DELETE FROM meta_constraints WHERE constraint_name = %s"), [shared]
+        )
+        db.drop_table(new, force=True)

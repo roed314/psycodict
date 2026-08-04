@@ -257,6 +257,42 @@ hardening standalone use; the highlights:
   wait — though it does inherit the connection overrides that decide which
   server and database it reaches.
 
+- **Search table names have one grammar, and table objects have their own
+  registry.** A table name is used as a PostgreSQL identifier, as the key the
+  table object is reached by, and as the stem of the files `copy_to` writes,
+  but nothing checked it against any of those uses. A name with a path
+  separator or a `..` component sent an export out of the folder it was asked
+  for, and because table objects were stored in the database object's instance
+  dictionary, a table named `conn`, `config` or `tablenames` — from
+  `create_table` or from a `meta_tables` row edited with plain SQL — replaced
+  that attribute. Names are now checked by `validate_search_table_name`
+  (lowercase letters, digits and underscores, starting with a letter, at most
+  63 bytes, not ending in a suffix psycodict appends to a table's own name, not
+  the name of something else on the database object) in `create_table`,
+  `create_table_like` and `rename_table`, where the limit is 49 bytes rather
+  than PostgreSQL's 63 so that the relations psycodict names after the table
+  (`<name>_counts_old<N>` is the longest) cannot be truncated into each other;
+  names already in `meta_tables` may keep a legacy spelling but are checked as
+  a set, before anything is registered, against the relations the database
+  actually has — a row is refused if it names one of psycodict's own relations,
+  ends in scratch space (`_tmp`, `_oldN`, `_depN`, `_pkey`), exceeds 63 bytes,
+  claims a relation another row already claims, or lacks its counts or stats
+  table, where "has" is decided against the spelling the catalog holds, since a
+  legacy name long enough that `<name>_counts` does not fit in 63 bytes has that
+  relation under the truncated one (a name with 62 or 63 bytes, whose counts and
+  stats tables PostgreSQL would store as a single relation, is refused and
+  said so); renaming a table plans the new names of its indexes and constraints
+  before renaming anything, so the metadata and the catalog cannot end up with
+  different spellings when substituting a longer table name pushes one past the
+  limit; the transient index a staged write builds is named by one helper
+  rather than by three concatenations; table objects live in `db.tables`; and
+  the files an export generates go through
+  `safe_child_path`, which resolves symlinks and refuses anything that is not
+  under the requested folder. *Migration:* `db.tablenames` is now a sorted
+  property derived from `db.tables` rather than a list to mutate, and
+  attribute access (`db.mytable`) is unchanged. `reload_all` and `rename_table`
+  raise `ValueError` where they used to `assert`.
+
 ### Infrastructure
 
 - A test suite of 500+ tests and a continuous-integration workflow covering the

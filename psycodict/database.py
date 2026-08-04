@@ -42,9 +42,16 @@ from .base import (
     _meta_tables_defaults,
     _meta_cols_types_jsonb_idx,
 )
-from .validation import physical_table_name
+from .validation import (
+    InvalidDefinitionError,
+    check_new_table_name,
+    derived_identifier,
+    physical_table_name,
+    validate_search_table_name,
+    validate_search_table_registry,
+)
 from .searchtable import PostgresSearchTable
-from .utils import DelayCommit
+from .utils import DelayCommit, safe_child_path
 
 # The registry of metadata-format migrations.  Entry N describes the step
 # from format N-1 to format N; MetadataFormats.md has the checklist a new
@@ -195,11 +202,16 @@ class PostgresDatabase(PostgresBase):
 
     - ``server_side_counter`` -- an integer tracking how many buffered connections have been created
     - ``conn`` -- the psycopg connection object
-    - ``tablenames`` -- a list of tablenames in the database, as strings
+    - ``tables`` -- the search tables, by name
+    - ``tablenames`` -- the names of the search tables, sorted
     - ``meta_format`` -- the metadata format this connection operates at (see
       MetadataFormats.md)
 
-    Also, each tablename will be stored as an attribute, so that db.ec_curvedata works for example.
+    Each table is also reachable as an attribute, so that db.ec_curvedata works
+    for example.  The tables themselves live in ``db.tables``, not in the
+    instance dictionary: a table name comes out of meta_tables and must not be
+    able to take the place of the connection or of a method, so anything the
+    database object really has wins over a table of the same name.
 
     These table objects are snapshots: if another process later changes the schema
     (adding or dropping columns or tables), call ``refresh_tables`` to update them
@@ -581,7 +593,11 @@ class PostgresDatabase(PostgresBase):
         # sides have.
         self._meta_format = min(stored, META_FORMAT)
 
-        self.tablenames = []
+        # The search tables, by name.  A dedicated mapping rather than the
+        # instance dictionary, so that a table name -- which comes out of
+        # meta_tables and can therefore be anything a row holds -- cannot take
+        # the place of the connection, the configuration or a method.
+        self.tables = {}
         self.refresh_tables()
 
     def refresh_tables(self):
@@ -626,21 +642,29 @@ class PostgresDatabase(PostgresBase):
                 "If this is a fresh database, connect with PostgresDatabase(create=True) "
                 "to create them."
             )
+        # Read everything, validate everything, and only then touch the
+        # registry.  meta_tables is data like any other -- a row can be
+        # inserted or edited with plain SQL -- and a name is not a search table
+        # on its own: it has to own a whole family of relations that nothing
+        # else claims.  Refreshing table by table would act on the rows before
+        # the poisoned one.
+        rows = list(cur)
+        names = [tabledata[0] for tabledata in rows]
+        for tablename in names:
+            self._validate_table_name(tablename, source="meta_tables")
+        validate_search_table_registry(names, self._schema_relations())
+
         current = set()
-        for tabledata in cur:
+        for tabledata in rows:
             tablename = tabledata[0]
             current.add(tablename)
-            if tablename in self.tablenames:
-                self.__dict__[tablename]._refresh(tabledata[1:], data_types)
+            if tablename in self.tables:
+                self.tables[tablename]._refresh(tabledata[1:], data_types)
             else:
                 tabledata += (data_types,)
-                table = self._search_table_class_(self, *tabledata)
-                self.__dict__[tablename] = table
-                self.tablenames.append(tablename)
-        for tablename in [name for name in self.tablenames if name not in current]:
-            delattr(self, tablename)
-            self.tablenames.remove(tablename)
-        self.tablenames.sort()
+                self.tables[tablename] = self._search_table_class_(self, *tabledata)
+        for tablename in [name for name in self.tables if name not in current]:
+            del self.tables[tablename]
 
     def __repr__(self):
         return "Interface to Postgres database"
@@ -771,14 +795,108 @@ class PostgresDatabase(PostgresBase):
             pass
         return False
 
+    # The relkinds that can hold rows, which is what a search table's family is
+    # made of: ordinary and partitioned tables, views, materialized views and
+    # foreign tables.
+    _TABLE_RELKINDS = ("r", "p", "v", "m", "f")
+
+    def _schema_relations(self, relkinds=_TABLE_RELKINDS):
+        """
+        The names of relations in the schema psycodict is using.
+
+        INPUT:
+
+        - ``relkinds`` -- the ``pg_class.relkind`` values to include; the
+          default is the kinds that can be a search table or one of its
+          companions.  Pass None for every relation, which is the namespace a
+          *name* has to be free in: indexes, sequences and tables share it.
+
+        Restricted to the current schema rather than taken from an unqualified
+        ``information_schema`` query, so that a relation of the same name in
+        another schema -- ``userdb.users``, say -- cannot stand in for one this
+        database is deciding about.
+        """
+        query = (
+            "SELECT c.relname FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = current_schema()"
+        )
+        values = None
+        if relkinds is not None:
+            query += " AND c.relkind = ANY(%s)"
+            values = [list(relkinds)]
+        cur = self._execute(SQL(query), values, silent=True)
+        return {rec[0] for rec in cur}
+
+    @property
+    def tablenames(self):
+        """
+        The names of the search tables, sorted.
+        """
+        return sorted(self.tables)
+
+    def _validate_table_name(self, name, source=None):
+        """
+        Check a search table name.
+
+        INPUT:
+
+        - ``name`` -- the proposed or recorded name
+        - ``source`` -- where it came from, if not from a caller, which also
+          means the name is one this database already has
+
+        A name psycodict is asked to create must follow the conventions in
+        full.  A name read out of ``meta_tables`` is checked for the things
+        that would make it unsafe to use -- a path separator, a ``..``
+        component, whitespace, anything that is not an identifier -- but not
+        for the conventions, which an existing database is entitled to have
+        broken long before this check existed.
+        """
+        try:
+            return validate_search_table_name(
+                name, reserved=self._reserved_names(), strict=source is None
+            )
+        except ValueError as err:
+            if source is None:
+                raise
+            raise InvalidDefinitionError("%s (from %s)" % (err, source))
+
+    def _reserved_names(self):
+        """
+        The names a search table may not have, because the database object
+        already uses them for something else.
+        """
+        return set(dir(type(self))) | set(self.__dict__)
+
     def __getitem__(self, name):
         """
         Accesses a PostgresSearchTable object by name.
         """
-        if name in self.tablenames:
-            return getattr(self, name)
-        else:
+        try:
+            return self.tables[name]
+        except KeyError:
             raise ValueError("%s is not a search table" % name)
+
+    def __getattr__(self, name):
+        """
+        Accesses a PostgresSearchTable object as an attribute.
+
+        Table objects live in ``self.tables`` rather than in the instance
+        dictionary, so that a table can never take the place of the
+        connection, the configuration or a method.  This is only reached when
+        ordinary attribute lookup has already failed, so anything the database
+        object really has wins over a table of the same name.
+        """
+        try:
+            tables = self.__dict__["tables"]
+        except KeyError:
+            # before __init__ has made the registry; without this an attribute
+            # touched during construction would recurse
+            raise AttributeError(name)
+        try:
+            return tables[name]
+        except KeyError:
+            raise AttributeError(name)
 
     def table_sizes(self):
         """
@@ -1300,7 +1418,12 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         INPUT:
 
-        - ``name`` -- the name of the table, which must include an underscore.  See existing names for consistency.
+        - ``name`` -- the name of the table: lowercase letters, digits and
+          underscores, starting with a letter, at most 63 bytes, and not ending
+          in one of the suffixes psycodict appends to a search table's own name
+          (``_counts``, ``_stats``, ``_pkey``, ``_tmp``, ``_oldN``, ``_depN``).
+          By convention it includes an underscore; see existing names for
+          consistency.
         - ``search_columns`` -- either a dictionary whose keys are valid postgres types and whose values
             are lists of column names (or just a string if only one column has the specified type);
             or a list of pairs (col, type).
@@ -1347,6 +1470,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         Anything else raises ``InvalidColumnTypeError`` before any statement
         runs.
         """
+        self._validate_table_name(name)
         if name in self.tablenames:
             raise ValueError("%s already exists" % name)
         now = time.time()
@@ -1463,9 +1587,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         new_table.restore_pkeys()
         new_table.description(table_description)
         new_table.column_description(description=col_description)
-        self.__dict__[name] = new_table
-        self.tablenames.append(name)
-        self.tablenames.sort()
+        self.tables[name] = new_table
         self._log_db_change(
             "create_table",
             tablename=name,
@@ -1519,9 +1641,154 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                         ("search", "counts", "stats")]:
                 self._execute(SQL("DROP TABLE {0}").format(Identifier(tbl)))
                 print("Dropped {0}".format(tbl))
-            self.tablenames.remove(name)
-            delattr(self, name)
+            del self.tables[name]
             self._notify_schema_change(name)  # rides this transaction
+
+    def _next_backup_number_for(self, name):
+        """
+        One past the highest backup number a table has, so that callers can
+        enumerate its existing ``_oldN`` relations.
+        """
+        number = 1
+        while any(
+            self._table_exists(physical_table_name(name, component, "_old%s" % number))
+            for component in ("search", "counts", "stats")
+        ):
+            number += 1
+        return number
+
+    def _dependent_rename_plan(self, old_name, new_name):
+        """
+        What each of a table's indexes and constraints will be called after the
+        table is renamed.
+
+        INPUT:
+
+        - ``old_name``, ``new_name`` -- the table's current and new names
+
+        OUTPUT:
+
+        ``{"index": {old: new, ...}, "constraint": {old: new, ...}}``, covering
+        every name in the current and history metadata.
+
+        Planned in one place, before anything is renamed, for two reasons.  The
+        metadata and the catalog must end up with the same spelling, and the
+        candidate -- the old name with the table's name substituted -- can be
+        longer than PostgreSQL will keep, so it goes through
+        ``derived_identifier``; computing it separately in each metadata loop
+        would risk two paths deciding differently.  And a fitted name can land
+        on one that another object already has, which has to be resolved here
+        rather than discovered halfway through the renames.
+        """
+        plan = {}
+        # An index is a pg_class relation, not a table, so pg_tables cannot see
+        # the names an index rename can collide with -- and neither can the
+        # table-shaped default here.  Every relation in the schema shares one
+        # namespace, so that is the set a new name has to be free in.
+        #
+        # A CHECK constraint is not a relation at all: pg_class has no row for
+        # it, only pg_constraint does (a UNIQUE constraint is visible through
+        # its backing index, which is why it is easy to miss).  The table's own
+        # constraints are added from there, which also covers constraints
+        # psycodict does not manage.
+        occupied = self._schema_relations(relkinds=None)
+        occupied |= set(self._list_constraints(old_name))
+
+        # Read both kinds before allocating any of them.  The reservation below
+        # has to be global: an index and a constraint can hold the same name --
+        # PostgreSQL keeps them in different catalogs -- so allocating one kind
+        # completely before looking at the other would let an index's new name
+        # take a name a constraint is keeping.
+        dependents = {}
+        for kind, meta_tables, column in (
+            ("index", ("meta_indexes", "meta_indexes_hist"), "index_name"),
+            ("constraint", ("meta_constraints", "meta_constraints_hist"), "constraint_name"),
+        ):
+            names, current = [], set()
+            for meta in meta_tables:
+                cur = self._execute(
+                    SQL("SELECT DISTINCT {0} FROM {1} WHERE table_name = %s").format(
+                        Identifier(column), Identifier(meta)
+                    ),
+                    [old_name],
+                    silent=True,
+                )
+                for rec in cur:
+                    if rec[0] not in names:
+                        names.append(rec[0])
+                    if not meta.endswith("_hist"):
+                        current.add(rec[0])
+            dependents[kind] = (names, current)
+            plan[kind] = {}
+
+        targets = {
+            (kind, name): derived_identifier(name.replace(old_name, new_name))
+            for kind, (names, _) in dependents.items()
+            for name in names
+        }
+
+        # First pass, across both kinds: the dependents that keep their name.
+        # A name that does not mention the table stays as it is -- the object
+        # does not move, and "ALTER ... RENAME TO" its own name is an error
+        # rather than a no-op -- but its metadata still follows the table.
+        # Nothing else may be given that name, including a dependent of the
+        # other kind, and including a name only the history remembers, which no
+        # catalog reserves.
+        #
+        # Two keepers may share a name: an index and a CHECK constraint are
+        # allowed to, and if they already do, neither is being renamed.
+        planned = set()
+        for kind, (names, current) in dependents.items():
+            for name in names:
+                if targets[kind, name] == name:
+                    plan[kind][name] = {"target": name, "rename_physical": False}
+                    planned.add(name)
+
+        # Second pass, across both kinds: everything that is being renamed,
+        # against the relations that exist and every name already spoken for.
+        for kind, (names, current) in dependents.items():
+            for name in names:
+                if name in plan[kind]:
+                    continue
+                candidate = targets[kind, name]
+                target, disamb = candidate, 0
+                while target in occupied or target in planned:
+                    target = derived_identifier(candidate, str(disamb))
+                    disamb += 1
+                    if disamb > 100:
+                        raise ValueError(
+                            "Cannot find a free name for the %s %s after "
+                            "renaming %s to %s" % (kind, name, old_name, new_name)
+                        )
+                plan[kind][name] = {
+                    "target": target,
+                    # only a relation that exists can be renamed; a name that
+                    # only history remembers has nothing to rename
+                    "rename_physical": name in current,
+                }
+                planned.add(target)
+
+        # No dependent that is being renamed may share its new name with
+        # anything else in the plan.  Keepers are exempt, since they are not
+        # being renamed and may legitimately already share.
+        renamed = [
+            entry["target"]
+            for entries in plan.values()
+            for name, entry in entries.items()
+            if entry["target"] != name
+        ]
+        keepers = {
+            entry["target"]
+            for entries in plan.values()
+            for name, entry in entries.items()
+            if entry["target"] == name
+        }
+        if len(set(renamed)) != len(renamed) or keepers & set(renamed):
+            raise ValueError(
+                "Renaming %s to %s would give two of its indexes or "
+                "constraints the same name" % (old_name, new_name)
+            )
+        return plan
 
     def rename_table(self, old_name, new_name):
         """
@@ -1532,8 +1799,27 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         - ``old_name`` -- the current name of the table, as a string
         - ``new_name`` -- the new name of the table, as a string
         """
-        assert old_name != new_name
-        assert new_name not in self.tablenames
+        if old_name == new_name:
+            raise ValueError("The new name is the same as the old one")
+        self._validate_table_name(new_name)
+        if new_name in self.tablenames:
+            raise ValueError("%s already exists" % new_name)
+        # Everything the rename will produce is decided and checked before any
+        # of it happens.  The dependent names have to agree between the
+        # metadata and the catalog, and every destination relation has to be a
+        # name PostgreSQL will keep -- a rename that discovered otherwise
+        # halfway through would leave the table in pieces.
+        renames = self._dependent_rename_plan(old_name, new_name)
+        for component in ("search", "counts", "stats"):
+            for lifecycle in [""] + [
+                "_tmp"
+            ] + ["_old%s" % n for n in range(1, self._next_backup_number_for(old_name))]:
+                source = physical_table_name(old_name, component, lifecycle)
+                if lifecycle and not self._table_exists(source):
+                    continue
+                check_new_table_name(
+                    physical_table_name(new_name, component, lifecycle)
+                )
         with DelayCommit(self, silence=True):
             table = self[old_name]
             # first rename indexes and constraints
@@ -1547,6 +1833,7 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 ("meta_constraints", "constraint_name", ccols),
                 ("meta_constraints_hist", "constraint_name", ccols),
             ]:
+                kind = "index" if "indexes" in meta else "constraint"
                 indexes = list(self._execute(
                     SQL("SELECT {0} FROM {1} WHERE table_name = %s").format(
                         Identifier(mname), Identifier(meta)
@@ -1554,18 +1841,32 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     [old_name],
                 ))
                 if indexes:
-                    rename_index_in_meta = SQL("UPDATE {0} SET ({1}) = ({2}) WHERE {3} = {4}")
+                    # Scoped by the table as well as by the dependent's name: a
+                    # constraint name is only unique within its own table, so
+                    # two tables can legitimately share one, and renaming this
+                    # table must not move the other table's rows.
+                    rename_index_in_meta = SQL(
+                        "UPDATE {0} SET ({1}) = ({2}) WHERE {3} = {4} AND {5} = {6}"
+                    )
                     rename_index_in_meta = rename_index_in_meta.format(
                         Identifier(meta),
                         SQL(", ").join(cols),
                         SQL(", ").join(Placeholder() * len(cols)),
                         cols[0],
                         Placeholder(),
+                        Identifier("table_name"),
+                        Placeholder(),
                     )
                     for old_index_name in indexes:
                         old_index_name = old_index_name[0]
-                        new_index_name = old_index_name.replace(old_name, new_name)
-                        self._execute(rename_index_in_meta, [new_index_name, new_name, old_index_name])
+                        planned = renames[kind][old_index_name]
+                        new_index_name = planned["target"]
+                        self._execute(
+                            rename_index_in_meta,
+                            [new_index_name, new_name, old_index_name, old_name],
+                        )
+                        if not planned["rename_physical"]:
+                            continue
                         if meta == "meta_indexes":
                             self._execute(rename_index.format(
                                 Identifier(old_index_name),
@@ -1617,14 +1918,11 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 [new_name],
             ).fetchone()
             table = self._search_table_class_(self, *tabledata)
-            self.__dict__[new_name] = table
-            # Also drop the old attribute (as drop_table does), so that
+            self.tables[new_name] = table
+            # Also drop the old name (as drop_table does), so that
             # db.<old_name> does not keep handing out a table object whose
             # postgres table no longer exists.
-            self.__dict__.pop(old_name, None)
-            self.tablenames.append(new_name)
-            self.tablenames.remove(old_name)
-            self.tablenames.sort()
+            self.tables.pop(old_name, None)
             # A rename touches both names: the old one is gone, the new one
             # appeared.  Announce both so a listener can drop the stale
             # metadata and pick up the new table (rides this transaction).
@@ -1655,12 +1953,16 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         for tablename in search_tables:
             if tablename in self.tablenames:
                 table = self[tablename]
-                searchfile = data_folder / (tablename + ".txt")
-                statsfile = data_folder / (tablename + "_stats.txt")
-                countsfile = data_folder / (tablename + "_counts.txt")
-                indexesfile = data_folder / (tablename + "_indexes.txt")
-                constraintsfile = data_folder / (tablename + "_constraints.txt")
-                metafile = data_folder / (tablename + "_meta.txt")
+                # These names are generated from the table name rather than
+                # given by the caller, so they go through safe_child_path:
+                # whatever a name in meta_tables turns out to be, the files an
+                # export writes stay in the folder it was asked for.
+                searchfile = safe_child_path(data_folder, tablename + ".txt")
+                statsfile = safe_child_path(data_folder, tablename + "_stats.txt")
+                countsfile = safe_child_path(data_folder, tablename + "_counts.txt")
+                indexesfile = safe_child_path(data_folder, tablename + "_indexes.txt")
+                constraintsfile = safe_child_path(data_folder, tablename + "_constraints.txt")
+                metafile = safe_child_path(data_folder, tablename + "_meta.txt")
                 table.copy_to(
                     searchfile=searchfile,
                     countsfile=countsfile,
@@ -1765,7 +2067,12 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     if len(rows) != 1:
                         raise RuntimeError("Expected only one row in {0}")
                     meta = dict(zip(_meta_tables_cols, rows[0]))
-                    assert meta["name"] == tablename
+                    if meta["name"] != tablename:
+                        raise ValueError(
+                            "The meta file %s describes the table %s, but its "
+                            "name says %s"
+                            % (metafile, meta["name"], tablename)
+                        )
 
                     with search_table_file.open("r") as F:
                         search_columns_pairs = self._read_header_lines(F, sep=sep)
