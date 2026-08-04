@@ -1872,6 +1872,44 @@ class PostgresTable(PostgresBase):
         to the server to truncate.
         """
         return derived_identifier(self.search_table + suffix, "_staged_label")
+    def _grant_kind_for_relation(self, table):
+        """
+        Which kind of relation one of this table's relations is.
+
+        By identity, not by suffix: a search table may itself be called
+        something ending in ``_stats`` (the LMFDB has one), and reading the
+        kind off the name would give it a stats table's privileges.
+        """
+        return {
+            self.search_table: "search",
+            self.stats.counts: "counts",
+            self.stats.stats: "stats",
+        }.get(table, "search")
+
+    def _apply_post_swap_grant_policies(self, tables, backup_suffix):
+        """
+        Give each relation the privileges of what it now is.
+
+        INPUT:
+
+        - ``tables`` -- the live names that were just swapped
+        - ``backup_suffix`` -- the suffix the relations they replaced now carry
+
+        PostgreSQL ACLs follow a relation through a rename, so a swap hands the
+        live table's privileges to the backup and the backup's to the table
+        that just went live.  Every swap therefore has to say again what each
+        relation is: a reload and a revert are the same exchange in opposite
+        directions, and an invariant that held only one way would leave a
+        reverted table with its backup's privileges.
+        """
+        for table in tables:
+            backup = table + backup_suffix
+            self._db._apply_grant_policy(table, self._grant_kind_for_relation(table))
+            self._db._apply_grant_policy(backup, "backup")
+            # The relation now live may have been built by _clone, which copies
+            # no privileges, so under a policy that grants nothing this swap can
+            # quietly take away access the live table had.
+            self._db._warn_if_access_was_lost(table, backup)
 
     def _next_backup_number(self):
         """
@@ -1913,10 +1951,11 @@ class PostgresTable(PostgresBase):
         with DelayCommit(self, silence=True):
             self._swap(tables, "", "_old" + str(backup_number))
             self._swap(tables, "_tmp", "")
-            for table in tables:
-                self._db.grant_select(table)
-                if table.endswith("_counts") or table.endswith("_stats"):
-                    self._db.grant_insert(table)
+            # Which relation is which is known here, so the policy is looked up
+            # by it rather than guessed from the name: a search table may end
+            # in _stats (the LMFDB has one), and granting it a counts table's
+            # privileges would be wrong.
+            self._apply_post_swap_grant_policies(tables, "_old" + str(backup_number))
         print(
             "Swapped temporary tables for %s into place in %s secs\nNew backup at %s"
             % (
@@ -2325,6 +2364,10 @@ class PostgresTable(PostgresBase):
 
         - ``backup_number`` -- the backup version to restore,
             or ``None`` for the most recent.
+
+        The grant policy is reapplied to both relations afterwards: PostgreSQL
+        privileges follow a relation through a rename, so without that the
+        restored table would come back with its backup's privileges.
         """
         if self._table_exists(self.search_table + "_tmp"):
             print(
@@ -2348,6 +2391,10 @@ class PostgresTable(PostgresBase):
             self._swap(tables, "", "_tmp")
             self._swap(tables, old, "")
             self._swap(tables, "_tmp", old)
+            # The exchange moved each relation's privileges to the other one,
+            # so both are told again what they are -- inside this DelayCommit,
+            # with the renames.
+            self._apply_post_swap_grant_policies(tables, old)
             self._log_db_change("reload_revert")
         print(
             "Swapped backup %s with %s"

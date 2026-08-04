@@ -53,8 +53,12 @@ def test_show_queries_sees_other_sessions(db, capsys):
         runner = threading.Thread(target=sleeper)
         runner.start()
         try:
+            # pg_stat_activity.query is NULL for a session whose query text
+            # this role may not see, so another connection running while this
+            # test does must not turn the search into a TypeError
             assert wait_until(lambda: any(
-                q[0] == pid and "pg_sleep" in q[3] for q in db._get_queries()
+                q[0] == pid and q[3] and "pg_sleep" in q[3]
+                for q in db._get_queries()
             )), "the other session's query never showed up in _get_queries"
             db.show_queries()
             out = capsys.readouterr().out

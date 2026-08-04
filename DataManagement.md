@@ -8,6 +8,23 @@ Everything here is a method on either the database object (`db`) or a search tab
 
 A note on permissions: most write methods first check `db._read_only`, and several branches of behavior depend on whether your table's statistics class has `saving` turned on (see [Statistics and counts](#statistics-and-counts)).  A bare psycodict install has `saving = False`.
 
+Permissions on the relations psycodict *creates* are a separate matter, decided by the database's grant policy (`psycodict.grants`).  The default policy grants nothing, so a new search table, its `_counts` and `_stats` companions and the meta tables are reachable only by their owner.  A deployment that wants the LMFDB's roles asks for them:
+
+```python
+from psycodict.grants import LMFDBGrantPolicy
+db = PostgresDatabase(grant_policy=LMFDBGrantPolicy())
+```
+
+which grants `SELECT` to `lmfdb` and `webserver` and `INSERT` on the counts and stats tables to `webserver`, as psycodict used to do unconditionally.  A policy names a role that must exist: by default a policy naming a role the cluster does not have raises — at connection time, rather than partway through the first thing that creates a relation — and `missing_role="skip"` (what `LMFDBGrantPolicy` uses, since development databases rarely have those roles) warns and carries on.
+
+The policy is authoritative **for the roles it names**.  Applying it revokes `SELECT`, `INSERT`, `UPDATE` and `DELETE` from those roles before granting what the policy says, so a relation psycodict creates or swaps ends up with the policy rather than with the policy plus whatever it inherited; roles the policy does not name are never touched.  That distinction matters for the default policy, which names no roles at all: it therefore revokes nothing.  A *freshly created* relation has no non-owner grants to begin with, so under the default it stays owner-only — but a relation psycodict *renames* (a backup, say) keeps the ACL it already had, and the default policy will not take it away.  `LMFDBGrantPolicy` does take it away, because it names `lmfdb` and `webserver` and gives the `backup` kind nothing.
+
+Policies are applied where psycodict creates or swaps a relation, not on connection: pointing a policy at an existing database does not retroactively change the privileges on relations that are already there.  Cleaning up historical ACLs is an administrative job.
+
+This matters most for the `_oldN` table a [reload](#reload) leaves behind: PostgreSQL carries privileges along with a rename, so the backup would otherwise stay as readable as the live table it used to be, while holding a copy of the same production data.  The `backup` relation kind decides what it gets instead — nothing, under `LMFDBGrantPolicy`.  `reload_revert` applies the same rule in the other direction, so reverting does not hand the restored table its backup's privileges.  The legacy `_oldstats` relation has its own kind, and gets read access only.
+
+The reverse is worth knowing too: a reload swaps in a clone, and PostgreSQL creates a clone with no privileges of its own, so under the default policy the replacement is reachable only by its owner even if the table it replaced was readable by an application role.  psycodict warns when a swap takes access away like this, naming the roles that lost it.  `db.grant_select` and its siblings remain, for granting something to roles you name explicitly.
+
 ## Creating tables
 
 ### `create_table`

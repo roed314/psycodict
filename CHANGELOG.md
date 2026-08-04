@@ -293,6 +293,40 @@ hardening standalone use; the highlights:
   attribute access (`db.mytable`) is unchanged. `reload_all` and `rename_table`
   raise `ValueError` where they used to `assert`.
 
+- **Table creation no longer grants privileges to hard-coded roles.** Creating
+  a search table granted `SELECT` on it to `lmfdb` and `webserver`, and
+  `SELECT`/`INSERT` on its counts and stats tables, wherever those roles
+  happened to exist; the metadata tables did the same, and a reload reapplied
+  it. That is the LMFDB's deployment rather than a fact about a PostgreSQL
+  database, so a new table holding anything at all was readable by two roles
+  the administrator may never have heard of. Privileges are now stated by a
+  `psycodict.grants.GrantPolicy`, passed as
+  `PostgresDatabase(grant_policy=...)` and applied through one helper wherever
+  psycodict creates or swaps a relation. *Migration:* the default policy grants
+  nothing; LMFDB and any other deployment that wants the old behavior passes
+  `LMFDBGrantPolicy()`. A policy that names a role the cluster does not have
+  raises by default (`LMFDBGrantPolicy` warns and skips, as before), and
+  `grant_select`, `grant_insert`, `grant_update` and `grant_delete` now require
+  their `users` argument instead of defaulting to those roles.
+- **A reload warns when it takes access away.** A reload swaps in a clone, and
+  PostgreSQL gives a clone no privileges of its own, so under the default
+  policy the replacement is reachable only by its owner even when the table it
+  replaced was readable by an application role. That is what the policy asks
+  for, but it should not be discovered by a website going dark, so psycodict
+  logs a warning naming the roles that lost access.
+- **A reload's backup table is no longer left as readable as the table it
+  replaced.** PostgreSQL carries privileges along with a rename, so the `_oldN`
+  table — a copy of the live data — inherited the live table's grants. The
+  policy is now applied to it as its own relation kind, which grants nothing
+  under `LMFDBGrantPolicy`. `reload_revert` applies the same rule, so reverting
+  a reload no longer hands the restored table its backup's privileges and the
+  backup the live table's. The legacy `_oldstats` relation has its own
+  `oldstats` kind and keeps the read-only access it always had, rather than
+  being treated as an ordinary stats table (which under `LMFDBGrantPolicy`
+  would have given the website `INSERT` on it). Note that the *default* policy
+  names no roles, so it revokes nothing: a freshly created relation has no
+  non-owner grants to begin with, but a renamed one keeps the ACL it had.
+
 ### Infrastructure
 
 - A test suite of 500+ tests and a continuous-integration workflow covering the
