@@ -105,6 +105,7 @@ MODULES = [
     "psycodict.utils",
     "psycodict.encoding",
     "psycodict.base",
+    "psycodict.validation",
     "psycodict.searchtable",
     "psycodict.statstable",
     "psycodict.table",

@@ -26,9 +26,9 @@ from .base import PostgresBase, _meta_table_name
 from .utils import DelayCommit, IdentifierWrapper, LockError
 from .base import (
     _meta_cols_types_jsonb_idx,
-    column_type_sql,
     jsonb_idx,
 )
+from .validation import column_type_sql
 from .statstable import PostgresStatsTable
 
 

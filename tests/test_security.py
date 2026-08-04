@@ -22,7 +22,7 @@ import pytest
 
 from psycopg.sql import SQL
 
-from psycodict.base import (
+from psycodict.validation import (
     InvalidColumnTypeError,
     types_whitelist,
     validate_column_type,

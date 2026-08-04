@@ -1119,7 +1119,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         A type has to be interpolated into the ``CREATE TABLE`` statement as
         SQL text, since PostgreSQL has no placeholder for a type, so types are
-        restricted to the ones ``psycodict.base.validate_column_type`` accepts:
+        restricted to the ones ``psycodict.validation.validate_column_type``
+        accepts:
         the fixed types above, arrays of them, and lengths, precisions and
         collations (``numeric(10, 2)``, ``varchar(16)``, ``text COLLATE "C"``).
         Anything else raises ``InvalidColumnTypeError`` before any statement

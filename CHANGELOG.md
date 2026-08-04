@@ -171,7 +171,8 @@ hardening standalone use; the highlights:
   and executed. `create_table`, `create_table_like`, `add_column` and the
   column types read from the header of a reloaded data file
   (`reload(adjust_schema=True)`, `reload_all(adjust_schema=True)`) were all
-  affected. Types are now validated by `psycodict.base.validate_column_type`,
+  affected. Types are now validated by
+  `psycodict.validation.validate_column_type`,
   which matches the complete string and returns the spelling that callers must
   emit; the character-type grammar it replaces was also malformed, so
   `varchar(N)`, `char(N)` and `character varying(N)` are now described
@@ -185,7 +186,9 @@ hardening standalone use; the highlights:
   without a field restriction or with one that reaches `SECOND`
   (`interval day to second(6)`, not `interval day(3)`). An invalid type raises
   `InvalidColumnTypeError`, a subclass of both `ValueError` and the
-  `RuntimeError` raised before.
+  `RuntimeError` raised before. What psycodict checks before putting it into a
+  statement now lives in its own module, `psycodict.validation`; the names are
+  re-exported from `psycodict.base`, where they used to be.
 
 ### Infrastructure
 
