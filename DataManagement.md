@@ -108,7 +108,32 @@ These mutate the live table directly.  They are convenient for small edits; for 
  * **`update(query, changes, resort=False, restat=True)`** — a plain SQL `UPDATE` of every row matching `query`; `changes` maps column names to constants.
  * **`delete(query, restat=True)`** — deletes every row matching `query` and decrements `total`.
 
-**Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call; otherwise they are simply marked invalid.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
+**Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call; otherwise they are simply marked invalid.
+
+`stats_valid` is enforced rather than merely recorded: while it is false, a
+cached nonempty-query count, distinct count, minimum, maximum or sum reports a
+miss, and the method computes the answer instead of returning the stored one.
+The empty-query `total` is the exception, since it is maintained on every write
+and so stays exact.
+
+`column_counts`, `numstats` and `null_counts` are the other exception, and a
+caveat worth knowing.  The line is what a cache miss costs: the counts above
+fall back to a single statement about the rows in question, while these fall
+back to rebuilding a whole statistics family, or to one full count per search
+column.  Making them miss while the table is invalid would rebuild on every
+call and never converge, since only `refresh_stats()` restores the flag, so
+they read what is recorded.  A value recorded before an unrefreshed write is
+therefore still reported by them; run `refresh_stats()` after a write you did
+not `restat`.  The flag goes back to true only in `refresh_stats()`, inside
+the transaction that rebuilt the caches, so a refresh that fails part-way leaves
+the table marked invalid rather than claiming a cache it does not have.
+Refreshing a `_tmp` copy does not validate the live table.
+
+Bulk paths also run PostgreSQL's own `ANALYZE`, which is a different thing from
+psycodict's statistics: a freshly loaded relation has no planner statistics
+until autovacuum reaches it.  Replacement tables are analyzed while still named
+`_tmp`, before the swap, since the catalog entry follows the relation through
+the rename; `copy_from` analyzes the live table it loaded into.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
 
 ### Resorting is disabled
 

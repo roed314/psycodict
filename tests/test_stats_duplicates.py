@@ -39,6 +39,11 @@ def saving_table(table_factory):
     table = table_factory()
     table.insert_many([sample_row(i) for i in range(200)])
     table.stats.saving = True
+    # insert_many invalidates the statistics, and a cached count may not be
+    # used while they are invalid.  Nothing is cached yet and the total is
+    # maintained by the insert, so the caches do agree with the data: say so,
+    # which is the state these tests are about.
+    table._restore_stats()
     return table
 
 
@@ -265,6 +270,10 @@ def constrained_table(table_factory):
         [{"n": i, "a": i % 3, "z": i % 2, "label": "l%d" % i} for i in range(30)]
     )
     table.stats.saving = True
+    # As in ``saving_table``: nothing is cached yet, so the (empty) caches do
+    # agree with the data, and these tests are about what add_numstats writes
+    # rather than about invalidation.
+    table._restore_stats()
     return table
 
 

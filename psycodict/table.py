@@ -1182,6 +1182,20 @@ class PostgresTable(PostgresBase):
             self._execute(updater, [self.search_table], silent=True)
             self._stats_valid = False
 
+    def _restore_stats(self):
+        """
+        Record that the cached counts and statistics agree with the live data.
+
+        The counterpart of :meth:`_break_stats`, and the only way the flag goes
+        back to true.  Call it from inside the transaction that rebuilt or
+        loaded the caches, so that a failure part-way through leaves the table
+        marked invalid rather than claiming a cache it does not have.
+        """
+        if not self._stats_valid:
+            updater = SQL("UPDATE meta_tables SET stats_valid = true WHERE name = %s")
+            self._execute(updater, [self.search_table], silent=True)
+            self._stats_valid = True
+
     def _break_order(self):
         """
         This function should be called when the id ordering is invalidated by an insertion or update.
@@ -1943,6 +1957,24 @@ class PostgresTable(PostgresBase):
                 )
         return backup_number
 
+    def _analyze(self, tables, suffix=""):
+        """
+        Refresh PostgreSQL's planner statistics for the given relations.
+
+        These are the server's own statistics, not the counts and stats
+        psycodict maintains: a relation that has just been bulk loaded has none
+        until autovacuum reaches it, and until then the planner costs queries
+        against it as though it were tiny.
+
+        Run on a ``_tmp`` copy before the swap rather than on the live table
+        after it, so that no query is served by an unanalyzed relation; the
+        catalog entry follows the relation through the rename.
+        """
+        for table in tables:
+            self._execute(
+                SQL("ANALYZE {0}").format(Identifier(table + suffix)), silent=True
+            )
+
     def _swap_in_tmp(self, tables):
         """
         Helper function for ``reload``: appends _old{n} to the names of tables/indexes/pkeys
@@ -1953,6 +1985,10 @@ class PostgresTable(PostgresBase):
         - ``tables`` -- a list of tables to rename (e.g. self.search_table, self.stats.counts, self.stats.stats)
         """
         now = time.time()
+        # Before the swap, and outside its transaction: the _tmp relations are
+        # complete by now, and analyzing them here keeps the window in which
+        # the live names are locked as short as it was.
+        self._analyze(tables, "_tmp")
         backup_number = self._next_backup_number()
         with DelayCommit(self, silence=True):
             self._swap(tables, "", "_old" + str(backup_number))
@@ -2937,6 +2973,10 @@ class PostgresTable(PostgresBase):
                 if reindex:
                     self.restore_indexes()
                 self._break_stats()
+                # A bulk COPY can change the table's size and distribution
+                # enough that the planner's statistics no longer describe it,
+                # and the stats refresh below plans against them.
+                self._analyze([self.search_table])
                 if self.stats.saving and restat:
                     self.stats.refresh_stats(total=False)
                 self.stats._update_total(search_count)

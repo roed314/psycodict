@@ -366,6 +366,42 @@ hardening standalone use; the highlights:
   unknown one; and a repeatable `choice` sample uses a local
   `random.Random(seed)` rather than reseeding the process-wide generator.
 
+- **`stats_valid` is enforced, not just recorded.** Write paths cleared the
+  flag but read paths ignored it, so a count cached before a `restat=False`
+  write kept being served afterwards -- verified: a query counted at 67, then
+  every matching row changed, still answered 67. Every lookup that would serve
+  a cached answer now goes through one predicate and reports a miss while the
+  flag is false: `quick_count`, `quick_count_distinct` and `_quick_statistic`,
+  which is what makes `count`, `max`, `min` and `sum` compute the answer
+  instead of returning a recorded one. The line is whether a miss costs one
+  bounded query or a rebuild, so these are deliberately not gated: the
+  empty-query `total`, maintained on every write and so exact; the `_status` /
+  `status` / `extra_counts` inventory, which is how `refresh_stats` discovers
+  what to recompute; `_has_stats` / `_has_numstats`, which decide whether a
+  whole statistics family needs computing; and `null_counts`, whose fallback
+  is one full count *per search column*. Gating that last group made
+  `column_counts`, `numstats` and `null_counts` rebuild on every call with
+  nothing to converge on, since only `refresh_stats` restores the flag --
+  measured on the LMFDB, four minutes of downstream suite became over
+  forty-five. **The gap that leaves:** `column_counts`, `numstats` and
+  `null_counts` can still report a value recorded before an unrefreshed
+  write.
+  Closing it needs freshness per statistic rather than one flag per table,
+  which is a metadata format change; `refresh_stats()` is the remedy
+  meanwhile. A suffixed (`_tmp`, `_oldN`) table is not gated by the live
+  table's flag, since it carries its own caches. The flag is restored only by
+  `refresh_stats()`, inside the transaction that rebuilt the caches, so a
+  failed refresh leaves the table invalid; refreshing a `_tmp` copy does not
+  validate the live table.
+- **Bulk paths run `ANALYZE`.** A relation that has just been bulk loaded has
+  no planner statistics until autovacuum reaches it, so queries against it are
+  costed as though it were tiny. Replacement tables are analyzed while still
+  named `_tmp` -- before the swap, and outside its transaction, since the
+  catalog entry follows the relation through the rename -- which covers
+  `reload`, `rewrite`, non-inplace `update_from_file` and staged commits
+  through the one helper they share; `copy_from` analyzes the live table it
+  loaded into.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores
