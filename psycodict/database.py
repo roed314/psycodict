@@ -19,6 +19,8 @@ import time
 import traceback
 from collections import defaultdict, Counter
 
+from typing import NamedTuple
+
 from psycopg import connect, DatabaseError
 from psycopg.errors import UndefinedTable
 from psycopg.sql import SQL, Identifier, Placeholder
@@ -98,6 +100,18 @@ class NumericLoader(Loader):
         return numeric_converter(bytes(data).decode())
 
 
+class _ConnectionCapabilities(NamedTuple):
+    """
+    What a session is allowed to do: the answers ``_detect_capabilities`` reads
+    from one connection, kept together so that they are adopted together.
+    """
+
+    read_only: bool
+    super_user: bool
+    read_and_write_knowls: bool
+    read_and_write_userdb: bool
+
+
 def setup_connection(conn):
     """
     Prepare a fresh psycopg connection for psycodict: set the client
@@ -160,7 +174,20 @@ class PostgresDatabase(PostgresBase):
       MetadataFormats.md).  Without it, a database using an older but
       compatible metadata format connects with a warning and operates at the
       older format.
-    - ``**kwargs`` -- passed on to psycopg's connect method
+    - ``session_settings`` -- a dictionary of PostgreSQL session settings
+      (``statement_timeout``, ``lock_timeout``,
+      ``idle_in_transaction_session_timeout``, ``application_name``) applied to
+      the main database connection and to every replacement main connection.
+      Defaults to a 25 second statement timeout when connecting as
+      ``webserver``, and to nothing otherwise.  A notification listener's
+      connection deliberately does not inherit them: it exists to wait, and a
+      statement timeout on it would be more likely to be wrong than right.  It
+      does inherit the connection overrides below, so that it reaches the same
+      server and database as the sender.
+    - ``**kwargs`` -- passed on to psycopg's connect method.  These override the
+      configured options for every connection this database opens, so TLS
+      settings, an alternate host or database, and timeouts given here survive
+      a reconnect.
 
     ATTRIBUTES:
 
@@ -192,38 +219,287 @@ class PostgresDatabase(PostgresBase):
     # Override the following to use a different class for search tables
     _search_table_class_ = PostgresSearchTable
 
-    def _new_connection(self, **kwargs):
+    # The session settings psycodict will apply, and what it applies to a
+    # webserver connection when the caller asks for nothing else.  Settings are
+    # applied with set_config, which takes the name and the value as bound
+    # parameters; the closed set here is what keeps a caller from setting
+    # something unrelated through the same door.
+    _allowed_session_settings = (
+        "statement_timeout",
+        "lock_timeout",
+        "idle_in_transaction_session_timeout",
+        "application_name",
+    )
+    _webserver_session_settings = {"statement_timeout": "25s"}
+
+    def _resolve_session_settings(self, session_settings):
         """
-        Create a new connection to the postgres database.
+        The session settings to apply to every connection of this database.
+
+        INPUT:
+
+        - ``session_settings`` -- a dictionary of PostgreSQL settings, or None
+          to take the default for the connecting role
+
+        A connection as ``webserver`` has always been given a 25 second
+        statement timeout; that is now the default rather than a special case
+        applied once, so it survives a reconnect and can be overridden.  The
+        settings apply to the main connection and its replacements, not to a
+        listener's separate connection.
+        """
+        if session_settings is None:
+            user = self._connection_options().get("user")
+            session_settings = (
+                self._webserver_session_settings if user == "webserver" else {}
+            )
+        unknown = set(session_settings) - set(self._allowed_session_settings)
+        if unknown:
+            raise ValueError(
+                "psycodict will not set the session setting(s) %s; it applies "
+                "%s" % (", ".join(sorted(unknown)),
+                        ", ".join(self._allowed_session_settings))
+            )
+        return dict(session_settings)
+
+    def _connection_options(self):
+        """
+        The options every connection this database opens is made with.
+
+        The configured ``postgresql`` options, overridden by the keyword
+        arguments the constructor was given.  There is one of these rather than
+        a ``_new_connection(**kwargs)`` because the overrides carry the
+        connection's security: TLS mode and certificates, the host and database
+        actually connected to, libpq ``options``, timeouts.  A reconnect that
+        rebuilt the options without them would come back on a connection weaker
+        than the one it replaced -- or to a different server.
         """
         options = dict(self.config.options["postgresql"])
-        # overrides the options passed as keyword arguments
-        for key, value in kwargs.items():
-            options[key] = value
-        self._user = options["user"]
+        options.update(self._connect_kwargs)
+        return options
+
+    def _new_connection(self):
+        """
+        Open a connection with this database's options, and configure it.
+
+        Every connection the database makes -- the first one and every
+        replacement -- goes through here, so they are made alike.
+        """
+        options = self._connection_options()
         logging.info(
             "Connecting to PostgresSQL server as: user=%s host=%s port=%s dbname=%s..."
-            % (options["user"], options["host"], options["port"], options["dbname"])
+            % (
+                options.get("user"),
+                options.get("host"),
+                options.get("port"),
+                options.get("dbname"),
+            )
         )
         connection = connect(**options)
         logging.info("Done!\n connection = %s" % connection)
+        try:
+            self._configure_session(connection)
+        except Exception:
+            # The caller never sees this connection, so nothing else can close
+            # it; leaving it to the garbage collector holds a server slot for
+            # as long as the traceback keeps the frame alive.
+            try:
+                connection.close()
+            except Exception:
+                logging.info(
+                    "Could not close a connection that failed during setup",
+                    exc_info=True,
+                )
+            raise
+        return connection
+
+    def _configure_session(self, conn):
+        """
+        Apply psycodict's per-session setup to a fresh connection.
+
+        Everything a session needs beyond the connection itself: the type
+        adapters, and the session settings (statement, lock and
+        idle-in-transaction timeouts) that protect the server from this
+        connection.  A replacement connection that skipped this would be a
+        connection without those protections.
+
+        This is for the main connection and its replacements.  A notification
+        listener opens its own connection and does not come through here.
+
+        Runs directly on ``conn`` rather than through ``_execute``, because it
+        is called while recovering from a failure in ``_execute``.
+        """
         # The following function controls how Python classes are converted to
         # strings for passing to Postgres, and how the results are decoded upon
         # extraction from the database.
         # Note that it has some global effects, since register_adapter
         # is not limited to just one connection
-        setup_connection(connection)
-        return connection
+        setup_connection(conn)
+        for name, value in self._session_settings.items():
+            # set_config takes both as bound values, so nothing is interpolated
+            conn.execute("SELECT set_config(%s, %s, false)", [name, str(value)])
+        conn.commit()
+
+    def _detect_capabilities(self, conn):
+        """
+        What a connection is allowed to do, read from the server.
+
+        INPUT:
+
+        - ``conn`` -- the connection to ask about, which may be a candidate
+          this database has not adopted
+
+        OUTPUT:
+
+        A :class:`_ConnectionCapabilities`.  Nothing is written to ``self``:
+        the answers are only about ``conn``, and a candidate that fails
+        halfway through must not leave this object describing a session it
+        never adopted.  ``_apply_capabilities`` is the one place they land.
+
+        Called for the initial connection and again for every replacement: a
+        reconnect can reach a standby, or a role whose grants have changed, and
+        the previous session's answers would then be wrong in the unsafe
+        direction.  Like ``_configure_session``, this runs directly on ``conn``.
+        """
+        user = conn.info.user
+
+        def query(sql, args):
+            return conn.execute(sql, args).fetchall()
+
+        if query("SELECT pg_is_in_recovery()", [])[0][0]:
+            read_only = True
+        else:
+            # Check if there is a table where we can insert/update
+            privileges = ["INSERT", "UPDATE"]
+            rows = query(
+                "SELECT count(*) FROM information_schema.role_table_grants "
+                "WHERE grantee = %s AND table_schema = %s "
+                "AND privilege_type IN (" + ",".join(["%s"] * len(privileges)) + ")",
+                [user, "public"] + privileges,
+            )
+            read_only = rows[0][0] == 0
+
+        super_user = query("SELECT current_setting('is_superuser')", [])[0][0] == "on"
+
+        if read_only:
+            read_and_write_knowls = False
+            read_and_write_userdb = False
+        elif super_user:
+            read_and_write_knowls = True
+            read_and_write_userdb = True
+        else:
+            privileges = ["INSERT", "SELECT", "UPDATE"]
+            knowls_tables = ["kwl_knowls"]
+            rows = sorted(query(
+                "SELECT table_name, privilege_type "
+                "FROM information_schema.role_table_grants "
+                "WHERE grantee = %s AND table_name IN ("
+                + ",".join(["%s"] * len(knowls_tables))
+                + ") AND privilege_type IN ("
+                + ",".join(["%s"] * len(privileges))
+                + ")",
+                [user] + knowls_tables + privileges,
+            ))
+            read_and_write_knowls = rows == sorted(
+                [(table, priv) for table in knowls_tables for priv in privileges]
+            )
+
+            rows = sorted(query(
+                "SELECT privilege_type FROM information_schema.role_table_grants "
+                "WHERE grantee = %s AND table_schema = %s "
+                "AND table_name = %s AND privilege_type IN ("
+                + ",".join(["%s"] * len(privileges))
+                + ")",
+                [user, "userdb", "users"] + privileges,
+            ))
+            read_and_write_userdb = rows == sorted([(priv,) for priv in privileges])
+        conn.commit()
+
+        logging.info("User: %s", user)
+        logging.info("Read only: %s", read_only)
+        logging.info("Super user: %s", super_user)
+        logging.info("Read/write to userdb: %s", read_and_write_userdb)
+        logging.info("Read/write to knowls: %s", read_and_write_knowls)
+        return _ConnectionCapabilities(
+            read_only, super_user, read_and_write_knowls, read_and_write_userdb
+        )
+
+    def _apply_capabilities(self, capabilities):
+        """
+        Adopt a capability snapshot.
+
+        The only place the four capability attributes are written, so that they
+        change together or not at all.
+        """
+        self._read_only = capabilities.read_only
+        self._super_user = capabilities.super_user
+        self._read_and_write_knowls = capabilities.read_and_write_knowls
+        self._read_and_write_userdb = capabilities.read_and_write_userdb
+
+    def _verify_identity(self, conn):
+        """
+        Check that a replacement connection reached the same place as the one
+        it replaces.
+
+        The database and the authenticated role are what psycodict's cached
+        view of the schema, and every permission decision made from it, are
+        about, so a replacement that reaches a different database or
+        authenticates as a different role is refused.
+
+        That is the whole of the check: it compares the database name and the
+        role name, and two different clusters can agree on both.  It is not a
+        proof that the replacement reached the same server -- the host is
+        deliberately not compared, since a failover to a standby is a
+        legitimate way for it to change -- and it does not detect every DNS or
+        connection-service redirection.
+        """
+        found = (conn.info.dbname, conn.info.user)
+        if found != self._identity:
+            raise RuntimeError(
+                "Refusing to reconnect: expected to reach database %s as %s, "
+                "but the new connection reached database %s as %s"
+                % (self._identity + found)
+            )
 
     def reset_connection(self):
         """
-        Resets the connection
+        Replace the connection, and everything that was set up on it.
+
+        The replacement is made with the same options, configured with the same
+        session settings, and checked to have reached the same database as the
+        same role; only then does it replace the old one on this object and on
+        every table registered with it.  Capability flags are recomputed from
+        it, since they describe the session and not the object.
         """
         logging.info("Connection broken (status %s); resetting...", self.conn.closed)
-        conn = self._new_connection()
-        # Note that self is the first entry in self._objects
+        old = self.conn
+        candidate = self._new_connection()
+        try:
+            self._verify_identity(candidate)
+            capabilities = self._detect_capabilities(candidate)
+        except Exception:
+            # Nothing has been adopted: the old connection, the registered
+            # objects and the capability flags are all as they were.
+            candidate.close()
+            raise
+
+        # The candidate has passed everything, so it is adopted here -- the
+        # connection and the capabilities together, before any hook runs, so
+        # that a hook sees a consistent object.  Note that self is the first
+        # entry in self._objects.
         for obj in self._objects:
-            obj.conn = conn
+            obj.conn = candidate
+        self._apply_capabilities(capabilities)
+        try:
+            for obj in tuple(self._objects):
+                obj._connection_reset()
+        finally:
+            if old is not None and not old.closed:
+                try:
+                    old.close()
+                except Exception:
+                    logging.info(
+                        "Could not close the replaced connection", exc_info=True
+                    )
 
     def _register_object(self, obj):
         """
@@ -232,7 +508,8 @@ class PostgresDatabase(PostgresBase):
         obj.conn = self.conn
         self._objects.append(obj)
 
-    def __init__(self, config=None, secretsfile=None, create=False, upgrade=False, **kwargs):
+    def __init__(self, config=None, secretsfile=None, create=False, upgrade=False,
+                 session_settings=None, **kwargs):
         if config is None:
             from .config import Configuration
             config = Configuration()
@@ -246,10 +523,12 @@ class PostgresDatabase(PostgresBase):
         # listener() opens (otherwise it could subscribe on a different server
         # or database than the sender writes to).
         self._connect_kwargs = dict(kwargs)
-        self.conn = self._new_connection(**kwargs)
+        self._session_settings = self._resolve_session_settings(session_settings)
+        self.conn = self._new_connection()
+        self._user = self.conn.info.user
+        # What a replacement connection has to reach to be adopted.
+        self._identity = (self.conn.info.dbname, self.conn.info.user)
         PostgresBase.__init__(self, "db_all", self)
-        if self._user == "webserver":
-            self._execute(SQL("SET SESSION statement_timeout = '25s'"))
 
         if create:
             # Create any missing metadata tables before the read-only detection
@@ -263,69 +542,10 @@ class PostgresDatabase(PostgresBase):
             # format (and without the older-format warning) in one call.
             self.upgrade_metadata()
 
-        if self._execute(SQL("SELECT pg_is_in_recovery()")).fetchone()[0]:
-            self._read_only = True
-        else:
-            # Check if there is a table where we can insert/update
-            privileges = ["INSERT", "UPDATE"]
-            cur = self._execute(
-                SQL(
-                    "SELECT count(*) FROM information_schema.role_table_grants "
-                    + "WHERE grantee = %s AND table_schema = %s "
-                    + "AND privilege_type IN ("
-                    + ",".join(["%s"] * len(privileges))
-                    + ")"
-                ),
-                [self._user, "public"] + privileges,
-            )
-            self._read_only = cur.fetchone()[0] == 0
-
-        self._super_user = (self._execute(SQL("SELECT current_setting('is_superuser')")).fetchone()[0] == "on")
-
-        if self._read_only:
-            self._read_and_write_knowls = False
-            self._read_and_write_userdb = False
-        elif self._super_user and not self._read_only:
-            self._read_and_write_knowls = True
-            self._read_and_write_userdb = True
-        else:
-            privileges = ["INSERT", "SELECT", "UPDATE"]
-            knowls_tables = ["kwl_knowls"]
-            cur = sorted(self._execute(
-                SQL(
-                    "SELECT table_name, privilege_type "
-                    + "FROM information_schema.role_table_grants "
-                    + "WHERE grantee = %s AND table_name IN ("
-                    + ",".join(["%s"] * len(knowls_tables))
-                    + ") AND privilege_type IN ("
-                    + ",".join(["%s"] * len(privileges))
-                    + ")"
-                ),
-                [self._user] + knowls_tables + privileges,
-            ))
-            #            print cur
-            #            print sorted([(table, priv) for table in knowls_tables for priv in privileges])
-            self._read_and_write_knowls = cur == sorted(
-                [(table, priv) for table in knowls_tables for priv in privileges]
-            )
-
-            cur = sorted(self._execute(
-                SQL(
-                    "SELECT privilege_type FROM information_schema.role_table_grants "
-                    + "WHERE grantee = %s AND table_schema = %s "
-                    + "AND table_name=%s AND privilege_type IN ("
-                    + ",".join(["%s"] * len(privileges))
-                    + ")"
-                ),
-                [self._user, "userdb", "users"] + privileges,
-            ))
-            self._read_and_write_userdb = cur == sorted([(priv,) for priv in privileges])
-
-        logging.info("User: %s", self._user)
-        logging.info("Read only: %s", self._read_only)
-        logging.info("Super user: %s", self._super_user)
-        logging.info("Read/write to userdb: %s", self._read_and_write_userdb)
-        logging.info("Read/write to knowls: %s", self._read_and_write_knowls)
+        # After create/upgrade: the read-only detection below concludes
+        # read-only when it can see no table it may write to, which a database
+        # whose meta tables have just been bootstrapped now has.
+        self._apply_capabilities(self._detect_capabilities(self.conn))
 
         # Refuse to run against a database that still uses the removed
         # search/extras table split

@@ -234,6 +234,29 @@ hardening standalone use; the highlights:
   gone. These rules live in `psycodict.validation`, next to the column-type
   grammar; `psycodict.base` no longer holds any of them.
 
+- **A reconnect reproduces the connection it replaces.** `reset_connection`
+  rebuilt the connection from the configuration alone, dropping the overrides
+  passed to `PostgresDatabase(...)` — TLS mode and certificates, an alternate
+  host, port, database or user, libpq `options`, connect and keepalive
+  timeouts. A connection that dropped could come back weaker than the one it
+  replaced, or somewhere else entirely. Options now come from one place
+  (`_connection_options`), used for the first connection and every replacement;
+  session setup moved into `_configure_session`, so the statement timeout and
+  friends are reapplied rather than lost with the session they were set on; and
+  a replacement is checked to have reached the same database as the same role,
+  with the read-only, superuser, knowls and userdb capability flags recomputed
+  from it instead of carried over. Retry behavior is unchanged: a standalone
+  statement is retried once, and a statement inside `DelayCommit` still raises
+  rather than replaying a transaction whose earlier statements are gone.
+- **`PostgresDatabase(session_settings=...)`** applies `statement_timeout`,
+  `lock_timeout`, `idle_in_transaction_session_timeout` or `application_name`
+  to the main connection and to every replacement main connection. The 25
+  second statement timeout for the `webserver` role is now the default value of
+  this setting rather than a one-off `SET` in the constructor. A notification
+  listener's connection deliberately does not inherit them — it exists to
+  wait — though it does inherit the connection overrides that decide which
+  server and database it reaches.
+
 ### Infrastructure
 
 - A test suite of 500+ tests and a continuous-integration workflow covering the

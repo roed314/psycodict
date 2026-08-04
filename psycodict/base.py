@@ -244,6 +244,25 @@ class PostgresBase():
         shandler.setFormatter(formatter)
         l.addHandler(shandler)
 
+    def _connection_reset(self):
+        """
+        Refresh state this object derived from the database session.
+
+        Called on every registered object after a replacement connection has
+        been verified and adopted, together with the capability snapshot read
+        from it: by the time this runs, ``self.conn`` is the replacement and
+        ``self._db``'s capability accessors describe it, so an override can
+        simply read them.
+
+        A no-op here.  It exists for objects that cache something a new session
+        can invalidate -- whether the connected role may write to a particular
+        table, say, which changes if a reconnect reaches a standby or a role
+        whose grants have changed.  An override that cannot confirm such a
+        permission should fail closed rather than leave the old answer in
+        place, and should use ``self.conn`` directly rather than ``_execute``,
+        which is the path being recovered from.
+        """
+
     def _mogrify(self, query, values):
         """
         Render a query with values interpolated, for logging and error messages.
