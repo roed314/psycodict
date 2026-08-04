@@ -31,277 +31,25 @@ from psycopg.sql import SQL, Identifier, Placeholder, Literal, Composable
 
 from .encoding import Json
 from .utils import reraise, DelayCommit, QueryLogFilter
-
-
-# This dictionary is used when creating new tables
-# The value associated to each type is the typlen from the pg_type table
-# Reverse sorting by this typlen improves space efficiency
-# due to postgres' alignment requirements
-number_types = {
-    "int2": 2,
-    "smallint": 2,
-    "smallserial": 2,
-    "serial2": 2,
-    "int4": 4,
-    "int": 4,
-    "integer": 4,
-    "serial": 4,
-    "serial4": 4,
-    "int8": 8,
-    "bigint": 8,
-    "bigserial": 8,
-    "serial8": 8,
-    "numeric": -1,
-    "decimal": -1,
-    "float4": 4,
-    "real": 4,
-    "float8": 8,
-    "double precision": 8,
-}
-types_whitelist = {
-    "boolean": 1,
-    "bool": 1,
-    "text": -1,
-    "char": 1,
-    "character": 1,
-    "character varying": -1,
-    "varchar": -1,
-    "json": -1,
-    "jsonb": -1,
-    "xml": -1,
-    "date": 4,
-    "interval": 16,
-    "time": 8,
-    "time without time zone": 8,
-    "time with time zone": 12,
-    "timetz": 12,
-    "timestamp": 8,
-    "timestamp without time zone": 8,
-    "timestamp with time zone": 8,
-    "timestamptz": 8,
-    "bytea": -1,
-    "bit": -1,
-    "bit varying": -1,
-    "varbit": -1,
-    "point": 16,
-    "line": 24,
-    "lseg": 32,
-    "path": -1,
-    "box": 32,
-    "polygon": -1,
-    "circle": 24,
-    "tsquery": -1,
-    "tsvector": -1,
-    "txid_snapshot": -1,
-    "uuid": 16,
-    "cidr": -1,
-    "inet": -1,
-    "macaddr": 6,
-    "money": 8,
-    "pg_lsn": 8,
-}
-types_whitelist.update(number_types)
-# add arrays
-for elt in list(types_whitelist):
-    types_whitelist[elt + "[]"] = -1
-
-
-# Types that carry a length, a precision or a collation cannot be listed
-# exhaustively, so they are described by a grammar.  Every pattern below is
-# matched with fullmatch(): a type is accepted only if the *whole* string is a
-# type, so a valid prefix such as "text" cannot carry a suffix of arbitrary SQL
-# into the DDL these types are interpolated into.
-#
-# Keywords are matched case-insensitively through scoped (?i:...) groups rather
-# than by lowercasing the input, because a collation name is a quoted
-# identifier and therefore case-sensitive: "C" is a collation, "c" is not.
-
-# A collation name, as it appears inside the double quotes of a COLLATE clause.
-# Deliberately permissive about which collations exist -- "C", "POSIX",
-# "en_US.utf8", "C.UTF-8", "und-x-icu" and every other ICU name are all real,
-# and psycodict has no business deciding which a server has -- but restricted
-# to characters that cannot end the quoted name early.
-_COLLATION_NAME = r"[A-Za-z0-9][A-Za-z0-9_.@+-]*"
-
-# A declaration is read in layers rather than by one regular expression per
-# spelling: an optional COLLATE clause comes off the end, then the array
-# suffixes, and what is left is a scalar type matched below.  That is the order
-# PostgreSQL writes them in -- the collation follows the complete type,
-# including its array brackets -- and it means a length, an array and a
-# collation compose without a pattern for every combination.
-_COLLATE_CLAUSE = re.compile(
-    r'(?P<rest>.*\S)\s+(?P<clause>(?i:collate)\s+"' + _COLLATION_NAME + r'")',
-    re.DOTALL,
+from .validation import (
+    InvalidDefinitionError,
+    check_new_table_name,
+    derived_identifier,
+    validate_constraint_definition,
+    validate_index_definition,
 )
-_ARRAY_SUFFIXES = re.compile(r"(?:\s*\[\s*\])+$")
-
-# The scalar families a collation may be applied to.  PostgreSQL rejects
-# COLLATE on anything else, so accepting it here would only produce DDL the
-# server refuses.
-_COLLATABLE_SCALAR = re.compile(
-    r"(?i:text|character\s+varying|varchar|character|char)(?:\s*\([1-9][0-9]*\))?"
+# What psycodict validates before putting it into a statement lives in one
+# module.  These names are re-exported here because base.py is where the rest
+# of psycodict, and anything downstream, has always imported them from.
+from .validation import (  # noqa: F401
+    InvalidColumnTypeError,
+    column_type_sql,
+    number_types,
+    param_types_whitelist,
+    types_whitelist,
+    validate_column_type,
 )
 
-# Interval fields split by whether they can carry a precision: PostgreSQL's
-# interval precision is a *fractional seconds* precision, so a field
-# restriction that stops short of SECOND cannot have one.
-_INTERVAL_FIELDS_WITHOUT_SECOND = (
-    r"year\s+to\s+month|day\s+to\s+hour|day\s+to\s+minute|hour\s+to\s+minute"
-    r"|year|month|day|hour|minute"
-)
-_INTERVAL_FIELDS_WITH_SECOND = (
-    r"day\s+to\s+second|hour\s+to\s+second|minute\s+to\s+second|second"
-)
-
-param_types_whitelist = {
-    # the char family with a length; the bare spellings are fixed types
-    r"(?i:character\s+varying|varchar|character|char)\s*\([1-9][0-9]*\)": -1,
-    # bit strings, which unlike the char family require a length here
-    r"(?i:bit\s+varying|varbit|bit)\s*\([1-9][0-9]*\)": -1,
-    # interval: a precision alone, a field restriction alone, or a field
-    # restriction reaching SECOND together with a precision
-    r"(?i:interval)(?:"
-    r"\s*\([0-6]\)"
-    r"|\s+(?i:" + _INTERVAL_FIELDS_WITHOUT_SECOND + r")"
-    r"|\s+(?i:" + _INTERVAL_FIELDS_WITH_SECOND + r")(?:\s*\([0-6]\))?"
-    r")?": 16,
-    r"(?i:timestamp)\s*\([0-6]\)(?:\s+(?i:with|without)\s+(?i:time\s+zone))?": 8,
-    # PostgreSQL caps time precision at 6 but only warns above it; the wider
-    # range here is the one psycodict has always accepted.
-    r"(?i:time)\s*\((?:[0-9]|10)\)(?:\s+(?i:without\s+time\s+zone))?": 8,
-    r"(?i:time)\s*\((?:[0-9]|10)\)\s+(?i:with\s+time\s+zone)": 12,
-    r"(?i:numeric|decimal)\s*\([1-9][0-9]*(?:,\s*(?:0|[1-9][0-9]*))?\)": -1,
-}
-param_types_whitelist = {re.compile(s): cost for (s, cost) in param_types_whitelist.items()}
-
-# The only characters a column type may contain: letters and digits, the
-# punctuation used by lengths, precisions, array markers and quoted collation
-# names, and spaces between words.  Checking this first rejects NUL bytes,
-# control characters, non-ASCII lookalikes, semicolons and comment markers with
-# a clear message, and makes the case-folded copy used for the lookup below an
-# ASCII-only transformation of the string that is actually emitted.
-_TYPE_CHARSET = re.compile(r'[A-Za-z0-9_ ,.@()\[\]"-]*')
-
-# Preconstructed SQL for the fixed types, so that the common case interpolates
-# a constant chosen from a closed mapping rather than a caller-supplied string.
-_FIXED_TYPE_SQL = {typ: SQL(typ) for typ in types_whitelist}
-
-
-class InvalidColumnTypeError(ValueError, RuntimeError):
-    """
-    Raised for a column type psycodict will not put into a statement.
-
-    A ``ValueError``, since an unusable type is a bad argument, and also a
-    ``RuntimeError``, which is what psycodict raised for an invalid type
-    before 1.0.0 and what existing callers may catch.
-    """
-
-
-def validate_column_type(typ):
-    """
-    Check that ``typ`` is a PostgreSQL column type psycodict is willing to
-    create, and return the spelling that callers must put into DDL.
-
-    Validation is centralized here because a column type is interpolated into
-    ``CREATE TABLE`` and ``ALTER TABLE`` statements as SQL text rather than
-    bound as a value: PostgreSQL has no placeholder for a type.  Callers must
-    emit the returned spelling and never the string they passed in, since the
-    two are equal only for input that needed no normalization.
-
-    INPUT:
-
-    - ``typ`` -- a string, e.g. ``'bigint'``, ``'numeric(10, 2)'``,
-      ``'varchar(16)[]'`` or ``'text COLLATE "C"'``.  Surrounding whitespace is
-      ignored.
-
-    OUTPUT:
-
-    A pair ``(sql_spelling, storage_cost)``.  ``storage_cost`` is the width of
-    the type in bytes, or -1 if it is variable (which every array is), and is
-    used to order columns when creating a table.
-
-    The declaration is read in the order PostgreSQL writes it: a scalar type,
-    then any array brackets, then a collation.  Each layer is validated and the
-    spelling is rebuilt from the validated pieces, so no part of the caller's
-    string reaches the DDL unchecked.
-
-    Raises ``InvalidColumnTypeError`` (a ``ValueError``) on anything else,
-    including a type that merely starts with a valid type.
-    """
-    if not isinstance(typ, str):
-        raise InvalidColumnTypeError("Column type must be a string, not %s" % type(typ).__name__)
-    typ = typ.strip()
-    if not typ:
-        raise InvalidColumnTypeError("Column type must not be empty")
-    if not _TYPE_CHARSET.fullmatch(typ):
-        bad = next(c for c in typ if not _TYPE_CHARSET.fullmatch(c))
-        raise InvalidColumnTypeError(
-            "%r is not a valid type: it contains the character %r"
-            % (typ, bad)
-        )
-
-    # the collation, off the end
-    collation = None
-    collated = _COLLATE_CLAUSE.fullmatch(typ)
-    if collated is not None:
-        typ, collation = collated.group("rest"), collated.group("clause")
-
-    # then the array brackets
-    arrays = _ARRAY_SUFFIXES.search(typ)
-    depth = 0
-    if arrays is not None:
-        depth = arrays.group(0).count("[")
-        typ = typ[: arrays.start()].rstrip()
-
-    spelling, cost = _validate_scalar_type(typ)
-    if collation is not None and not _COLLATABLE_SCALAR.fullmatch(spelling):
-        raise InvalidColumnTypeError(
-            "%s is not a collatable type, so it cannot take a COLLATE clause"
-            % (spelling,)
-        )
-    if depth:
-        # an array is variable-width whatever its element type is
-        spelling, cost = spelling + "[]" * depth, -1
-    if collation is not None:
-        spelling = "%s %s" % (spelling, collation)
-    return spelling, cost
-
-
-def _validate_scalar_type(typ):
-    """
-    The scalar half of :func:`validate_column_type`: no array brackets and no
-    collation, which the caller has already taken off.
-    """
-    if not typ:
-        raise InvalidColumnTypeError("Column type must not be empty")
-    fixed = types_whitelist.get(typ.lower())
-    if fixed is not None:
-        # Emit the canonical spelling from the closed mapping rather than the
-        # caller's casing.
-        return typ.lower(), fixed
-    for regexp, cost in param_types_whitelist.items():
-        if regexp.fullmatch(typ):
-            return typ, cost
-    raise InvalidColumnTypeError("%s is not a valid type" % (typ,))
-
-
-def column_type_sql(typ):
-    """
-    The SQL fragment for a column type, validated by
-    :func:`validate_column_type`.
-
-    INPUT:
-
-    - ``typ`` -- a string giving a PostgreSQL column type
-
-    OUTPUT:
-
-    A ``psycopg.sql.SQL`` fragment naming the type, ready to be interpolated
-    into a ``CREATE TABLE`` or ``ALTER TABLE`` statement.
-    """
-    spelling, _ = validate_column_type(typ)
-    fixed = _FIXED_TYPE_SQL.get(spelling)
-    return SQL(spelling) if fixed is None else fixed
 
 ##################################################################
 # meta_* infrastructure                                          #
@@ -435,7 +183,8 @@ def _meta_cols_types_jsonb_idx(meta_name, fmt=None):
     should pass the connection's format, ``self._db._meta_format``, so that
     their SQL matches the columns the database actually has.
     """
-    assert meta_name in ["meta_tables", "meta_indexes", "meta_constraints"]
+    if meta_name not in ("meta_tables", "meta_indexes", "meta_constraints"):
+        raise ValueError("Unknown metadata table %r" % (meta_name,))
     if meta_name == "meta_tables":
         meta_cols = _meta_tables_cols
         meta_types = _meta_tables_types
@@ -877,17 +626,18 @@ class PostgresBase():
         - ``name`` -- a string, the name of an index or constraint
         - ``suffix`` -- a suffix to append to the name
         """
-        if self._relation_exists(name + suffix):
+        existing = derived_identifier(name, suffix)
+        if self._relation_exists(existing):
             # First we determine its type
             kind = None
-            tablename = self._constraint_exists(name + suffix)
+            tablename = self._constraint_exists(existing)
             if tablename:
                 kind = "Constraint"
                 begin_renamer = SQL("ALTER TABLE {0} RENAME CONSTRAINT").format(Identifier(tablename))
                 end_renamer = SQL("{0} TO {1}")
                 begin_command = SQL("ALTER TABLE {0}").format(Identifier(tablename))
                 end_command = SQL("DROP CONSTRAINT {0}")
-            elif self._index_exists(name + suffix):
+            elif self._index_exists(existing):
                 kind = "Index"
                 begin_renamer = SQL("")
                 end_renamer = SQL("ALTER INDEX {0} RENAME TO {1}")
@@ -896,27 +646,27 @@ class PostgresBase():
             else:
                 raise ValueError(
                     "Relation with name "
-                    + name + suffix
+                    + existing
                     + " already exists. And it is not an index or a constraint"
                 )
 
-            # Find a new name for the existing index
-            depsuffix = "_dep0" + suffix
+            # Find a new name for the existing index.  derived_identifier keeps
+            # the whole suffix and cuts the base, so a name already at the byte
+            # limit does not lose the _depN that distinguishes it.
             i = 0
-            deprecated_name = name[: 64 - len(depsuffix)] + depsuffix
+            deprecated_name = derived_identifier(name, "_dep0" + suffix)
             while self._relation_exists(deprecated_name):
                 i += 1
-                depsuffix = "_dep" + str(i) + suffix
-                deprecated_name = name[: 64 - len(depsuffix)] + depsuffix
+                deprecated_name = derived_identifier(name, "_dep%s%s" % (i, suffix))
 
             self._execute(
-                begin_renamer + end_renamer.format(Identifier(name + suffix), Identifier(deprecated_name))
+                begin_renamer + end_renamer.format(Identifier(existing), Identifier(deprecated_name))
             )
 
             command = begin_command + end_command.format(Identifier(deprecated_name))
 
             logging.warning(
-                "{} with name {} ".format(kind, name + suffix)
+                "{} with name {} ".format(kind, existing)
                 + "already exists. "
                 + "It has been renamed to {} ".format(deprecated_name)
                 + "and it can be deleted with the following SQL command:\n"
@@ -1056,6 +806,26 @@ class PostgresBase():
                 else:
                     has_id = True
         return sorted(col_list), col_type, has_id
+
+    def _relation_columns(self, table):
+        """
+        The set of column names of ``table``, or None if it has none.
+
+        Used to check an index or constraint definition against the relation it
+        will be built on at the moment it is built.  None -- for a relation
+        that does not exist yet, such as the ``_tmp`` table of a reload that has
+        not created it -- means "unknown", and leaves the columns unchecked
+        here so that PostgreSQL gives its own error rather than a misleading
+        one about columns.
+        """
+        cur = self._execute(
+            SQL("SELECT column_name FROM information_schema.columns WHERE table_name = %s"),
+            [table],
+            silent=True,
+            commit=False,
+        )
+        columns = {rec[0] for rec in cur}
+        return columns or None
 
     def _copy_to_select(self, select, filename, header="", sep="|", silent=False):
         """
@@ -1271,7 +1041,12 @@ class PostgresBase():
 
         - ``table`` -- string, the name of an existing table
         - ``tmp_table`` -- string, the name of the new table to create
+
+        Every relation psycodict swaps through -- ``_tmp``, and by way of the
+        swap ``_oldN`` -- is created here, so this is where a name PostgreSQL
+        would truncate into another relation's is refused.
         """
+        check_new_table_name(tmp_table)
         if self._table_exists(tmp_table):
             # remove suffix for display message
             for suffix in ['_counts', '_stats']:
@@ -1361,6 +1136,10 @@ class PostgresBase():
         - ``columns`` -- list of pairs, where the first entry is
           the column name and the second one is the corresponding type
         """
+        # Defense in depth for every caller, including header-driven creation
+        # and internal copies: a relation is not created under a name
+        # PostgreSQL would truncate into another one's.
+        check_new_table_name(name)
         if not isinstance(columns, dict):
             columns = self._pairs_to_dict(columns)
         ordered = self._order_columns(columns, addid=addid)
@@ -1439,16 +1218,31 @@ class PostgresBase():
                 target_name = original_name + "_" + target
             return target_name
 
+        # Every destination is decided and checked before the first rename.
+        # PostgreSQL truncates a name over its limit rather than refusing it, so
+        # a batch that would produce two identical destinations -- or one that
+        # collides with a relation already there -- has to stop before it has
+        # renamed half of them.  The *sources* are not checked: they may be the
+        # concatenated spelling of a legacy relation the server truncated when
+        # it was created, which still addresses it.
+        renames = [(table + source, table + target) for table in tables]
+        for _, destination in renames:
+            check_new_table_name(destination)
+        destinations = [destination for _, destination in renames]
+        if len(set(destinations)) != len(destinations):
+            raise InvalidDefinitionError(
+                "This swap would rename two relations to the same name: %s"
+                % ", ".join(sorted(destinations))
+            )
+
         with DelayCommit(self, silence=True):
-            for table in tables:
-                tablename_old = table + source
-                tablename_new = table + target
+            for tablename_old, tablename_new in renames:
                 self._execute(rename_table.format(Identifier(tablename_old), Identifier(tablename_new)))
 
                 done = set()  # done constraints/indexes
                 # We threat pkey separately
-                pkey_old = table + source + "_pkey"
-                pkey_new = table + target + "_pkey"
+                pkey_old = derived_identifier(tablename_old, "_pkey")
+                pkey_new = derived_identifier(tablename_new, "_pkey")
                 if self._constraint_exists(pkey_old, tablename_new):
                     self._execute(
                         rename_constraint.format(
@@ -1579,19 +1373,63 @@ class PostgresBase():
             )
         return db_cols[:width]
 
-    def _copy_from_meta(self, meta_name, filename, sep="|"):
-        # Take the column list from the file's width, so files exported from
-        # an older metadata format keep loading after the database migrates
-        # (columns the file predates are left NULL).
-        meta_cols = self._meta_file_columns(meta_name, filename, sep)
-        if meta_cols is None:
+    def _validate_meta_rows(self, meta_name, meta_cols, rows, source):
+        """
+        Check index or constraint definitions that have just been loaded.
+
+        INPUT:
+
+        - ``meta_name`` -- ``"meta_indexes"``, ``"meta_constraints"`` or
+          ``"meta_tables"``
+        - ``meta_cols`` -- the columns the rows carry, in order
+        - ``rows`` -- the rows, as returned by the database (jsonb columns
+          already decoded)
+        - ``source`` -- where they came from, for the error message
+
+        Must be called inside the transaction that loaded the rows, so that
+        raising leaves neither the new definitions nor the deletion of the old
+        ones behind.
+
+        The columns of the definitions are not checked against the table here:
+        an index may legitimately name a column that a reload is about to add,
+        and the relation the definition will be built on need not exist yet.
+        Column existence is checked when the definition becomes DDL.
+        """
+        if meta_name not in ("meta_indexes", "meta_constraints"):
             return
-        try:
-            with open(filename) as F:
-                self._copy_from_stdin(F, meta_name, meta_cols, sep)
-        except Exception:
-            self.conn.rollback()
-            raise
+        for row in rows:
+            record = dict(zip(meta_cols, row))
+            try:
+                if meta_name == "meta_indexes":
+                    validate_index_definition(
+                        record["index_name"],
+                        record["table_name"],
+                        record["type"],
+                        record["columns"],
+                        record["modifiers"],
+                        record["storage_params"],
+                        record.get("whereclause"),
+                    )
+                else:
+                    validate_constraint_definition(
+                        record["constraint_name"],
+                        record["table_name"],
+                        record["type"],
+                        record["columns"],
+                        record["check_func"],
+                        # a PostgresTable attribute: metadata for a search
+                        # table is always reloaded through its table object
+                        valid_check_functions=getattr(self, "_valid_check_functions", ()),
+                    )
+            except ValueError as err:
+                raise InvalidDefinitionError(
+                    "%s in %s is not a definition psycodict can build: %s"
+                    % (
+                        record.get("index_name") or record.get("constraint_name"),
+                        source,
+                        err,
+                    )
+                )
 
     def _get_current_meta_version(self, meta_name, search_table):
         # the column which will match search_table
@@ -1663,11 +1501,19 @@ class PostgresBase():
             place_holder = SQL(", ").join(Placeholder() * len(cols))
             query = SQL("INSERT INTO {} ({}) VALUES ({})").format(meta_name_hist_sql, cols_sql, place_holder)
 
+            imported = []
             for row in rows:
+                imported.append(row)
                 row = [
                     Json(elt) if i in jsonb_idx else elt for i, elt in enumerate(row)
                 ]
                 self._execute(query, row + [version])
+
+            # Validate what was imported, inside the transaction: a file that
+            # carries a definition psycodict would not build raises here, and
+            # the surrounding DelayCommit rolls back both the DELETE above and
+            # the rows just loaded, leaving the old metadata in place.
+            self._validate_meta_rows(meta_name, meta_cols, imported, filename)
 
     def _revert_meta(self, meta_name, search_table, version=None):
         meta_cols, _, jsonb_idx = _meta_cols_types_jsonb_idx(meta_name, self._db._meta_format)
@@ -1710,7 +1556,18 @@ class PostgresBase():
             query_hist = SQL("INSERT INTO {} ({}) VALUES ({})").format(
                 meta_name_hist_sql, cols_sql, place_holder
             )
+            restored = []
             for row in rows:
+                restored.append(row)
                 row = [Json(elt) if i in jsonb_idx else elt for i, elt in enumerate(row)]
                 self._execute(query, row)
                 self._execute(query_hist, row + [currentversion + 1])
+
+            # History is as untrusted as a file: the rows in it were written by
+            # whatever psycodict version was running at the time, and can be
+            # edited in place like any other table.  Validating here, inside
+            # the DelayCommit, means a poisoned version cannot be reverted to.
+            self._validate_meta_rows(
+                meta_name, meta_cols, restored,
+                "%s_hist version %s" % (meta_name, version),
+            )

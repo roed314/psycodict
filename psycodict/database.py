@@ -40,6 +40,7 @@ from .base import (
     _meta_tables_defaults,
     _meta_cols_types_jsonb_idx,
 )
+from .validation import physical_table_name
 from .searchtable import PostgresSearchTable
 from .utils import DelayCommit
 
@@ -1119,7 +1120,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
         A type has to be interpolated into the ``CREATE TABLE`` statement as
         SQL text, since PostgreSQL has no placeholder for a type, so types are
-        restricted to the ones ``psycodict.base.validate_column_type`` accepts:
+        restricted to the ones ``psycodict.validation.validate_column_type``
+        accepts:
         the fixed types above, arrays of them, and lengths, precisions and
         collations (``numeric(10, 2)``, ``varchar(16)``, ``text COLLATE "C"``).
         Anything else raises ``InvalidColumnTypeError`` before any statement
@@ -1187,7 +1189,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 "(cols jsonb, values jsonb, count bigint, "
                 "extra boolean, split boolean DEFAULT FALSE){1}"
             )
-            creator = creator.format(Identifier(name + "_counts"), tablespace)
+            creator = creator.format(
+                Identifier(physical_table_name(name, "counts")), tablespace
+            )
             self._execute(creator)
             self.grant_select(name + "_counts")
             self.grant_insert(name + "_counts")
@@ -1196,7 +1200,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 '(cols jsonb, stat text COLLATE "C", value numeric, '
                 "constraint_cols jsonb, constraint_values jsonb, threshold integer){1}"
             )
-            creator = creator.format(Identifier(name + "_stats"), tablespace)
+            creator = creator.format(
+                Identifier(physical_table_name(name, "stats")), tablespace
+            )
             self._execute(creator)
             self.grant_select(name + "_stats")
             self.grant_insert(name + "_stats")
@@ -1289,7 +1295,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                 self._execute(SQL("DELETE FROM meta_constraints WHERE table_name = %s"), [name])
                 print("Deleted constraints {0}".format(", ".join(constraint[0] for constraint in constraints)))
             self._execute(SQL("DELETE FROM meta_tables WHERE name = %s"), [name])
-            for tbl in [name, name + "_counts", name + "_stats"]:
+            for tbl in [physical_table_name(name, component) for component in
+                        ("search", "counts", "stats")]:
                 self._execute(SQL("DROP TABLE {0}").format(Identifier(tbl)))
                 print("Dropped {0}".format(tbl))
             self.tablenames.remove(name)

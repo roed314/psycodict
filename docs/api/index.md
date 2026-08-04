@@ -24,6 +24,10 @@ Generated from the docstrings.  The map of the library:
   announcements and a small publish/subscribe primitive.
 - {mod}`psycodict.dbdiff` — comparing the contents of two databases.
 - {mod}`psycodict.slowlog` — parsing and reporting on the slow-query log.
+- {mod}`psycodict.validation` — what psycodict checks before putting it into a
+  statement: the column types it will create, the identifiers it will name a
+  relation with, and the index and constraint definitions it will build DDL
+  from.
 - {mod}`psycodict.base` — {class}`~psycodict.base.PostgresBase`, the shared
   execution and logging plumbing underneath everything else.
 
@@ -40,5 +44,6 @@ utils
 notifications
 dbdiff
 slowlog
+validation
 base
 ```

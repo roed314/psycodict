@@ -48,6 +48,36 @@ psycodict keeps its own bookkeeping in a handful of tables that live alongside y
  * **`meta_tables_hist`**, **`meta_indexes_hist`**, **`meta_constraints_hist`** — versioned history of the three tables above, so that `reload_meta`/`revert_meta` can roll a table's metadata forward and back.
  * **`meta_format`** — a single-row `(version, min_compat)` stamp of the metadata *format*: the layout of the `meta_*` tables, versioned by an integer aligned with psycodict's major version (`META_FORMAT`).  Every connection checks it.  The same format connects silently; an older but compatible format connects with a warning and operates at that older format (newer features unavailable) so a not-yet-migrated or read-only database — the LMFDB devmirror, say — keeps working; a newer format connects when its stamped `min_compat` admits this psycodict, and is otherwise refused.  A database that has meta tables but no `meta_format` is the unstamped 0.x baseline (format 0); one with no meta tables at all is fresh and must be connected to with `PostgresDatabase(create=True)`, which bootstraps all of the above.  Migrating to a newer format is deliberate — `db.upgrade_metadata()` or `PostgresDatabase(upgrade=True)`, never a side effect of connecting.  See [MetadataFormats.md](MetadataFormats.md) for the full policy (including why a pre-1.0 psycodict must not be pointed at a migrated database).
 
+Rows of `meta_indexes` and `meta_constraints` become DDL when an index or
+constraint is rebuilt, so psycodict validates them both when they are imported
+(`reload_indexes`, `reload_constraints`, `revert_indexes`, `revert_constraints`)
+and again immediately before the `CREATE INDEX` or `ALTER TABLE` statement is
+built. The access method, the column modifiers, the storage-parameter names and
+the check function of a `CHECK` constraint must be ones psycodict recognizes,
+and are emitted as quoted identifiers or fixed SQL rather than as the stored
+text. A metadata file is therefore no more trusted than the database it is
+loaded into: an invalid definition raises, and because the import runs in a
+transaction, the metadata that was there before is left untouched. A `CHECK`
+constraint's function must be listed in `PostgresTable._valid_check_functions`
+both to create it and to rebuild it.
+
+Index and constraint names are quoted like every other identifier, so a name may contain punctuation, spaces or non-ASCII characters; what psycodict refuses is an empty name, a control character (its own policy, so that names stay printable in logs and export files) and a name longer than PostgreSQL's 63-*byte* identifier limit, which the server would silently truncate into something the metadata does not name.
+
+The distinction that matters is between a name that is *stored* and a name psycodict *derives*:
+
+ * A **stored** name — an index name in `meta_indexes`, a constraint name in `meta_constraints`, the table they refer to — is what the relation is called, so it must fit exactly.  A name over the limit is refused wherever it arrives: from `create_index`, from a reloaded metadata file, from a reverted history version, or from a row edited in place.  It is never shortened to make it usable, because the shortened name is not the name the metadata records.
+ * A **derived** name — `_tmp`, `_oldN`, `_depN`, `_pkey` — is one psycodict computes, so it may be shortened: one helper keeps the suffix, cuts the base on a character boundary and inserts a short digest when it has to, and every path that creates, drops or looks for such a relation calls it, so none of them can disagree.  A generated index name is fitted this way too; a name you choose is refused rather than silently changed.
+
+A search table's own relations — `name_counts`, `name_stats` and the `_tmp` and `_oldN` copies of all three — are the exception to the shortening: they are plain concatenations.  PostgreSQL truncates an over-long identifier *consistently*, so a legacy table whose counts table was created over the limit still has it in the catalog under the truncated name and still reaches it by the long one; shortening these would make psycodict look for relations that do not exist.  What truncation does break is distinctness — `<63 bytes>_old1` and `<63 bytes>_old2` are one relation — so a relation psycodict is about to *create* under an over-long name is refused instead, with a message saying to rename the table.  A name within the creation limit can never reach that case.
+
+A `CHECK` constraint's function may be schema-qualified (`schema.function`); psycodict parses it into its components and emits them as `"schema"."function"`, and it must be listed in `PostgresTable._valid_check_functions` both to create the constraint and to rebuild it.  Index storage parameters are normalized: a boolean written `on`, `yes`, `t` or `1` is stored and emitted as `true`, and `gin_pending_list_limit` is checked only for its documented lower bound, since its ceiling depends on the server's architecture.
+
+The predicate of a partial index (`create_index(..., where=...)`) stays raw SQL
+— psycodict does not parse it — but it is checked for the things that would let
+it stop being a predicate: a semicolon, a comment, a dollar-quoted string, a
+control character or an unreasonable length. It is administrative input, not
+website input.
+
 ## Row-level writes
 
 These mutate the live table directly.  They are convenient for small edits; for anything large prefer the [file operations](#bulk-file-operations).  Each records an entry in the change log and, on success, updates the maintained row `total`.

@@ -16,7 +16,7 @@ from itertools import islice
 from psycopg import Cursor, ServerCursor
 from psycopg.sql import SQL, Identifier, Literal, Composed
 
-from .base import number_types
+from .validation import number_types
 from .table import PostgresTable
 from .encoding import Json
 from .utils import IdentifierWrapper, DelayCommit, filter_sql_injection, postgres_infix_ops
