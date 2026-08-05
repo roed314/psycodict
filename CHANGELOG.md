@@ -419,6 +419,19 @@ hardening standalone use; the highlights:
   actually did, `reload_revert` invalidates (a backup carries no validity bit
   of its own) and also recounts the total, and nothing inherits the old live
   table's flag.
+- **`reload` returns what it prepared, and `reload_all` finalizes that.**
+  `reload_all` runs every reload before any swap, and built each deferred
+  swap's list of relations from the files in the input folder. That is not the
+  list `reload` prepared: a saving table's reload always readies *both* cache
+  companions, refreshing them when a file is missing, so a folder with no
+  `_counts.txt` produced a swap naming only the search table — stranding the
+  refreshed companions under `_tmp` and leaving the old live ones, describing
+  data that had just been replaced, paired with the new data and (once the
+  transitions above were added) marked valid. `reload` now returns a
+  `ReloadPlan` with the exact swap list, the intended `stats_valid` and the
+  resolved `ordered`, and `reload_all` passes it straight through, so
+  preparation and finalization cannot drift apart. `stats_valid` is true only
+  when both cache companions are in the list actually being swapped.
 - **Cache maintenance asks whether the row exists, not whether it may be
   served.** `_record_count`, `_record_count_distinct` and `_record_statistic`
   chose between `INSERT` and `UPDATE`/`DELETE` by calling the public lookups,

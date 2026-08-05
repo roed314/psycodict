@@ -17,6 +17,7 @@ import tempfile
 import time
 import re
 from bisect import bisect
+from collections import namedtuple
 from functools import partial
 
 from psycopg.sql import SQL, Identifier, Placeholder, Literal
@@ -55,6 +56,17 @@ assert _operator_classes and _valid_storage_params
 ##################################################################
 # counts and stats columns and their types                       #
 ##################################################################
+
+# What a reload prepared, and therefore what its final swap must do: the exact
+# base names whose _tmp copies are to be renamed into place, whether the counts
+# and stats arriving with them describe the data arriving with them, and whether
+# the ids were successfully resorted.  Returned by ``PostgresTable.reload`` so
+# that a deferred swap (``PostgresDatabase.reload_all``) finalizes what was
+# prepared rather than re-deriving it from the arguments -- the two drifted
+# apart, and a swap list assembled from the input filenames could leave a
+# refreshed cache companion stranded under _tmp while marking the table valid.
+ReloadPlan = namedtuple("ReloadPlan", ["tables", "stats_valid", "ordered"])
+
 
 _counts_cols = ("cols", "values", "count", "extra", "split")
 _counts_types = dict(zip(_counts_cols, ("jsonb", "jsonb", "bigint", "boolean", "boolean")))
@@ -2009,34 +2021,44 @@ class PostgresTable(PostgresBase):
                 SQL("ANALYZE {0}").format(Identifier(table + suffix)), silent=True
             )
 
-    def _reload_stats_valid(self, countsfile, statsfile, restat):
+    def _reload_stats_valid(self, tables, countsfile, statsfile, restat):
         """
-        Whether a reload with these arguments leaves the live counts and stats
-        describing the live data.
-
-        The transition a reload's final swap should make, in one place, because
-        ``reload`` and ``PostgresDatabase.reload_all`` both have to make it and
-        ``reload_all`` defers its swaps to a second pass, out of reach of the
-        call that knows the files.
+        Whether a reload leaves the live counts and stats describing the live
+        data.
 
         A reload replaces the search table wholesale, so the old cached answers
         are about data that is no longer there; whether the new ones are about
-        the data that is comes down to where they came from.  They describe it
-        when the caller supplied both files alongside the search file -- the
-        same trust the search file itself gets -- or when ``restat`` rebuilt
-        them from the loaded ``_tmp`` data.  Failing both, what is swapped in
-        is an empty clone (nothing lost, but nothing vouched for either) or,
-        if some earlier operation left a ``_tmp`` copy behind, a relation this
-        reload never wrote.  Without ``saving``, no companions are swapped at
-        all and the live ones are left describing data that is gone.
+        the data that is comes down to two things.
+
+        They have to *arrive*: both cache companions must be in ``tables``, the
+        list this reload is actually going to swap.  A swap list holding the
+        search table and one companion, or none, leaves the live table paired
+        with a cache relation describing data that has just been replaced --
+        and a refreshed ``_tmp`` companion stranded under its temporary name.
+        Nothing in a reload builds such a list on purpose, but the deferred
+        swap in ``PostgresDatabase.reload_all`` used to assemble one from the
+        input filenames, so the check is made against the list rather than
+        against the arguments that suggested it.
+
+        And they have to *describe the new data*: either the caller supplied
+        both files alongside the search file, which gets the same trust the
+        search file itself gets, or ``restat`` rebuilt them from the loaded
+        ``_tmp`` data.  Failing both, what is swapped in is an empty clone
+        (nothing lost, but nothing vouched for either) or, if some earlier
+        operation left a ``_tmp`` copy behind, a relation this reload never
+        wrote.  Without ``saving``, no companions are swapped at all.
 
         INPUT:
 
+        - ``tables`` -- the exact list of base table names this reload will
+          hand to :meth:`reload_final_swap`
         - ``countsfile``, ``statsfile`` -- as passed to :meth:`reload`
         - ``restat`` -- as passed to :meth:`reload`, before or after its
           ``None`` is resolved; both give the same answer
         """
         if not self.stats.saving:
+            return False
+        if self.stats.counts not in tables or self.stats.stats not in tables:
             return False
         if restat is None:
             restat = countsfile is None or statsfile is None
@@ -2257,14 +2279,23 @@ class PostgresTable(PostgresBase):
             is to refresh stats if either countsfile or statsfile is missing.
         - ``final_swap`` -- whether to perform the final swap exchanging the
             temporary table with the live one.  Deferring it defers the
-            validity transition too: ``reload_final_swap`` marks the table
-            invalid unless told otherwise, so a deferred swap should be given
-            the ``stats_valid`` this call would have computed.
+            validity transition too, so pass the returned plan's ``tables``,
+            ``ordered`` and ``stats_valid`` to ``reload_final_swap`` when the
+            time comes; it invalidates by default, and reassembling the swap
+            list by hand is how a refreshed cache companion gets stranded.
         - ``silence_meta`` -- suppress the warning message when using a metafile
         - ``adjust_schema`` -- If True, it will create the new tables using the
             header columns, otherwise expects the schema specified by the files
             to match the current one
         - ``kwds`` -- passed on to the ``COPY`` command.  Cannot include "columns".
+
+        OUTPUT:
+
+        A :data:`ReloadPlan` describing the swap: the exact list of base table
+        names whose ``_tmp`` copies belong at the live names, whether the
+        resulting cache companions describe the resulting data, and whether the
+        ids were resorted.  With ``final_swap`` it says what the swap did; with
+        ``final_swap=False`` it is what the deferred swap must be told.
 
         .. NOTE:
 
@@ -2398,18 +2429,28 @@ class PostgresTable(PostgresBase):
                     # create index on counts table
                     self._create_counts_indexes(suffix=suffix)
 
+                # What the final swap has to be told, decided here, where the
+                # relations this reload prepared are known.  A deferred swap
+                # gets it from the return value rather than reconstructing it,
+                # so that it cannot swap a different set than was prepared.
+                plan = ReloadPlan(
+                    tables=list(tables),
+                    stats_valid=self._reload_stats_valid(tables, countsfile, statsfile, restat),
+                    ordered=bool(ordered),
+                )
                 if final_swap:
                     self.reload_final_swap(
-                        tables=tables,
+                        tables=plan.tables,
                         metafile=metafile,
-                        ordered=ordered,
-                        stats_valid=self._reload_stats_valid(countsfile, statsfile, restat),
+                        ordered=plan.ordered,
+                        stats_valid=plan.stats_valid,
                     )
                 elif metafile is not None and not silence_meta:
                     print("Warning: since the final swap was not requested, we have not updated meta_tables")
                     print("when performing the final swap with reload_final_swap, pass the metafile as an argument to update the meta_tables")
                 print("Reloaded %s in %.3f secs" % (self.search_table, time.time() - now_overall))
             aborted = False
+            return plan
         finally:
             self._log_db_change(
                 "reload",

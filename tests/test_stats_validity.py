@@ -935,3 +935,123 @@ def test_refreshing_an_invalid_table_leaves_every_key_unique(cached_table):
     assert stored_counts_for(table, {}) == [150]
     assert stored_counts_for(table, {"n": {"$lt": 100}}) == [100]
     assert stored_counts_for(table, {"flag": True}) == [len([i for i in range(150) if i % 3 == 0])]
+
+
+# ---------------------------------------------------------------------------
+# reload_all finalizes what each reload prepared
+#
+# reload_all runs every reload first and swaps afterwards, so the second pass
+# has to be handed the swap list the first pass built.  Reconstructing it there
+# from the files in the folder is not the same list: a saving table's reload
+# always prepares both cache companions, refreshing them when a file is
+# missing, so a folder without a _counts.txt yielded a swap list naming only
+# the search table -- leaving the refreshed companions under _tmp and the old
+# live ones, describing replaced data, marked valid.
+# ---------------------------------------------------------------------------
+
+def reload_folder(table, tmp_path, counts=True, stats=True):
+    """
+    A ``reload_all`` input folder for one table, optionally without its cache
+    files, exported before whatever change the test is about.
+    """
+    folder = tmp_path / ("data_%d_%d" % (counts, stats))
+    table._db.copy_to([table.search_table], str(folder))
+    if not counts:
+        (folder / (table.search_table + "_counts.txt")).unlink()
+    if not stats:
+        (folder / (table.search_table + "_stats.txt")).unlink()
+    return folder
+
+
+def assert_coherent_after_reload_all(table, expect_valid):
+    """
+    Nothing stranded under _tmp, and the flag saying what the swap did.
+    """
+    live = table._db[table.search_table]
+    for name in (live.search_table, live.stats.counts, live.stats.stats):
+        assert not live._table_exists(name + "_tmp"), "%s_tmp was left behind" % name
+    assert stats_valid_in_meta(live) is expect_valid
+    return live
+
+
+@pytest.mark.parametrize("counts,stats", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("sequential_swap", [False, True])
+def test_reload_all_with_a_cache_file_missing_swaps_the_whole_family(
+    cached_table, tmp_path, counts, stats, sequential_swap
+):
+    """
+    The refreshed companions must reach the live names, and the flag may only
+    be true because they did.
+    """
+    cached_table.stats.add_stats(["flag"])
+    assert cached_table.stats.quick_count({"flag": True}) == NFLAGGED
+    folder = reload_folder(cached_table, tmp_path, counts=counts, stats=stats)
+
+    # Make the live caches disagree with what the folder holds, so that
+    # serving them after the reload is visibly wrong.
+    cached_table.update({"flag": True}, {"flag": False}, restat=False)
+    cached_table.stats.refresh_stats()
+    assert cached_table.stats.quick_count({"flag": True}) is None
+
+    cached_table._db.reload_all(
+        str(folder), restat=True, sequential_swap=sequential_swap
+    )
+
+    live = assert_coherent_after_reload_all(cached_table, expect_valid=True)
+    # the rebuilt value, from the reloaded data -- not the pre-reload cache
+    assert live.stats.quick_count({"flag": True}) == NFLAGGED
+    assert live.stats.count({"flag": True}) == NFLAGGED
+
+
+@pytest.mark.parametrize("counts,stats", [(False, False), (True, False)])
+def test_reload_all_without_restat_leaves_the_table_invalid(
+    cached_table, tmp_path, counts, stats
+):
+    """
+    Retaining old caches is allowed; claiming they are valid is not.
+    """
+    cached_table.stats.add_stats(["flag"])
+    folder = reload_folder(cached_table, tmp_path, counts=counts, stats=stats)
+    cached_table.update({"flag": True}, {"flag": False}, restat=False)
+    cached_table.stats.refresh_stats()
+
+    cached_table._db.reload_all(str(folder), restat=False)
+
+    live = assert_coherent_after_reload_all(cached_table, expect_valid=False)
+    assert live.stats.quick_count({"flag": True}) is None
+    assert live.stats.count({"flag": True}) == NFLAGGED
+
+
+def test_reload_all_with_both_cache_files_ends_valid(cached_table, tmp_path):
+    """
+    The unchanged case, kept honest: both companions come from the folder, so
+    the swap has all three relations and may say so.
+    """
+    cached_table.stats.add_stats(["flag"])
+    folder = reload_folder(cached_table, tmp_path)
+    cached_table.update({"flag": True}, {"flag": False}, restat=False)
+
+    cached_table._db.reload_all(str(folder))
+
+    live = assert_coherent_after_reload_all(cached_table, expect_valid=True)
+    assert live.stats.quick_count({"flag": True}) == NFLAGGED
+
+
+def test_a_deferred_swap_is_told_what_the_reload_prepared(cached_table, tmp_path):
+    """
+    The plan itself: a saving table's reload prepares both cache companions
+    whatever files it was given, and says so, so a caller deferring the swap
+    has no reason to reconstruct the list.
+    """
+    searchfile = str(tmp_path / "data.txt")
+    cached_table.copy_to(searchfile)
+    plan = cached_table.reload(searchfile, restat=True, final_swap=False)
+    try:
+        assert set(plan.tables) == {
+            cached_table.search_table,
+            cached_table.stats.counts,
+            cached_table.stats.stats,
+        }
+        assert plan.stats_valid is True
+    finally:
+        cached_table.drop_tmp()

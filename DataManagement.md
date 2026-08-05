@@ -171,10 +171,22 @@ the data change or rename**, so the flag and the relations cannot come apart:
 | `refresh_stats()` on the live table | true |
 
 `reload_final_swap` and `_swap_in_tmp` take the intended state as a
-`stats_valid=` argument, defaulting to false; a deferred final swap (`reload`
-with `final_swap=False`) should be given the value its `reload` would have
-computed.  Nothing inherits the old live table's flag, which was a fact about
-data that is no longer there.
+`stats_valid=` argument, defaulting to false.  Nothing inherits the old live
+table's flag, which was a fact about data that is no longer there.
+
+A deferred final swap (`reload` with `final_swap=False`, which is how
+`reload_all` runs every reload before any swap) must finalize what its reload
+prepared rather than working it out again afterwards: `reload` returns a
+`ReloadPlan` giving the exact list of base names whose `_tmp` copies belong at
+the live names, the `stats_valid` the swap should write, and whether the ids
+were resorted.  Pass those three to `reload_final_swap`.  The distinction is not
+academic — a saving table's `reload` prepares *both* cache companions whatever
+files it was given, refreshing them when one is missing, so a swap list
+reconstructed from the input filenames can name fewer relations than were
+prepared, stranding a refreshed companion under `_tmp` and leaving the old live
+one paired with new data.  `stats_valid` is true only when both companions are
+in the list actually being swapped and were either loaded for this search file
+or rebuilt from its `_tmp` data.
 
 Two consequences worth spelling out.  A `metafile` carries a `stats_valid`
 column, and the swap's own answer overrules it: the file records what was true
