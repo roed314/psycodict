@@ -527,7 +527,7 @@ class PostgresDatabase(PostgresBase):
         obj.conn = self.conn
         self._objects.append(obj)
 
-    def __init__(self, config=None, secretsfile=None, create=False, upgrade=False,
+    def __init__(self, config=None, create=False, upgrade=False,
                  session_settings=None, grant_policy=None, schema="public", **kwargs):
         if config is None:
             from .config import Configuration

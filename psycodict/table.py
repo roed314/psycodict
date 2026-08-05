@@ -22,7 +22,7 @@ from functools import partial
 from psycopg.sql import SQL, Identifier, Placeholder, Literal
 
 from .encoding import Json, check_copy_sep, copy_dumps
-from .base import PostgresBase, _meta_table_name
+from .base import PostgresBase, _meta_table_name, export_format_line
 from .utils import DelayCommit, IdentifierWrapper, LockError
 from .base import (
     _meta_cols_types_jsonb_idx,
@@ -1338,7 +1338,9 @@ class PostgresTable(PostgresBase):
         tot = self.count(query)
         try:
             with datafile:
-                # write headers
+                # write headers, including the export-format marker so this
+                # file reads the same way copy_to's do
+                datafile.write(export_format_line() + "\n")
                 datafile.write(sep.join(data_cols) + "\n")
                 datafile.write(
                     sep.join(self.col_type.get(col) for col in data_cols)
@@ -1966,7 +1968,10 @@ class PostgresTable(PostgresBase):
         if include_id and cols and cols[0] != "id":
             cols = ["id"] + cols
         types = [self.col_type[col] for col in cols]
-        F.write("%s\n%s\n\n" % (sep.join(cols), sep.join(types)))
+        F.write(
+            "%s\n%s\n%s\n\n"
+            % (export_format_line(), sep.join(cols), sep.join(types))
+        )
 
     def _staged_label_index_name(self, suffix="_tmp"):
         """

@@ -196,7 +196,10 @@ class Configuration():
                 dest="postgresql_dbname",
                 metavar="DBNAME",
                 help="PostgreSQL database name [default: %(default)s]",
-                default=defaults.get("postgresql_dbname", "lmfdb"),
+                # A generic default, not an LMFDB one: "postgres" is the
+                # database libpq itself falls back to.  Deployments name their
+                # own database in the config file or constructor.
+                default=defaults.get("postgresql_dbname", "postgres"),
             )
 
         def sec_opt(key):

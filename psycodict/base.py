@@ -91,6 +91,24 @@ def jsonb_idx(cols, cols_type):
 #        upgrade=True).
 META_FORMAT = 1
 
+# The format of a search-data export file (the searchfile of copy_to/copy_from/
+# reload), which is a *different* thing from the metadata format above: this
+# describes the layout of a data file, not of the meta_* tables.  A file may
+# begin with a line ``# psycodict-export-format: N``; a file without one is
+# format 0, the historical layout of just names, types and a blank line, so
+# every file psycodict has ever written still reads.  New files are written at
+# EXPORT_FORMAT; a reader refuses a version it does not understand before
+# loading any data.  See Versioning.md for the compatibility promise.
+EXPORT_FORMAT = 1
+EXPORT_FORMAT_MARKER = "# psycodict-export-format:"
+
+
+def export_format_line():
+    """
+    The marker line a new search-data export begins with, without a newline.
+    """
+    return "%s %s" % (EXPORT_FORMAT_MARKER, EXPORT_FORMAT)
+
 
 _meta_tables_cols = (
     "name",
@@ -1323,9 +1341,9 @@ class PostgresBase():
 
     def _read_header_lines(self, F, sep="|"):
         """
-        Reads the header lines from a file
-        (row of column names, row of column types, blank line).
-        Returning the dictionary of columns and their types.
+        Reads the header lines from a search-data file (an optional format
+        marker, the row of column names, the row of column types, and the blank
+        line), returning the columns and their types.
 
         INPUT:
 
@@ -1336,8 +1354,33 @@ class PostgresBase():
 
         A list of pairs where the first entry is the column and the second the
         corresponding type
+
+        A file may begin with ``# psycodict-export-format: N``.  A file without
+        one is format 0, the historical layout, so every file psycodict has
+        ever written still reads.  A version newer than this psycodict
+        understands is refused here, before any of the data is loaded.
         """
-        names = [x.strip() for x in F.readline().strip().split(sep)]
+        first = F.readline()
+        marker = first.strip()
+        if marker.startswith(EXPORT_FORMAT_MARKER):
+            version_text = marker[len(EXPORT_FORMAT_MARKER):].strip()
+            try:
+                version = int(version_text)
+            except ValueError:
+                raise ValueError(
+                    "Malformed export-format marker: %r" % (marker,)
+                )
+            if version > EXPORT_FORMAT:
+                raise ValueError(
+                    "This file is psycodict export format %s, but this psycodict "
+                    "understands only up to format %s; upgrade psycodict to read "
+                    "it" % (version, EXPORT_FORMAT)
+                )
+            names_line = F.readline()
+        else:
+            # No marker: format 0, and this first line is the column names.
+            names_line = first
+        names = [x.strip() for x in names_line.strip().split(sep)]
         types = [x.strip() for x in F.readline().strip().split(sep)]
         blank = F.readline()
         if blank.strip():

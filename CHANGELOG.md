@@ -437,6 +437,33 @@ hardening standalone use; the highlights:
   `id_ordered` table in sort order and reports whether its ids actually
   increase, since the flag can drift.
 
+- **psycopg is a plain dependency.** `pip install psycodict` now installs a
+  working package (pure-Python psycopg using the system `libpq`); `pgbinary`
+  adds the bundled binary build and `pgc` a locally compiled one. The
+  `pgsource` extra is removed -- plain install replaces it -- and a `<4` ceiling
+  keeps an unreviewed future driver major out of a 1.x environment. *Migration:*
+  replace `psycodict[pgsource]` with plain `psycodict`; `psycodict[pgbinary]` is
+  unchanged.
+- **Search-data export files carry an optional format marker.** A file written
+  by `copy_to`/`rewrite` now begins with `# psycodict-export-format: 1`; a file
+  without one is format 0, so every older export still loads, and a reader
+  refuses a version it does not understand before loading any data. This is the
+  data-file format, distinct from the `meta_*` metadata format. Versioning.md
+  states the realistic compatibility promise (newer readers read older files,
+  not necessarily the reverse) and decouples both format numbers from the
+  package major version.
+- **Generic defaults instead of LMFDB ones.** The default database name is
+  `postgres` (libpq's own default) rather than `lmfdb`; deployments name their
+  own database in the config or constructor, as LMFDB already does. The unused
+  `secretsfile` argument to `PostgresDatabase` is removed (secrets-file
+  resolution lives in `Configuration`).
+- **Packaging.** The source distribution is complete -- tests including
+  `conftest.py`, the maintenance scripts, the guides and metadata files -- and
+  CI unpacks it and runs its database-free tests, so a missing file fails the
+  build. The release workflow's actions are pinned to commit SHAs, and the
+  install smoke tests assert `importlib.metadata.version == __version__` and run
+  `pip check` for both a plain and a binary-extra install.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores

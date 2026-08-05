@@ -328,10 +328,11 @@ def test_copy_to_writes_name_and_type_header_lines(filled_table, tmp_path):
     searchfile = str(tmp_path / "search.txt")
     filled_table.copy_to(searchfile)
     lines = _read(searchfile).split("\n")
-    assert lines[0].split("|")[0] == "id"
-    assert set(lines[0].split("|")) == {"id"} | set(filled_table.search_cols)
-    assert lines[1].split("|")[0] == "bigint"
-    assert lines[2] == ""
+    assert lines[0] == "# psycodict-export-format: 1"
+    assert lines[1].split("|")[0] == "id"
+    assert set(lines[1].split("|")) == {"id"} | set(filled_table.search_cols)
+    assert lines[2].split("|")[0] == "bigint"
+    assert lines[3] == ""
 
 
 def test_copy_to_copy_from_roundtrip(filled_table, table_factory, tmp_path):
@@ -364,9 +365,10 @@ def test_copy_to_copy_from_respect_a_custom_null_marker(table_factory, tmp_path)
     searchfile = str(tmp_path / "search.txt")
     source.copy_to(searchfile, null="NULL")
     lines = _read(searchfile).split("\n")
-    header = lines[0].split("|")
+    assert lines[0] == "# psycodict-export-format: 1"
+    header = lines[1].split("|")
     data = {}
-    for line in lines[3:]:
+    for line in lines[4:]:
         if line:
             rec = dict(zip(header, line.split("|")))
             data[rec["n"]] = rec["label"]
@@ -411,8 +413,9 @@ def test_copy_to_with_columns_exports_only_those_columns(filled_table, tmp_path)
     searchfile = str(tmp_path / "search.txt")
     filled_table.copy_to(searchfile, columns=["n", "label"])
     lines = _read(searchfile).split("\n")
-    assert lines[0] == "id|label|n"
-    assert lines[3] == "0|l0|0"
+    assert lines[0] == "# psycodict-export-format: 1"
+    assert lines[1] == "id|label|n"
+    assert lines[4] == "0|l0|0"
 
 
 def test_copy_to_rejects_an_unknown_column(filled_table, tmp_path):
@@ -423,7 +426,7 @@ def test_copy_to_rejects_an_unknown_column(filled_table, tmp_path):
 def test_copy_from_a_file_without_ids_assigns_them(filled_table, table_factory, tmp_path):
     searchfile = str(tmp_path / "search.txt")
     filled_table.copy_to(searchfile, include_id=False)
-    assert "id" not in _read(searchfile).split("\n")[0].split("|")
+    assert "id" not in _read(searchfile).split("\n")[1].split("|")
     target = table_factory()
     target.copy_from(searchfile)
     assert [rec["id"] for rec in _all_rows(target)] == list(range(200))

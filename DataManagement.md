@@ -198,8 +198,9 @@ This is the heart of psycodict.  The workflow is: `copy_to` a table (or the curr
 
 ### The file format
 
-A **search file** begins with three header lines followed by one line per row:
+A **search file** begins with an optional format marker, then three header lines, then one line per row:
 
+ 0. optionally, `# psycodict-export-format: N` — the file format version.  A file without this line is format 0, the historical layout, so every file psycodict has ever written still loads; new files psycodict writes carry the current version.  A reader refuses a file whose version it does not understand before loading any data.  This is the *file* format, distinct from the database *metadata* format of the `meta_*` tables (see MetadataFormats.md);
  1. the column names, separated by the delimiter (default `|`), with `id` first if present;
  2. the Postgres type of each column, in the same order;
  3. a blank line.
