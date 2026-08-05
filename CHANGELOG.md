@@ -339,6 +339,37 @@ hardening standalone use; the highlights:
   Connect — no long-lived token is stored anywhere. (#113)
 - `CITATION.cff`, so GitHub renders a citation for the package. (#124)
 
+### Fixed after the first release candidates
+
+- **`max_id` and `min_id` compose the table name they are given.** Both took a
+  `table=` argument and formatted it into the statement as text, so a name
+  needing quotes was a syntax error and a name carrying its own statement ran
+  it. Both now use `Identifier`. `max_id` returns -1 for an empty table, which
+  is the only empty sentinel: 0 is a real id, and `random()` treated a table
+  whose single row had id 0 as empty.
+- **Approximate statistics are scaled by the table they describe.**
+  `_approx_most_common` took `reltuples` from a hard-coded `public.nf_fields`
+  while taking frequencies from the real table, so on every other table the
+  estimate was that table's frequencies multiplied by an unrelated row count.
+  The array type it casts to is now built by the validated
+  `array_cast_type_sql`, which adds the dimension to the data type instead of
+  after the column declaration: appending `[]` to a collated column type gave
+  the unparseable `text COLLATE "C"[]`.
+- **`update_from_file` no longer shares log state between calls.** Its
+  `logging` default was a dictionary literal that the method wrote `logid` and
+  `aborted` into, so consecutive default calls saw each other's values and a
+  caller-supplied dictionary came back modified. The default is now `None` and
+  the mapping is copied per call.
+- **Random selection edge cases.** `random(query, pick_first=...)` returned
+  `None` rather than raising `IndexError` when nothing satisfies the query; a
+  projected value of `0`, `False`, `""` or `[]` counts as a result instead of
+  being skipped until `maxtries` ran out; a row that exists with SQL `NULL` in
+  the column a scalar projection names returns `None`, as `lucky` does, rather
+  than being mistaken for a missing id; `random_sample` raises `ValueError`
+  naming the accepted modes instead of silently returning `None` for an
+  unknown one; and a repeatable `choice` sample uses a local
+  `random.Random(seed)` rather than reseeding the process-wide generator.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores
