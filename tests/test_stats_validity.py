@@ -4,14 +4,29 @@
 
 Before this, write paths cleared the flag but read paths ignored it, so a
 count cached before a ``restat=False`` write kept being served afterwards.
-These tests pin the whole contract -- which lookups are gated, which two are
-deliberately not, and how the flag is restored.
+These tests pin the whole contract -- which lookups are gated, which are
+deliberately not, when the flag is cleared and restored, and that all of it is
+decided by the database rather than by a Boolean on a Python object, which is
+what makes it hold across processes and across a rollback.
 """
+import threading
+import time
+
 import pytest
 
 from psycopg.sql import SQL, Identifier
 
 from conftest import sample_row
+from psycodict.utils import DelayCommit
+
+# Long enough that a loaded machine does not fail the concurrency tests
+# spuriously, short enough that a genuine hang is reported rather than waited
+# out.
+TIMEOUT = 30
+
+# Of sample_row(0), ..., sample_row(199), the rows with flag = True are those
+# with i % 3 == 0.
+NFLAGGED = len([i for i in range(200) if i % 3 == 0])  # 67
 
 
 @pytest.fixture
@@ -23,8 +38,36 @@ def cached_table(table_factory):
     table.insert_many([sample_row(i) for i in range(200)])
     table.stats.saving = True
     table.stats.refresh_stats()
-    table._restore_stats() if hasattr(table, '_restore_stats') else None
     return table
+
+
+@pytest.fixture
+def other_handle(config):
+    """
+    A second ``PostgresDatabase``, on its own connection.
+
+    The point of most of what follows: a deployment runs several webserver
+    processes, each holding its own table objects, and an invalidation from
+    one of them has to be visible to the others.  A fixture rather than a
+    second cursor because the object-level caching is what is under test.
+    """
+    from psycodict.database import PostgresDatabase
+
+    other = PostgresDatabase(config=config)
+    yield other
+    other.conn.close()
+
+
+def twin(table, other_handle):
+    """
+    The same search table, as seen by a second database handle.
+
+    Its ``_stats_valid`` and ``total`` are read when this object is built and
+    then left alone, exactly like those of a table object held by another
+    webserver process.
+    """
+    other_handle.refresh_tables()
+    return other_handle[table.search_table]
 
 
 def stats_valid_in_meta(table):
@@ -323,3 +366,572 @@ def test_copy_from_analyzes_the_live_table(cached_table, table_factory, tmp_path
 
     assert seen == [([target.search_table], "")]
     assert target.count() == 200
+
+
+# ---------------------------------------------------------------------------
+# the flag is the database's, not the Python object's
+#
+# A deployment runs several webserver processes, and a rollback undoes SQL and
+# not Python, so ``self.table._stats_valid`` answers neither "is this table
+# valid" nor "was this transition already made".  These are the cases where it
+# disagrees with the row.
+# ---------------------------------------------------------------------------
+
+def test_a_second_handle_does_not_serve_a_count_invalidated_elsewhere(
+    cached_table, other_handle
+):
+    """
+    The headline case in a deployment: one process writes with restat=False,
+    and every other process must stop serving the count it had cached.
+    """
+    query = {"flag": True}
+    before = cached_table.stats.count(query, record=True)
+    assert before == NFLAGGED
+
+    reader = twin(cached_table, other_handle)
+    assert reader.stats.quick_count(query) == before
+
+    cached_table.update(query, {"flag": False}, restat=False)
+
+    # The reader's copy of the flag still says true -- nothing told it
+    # otherwise, and nothing ever would ...
+    assert reader._stats_valid is True
+    # ... but the row it would have answered from is not an answer any more.
+    assert reader.stats.quick_count(query) is None
+    assert reader.stats.count(query) == 0
+
+
+def test_a_second_handle_does_not_serve_a_distinct_count_invalidated_elsewhere(
+    cached_table, other_handle
+):
+    cols = ["flag"]
+    assert cached_table.stats._slow_count_distinct(cols, record=True) == 2
+
+    reader = twin(cached_table, other_handle)
+    assert reader.stats.quick_count_distinct(cols) == 2
+
+    cached_table.update({"flag": True}, {"flag": False}, restat=False)
+
+    assert reader._stats_valid is True
+    assert reader.stats.quick_count_distinct(cols) is None
+    assert reader.stats.count_distinct("flag") == 1
+
+
+@pytest.mark.parametrize("kind,before,after", [("max", 199, 99), ("min", 0, 0), ("sum", 19900, 4950)])
+def test_a_second_handle_does_not_serve_a_statistic_invalidated_elsewhere(
+    cached_table, other_handle, kind, before, after
+):
+    from psycodict.encoding import Json
+
+    assert getattr(cached_table.stats, kind)("n") == before
+
+    reader = twin(cached_table, other_handle)
+    empty = Json([])
+    assert reader.stats._quick_statistic("n", empty, empty, kind) is not None
+
+    cached_table.delete({"n": {"$gte": 100}}, restat=False)
+
+    assert reader._stats_valid is True
+    assert reader.stats._quick_statistic("n", empty, empty, kind) is None
+    assert getattr(reader.stats, kind)("n", record=False) == after
+
+
+def test_a_second_handle_sees_a_total_another_handle_changed(cached_table, other_handle):
+    """
+    ``total`` is maintained rather than cached, so it is exempt from the gate --
+    which makes reading it from meta_tables rather than from ``self.total`` the
+    only thing keeping it honest across processes.
+    """
+    reader = twin(cached_table, other_handle)
+
+    cached_table.insert_many([sample_row(1000 + i) for i in range(5)], restat=False)
+    cached_table.delete({"n": 0}, restat=False)
+
+    # The value this reader was built with, untouched by either write ...
+    assert reader.stats.total == 200
+    # ... and the value it answers with.
+    assert reader.stats.quick_count({}) == 204
+    assert reader.count() == 204
+
+
+def test_a_stale_local_false_does_not_skip_the_invalidation(cached_table, other_handle):
+    """
+    The inverse failure: a table object whose copy of the flag is already false
+    would, if the transition were conditional on it, leave the row true while
+    changing the data.
+    """
+    query = {"n": {"$lt": 100}}
+    assert cached_table.stats.count(query, record=True) == 100
+
+    cached_table.update({"label": "l0"}, {"x": 9.5}, restat=False)
+    assert cached_table._stats_valid is False
+
+    refresher = twin(cached_table, other_handle)
+    refresher.stats.saving = True
+    refresher.stats.refresh_stats()
+    assert stats_valid_in_meta(cached_table) is True
+    # ... which the first handle has no way of hearing about.
+    assert cached_table._stats_valid is False
+
+    cached_table.update({"label": "l1"}, {"x": 8.5}, restat=False)
+    assert stats_valid_in_meta(cached_table) is False
+    assert cached_table.stats.quick_count(query) is None
+
+
+def test_a_rolled_back_restore_does_not_make_the_cache_usable(cached_table):
+    """
+    A rollback undoes the ``UPDATE`` and not the attribute, so after one the
+    Python object claims a validity the database denies.  The database wins.
+    """
+    query = {"flag": True}
+    assert cached_table.stats.count(query, record=True) == NFLAGGED
+    cached_table.update(query, {"flag": False}, restat=False)
+    assert cached_table.stats.quick_count(query) is None
+
+    with pytest.raises(RuntimeError):
+        with DelayCommit(cached_table):
+            cached_table.stats.refresh_stats()
+            assert cached_table._stats_valid is True
+            raise RuntimeError("the caller changed its mind")
+
+    # The object was left saying true and the row says false ...
+    assert cached_table._stats_valid is True
+    assert stats_valid_in_meta(cached_table) is False
+    # ... so the stale row the rollback restored is still not an answer.
+    assert cached_table.stats.quick_count(query) is None
+    assert cached_table.stats.count(query) == 0
+
+
+def test_a_refresh_and_a_concurrent_write_are_serialized(cached_table, other_handle):
+    """
+    A refresh claims the meta_tables row before it rebuilds anything, so a
+    write that overlaps it waits, and the outcome is one of the two the
+    ordering allows rather than a lost invalidation.
+
+    Here the refresh goes first: the writer's rows are not in the caches it
+    builds, so the writer's ``_break_stats`` lands afterwards and the table
+    ends invalid.  Without the claim, the refresh's restore would have
+    overwritten an invalidation that had already committed.
+    """
+    query = {"flag": True}
+    assert cached_table.stats.count(query, record=True) == NFLAGGED
+    cached_table.update({"label": "l0"}, {"x": 7.5}, restat=False)
+
+    writer = twin(cached_table, other_handle)
+    refresh_started = threading.Event()
+    write_finished = threading.Event()
+    failures = []
+
+    def write():
+        try:
+            refresh_started.wait(TIMEOUT)
+            # Blocks on the row lock the refresh took, until it commits.
+            writer.update(query, {"flag": False}, restat=False)
+        except Exception as err:  # pragma: no cover - reported below
+            failures.append(err)
+        finally:
+            write_finished.set()
+
+    thread = threading.Thread(target=write)
+    thread.start()
+    try:
+        # Hooked at the very start of the rebuild, before refresh_stats writes
+        # anything of its own to meta_tables: later than this and the total's
+        # own UPDATE has already taken the row lock, and the test would pass
+        # whether or not the refresh claimed the row deliberately.
+        original = cached_table.stats._status
+
+        def midway(*args, **kwds):
+            refresh_started.set()
+            # Long enough for the writer to reach the lock and block on it.
+            time.sleep(1)
+            assert not write_finished.is_set(), (
+                "the write committed in the middle of the refresh"
+            )
+            return original(*args, **kwds)
+
+        cached_table.stats._status = midway
+        try:
+            cached_table.stats.refresh_stats()
+        finally:
+            del cached_table.stats._status
+    finally:
+        refresh_started.set()
+        thread.join(TIMEOUT)
+
+    assert not thread.is_alive(), "the writer never unblocked"
+    assert not failures, failures
+    # The write landed after the refresh, so the caches it built do not
+    # describe it, and the table says so.
+    assert stats_valid_in_meta(cached_table) is False
+    assert cached_table.stats.quick_count(query) is None
+    assert cached_table.stats.count(query) == 0
+
+
+# ---------------------------------------------------------------------------
+# every write and swap path makes the transition, in its own transaction
+#
+# The row-level paths always cleared the flag; the bulk and replacement paths
+# did not, so a swap could leave new data under old caches and a true flag.
+# Each of these starts from a valid cached count of the rows it is about to
+# change.
+# ---------------------------------------------------------------------------
+
+def _write_flag_file(path, labels, value):
+    """An update file setting ``flag`` to ``value`` for the given labels."""
+    with open(path, "w") as F:
+        F.write("label|flag\ntext|boolean\n\n")
+        for label in labels:
+            F.write("%s|%s\n" % (label, "t" if value else "f"))
+
+
+@pytest.fixture
+def flagged(cached_table):
+    """
+    A cached, valid count of the flagged rows: what every path below is about
+    to make wrong.
+    """
+    query = {"flag": True}
+    assert cached_table.stats.count(query, record=True) == NFLAGGED
+    assert cached_table.stats.quick_count(query) == NFLAGGED
+    assert stats_valid_in_meta(cached_table) is True
+    return query
+
+
+def assert_disowned(table, query, after=0):
+    """
+    The persisted flag and the public answer, after a path that changed the
+    data without rebuilding the caches.
+    """
+    assert stats_valid_in_meta(table) is False
+    assert table.stats.quick_count(query) is None
+    assert table.stats.count(query) == after
+
+
+def test_in_place_update_from_file_without_restat_invalidates(cached_table, flagged, tmp_path):
+    datafile = str(tmp_path / "flags.txt")
+    _write_flag_file(datafile, ["l%d" % i for i in range(200)], value=False)
+    cached_table.update_from_file(datafile, "label", inplace=True, restat=False)
+    assert_disowned(cached_table, flagged)
+
+
+def test_a_swapping_update_from_file_without_restat_invalidates(cached_table, flagged, tmp_path):
+    """
+    The worst of the untransitioned paths: the search table is replaced and the
+    old counts and stats relations are kept, so every cached answer is now
+    about data that is no longer there.
+    """
+    datafile = str(tmp_path / "flags.txt")
+    _write_flag_file(datafile, ["l%d" % i for i in range(200)], value=False)
+    cached_table.update_from_file(datafile, "label", inplace=False, restat=False)
+    # The old counts row really did survive the swap ...
+    assert cached_table.stats._cached_count({"flag": True}) == NFLAGGED
+    # ... and is not served.
+    assert_disowned(cached_table, flagged)
+
+
+def test_rewrite_without_restat_invalidates(cached_table, flagged):
+    cached_table.rewrite(lambda rec: dict(rec, flag=False), restat=False)
+    assert_disowned(cached_table, flagged)
+
+
+def test_reload_without_restat_invalidates(cached_table, flagged, tmp_path):
+    searchfile = str(tmp_path / "data.txt")
+    cached_table.copy_to(searchfile)
+    cached_table.update({"flag": True}, {"flag": False}, restat=False)
+    cached_table.stats.refresh_stats()
+    assert stats_valid_in_meta(cached_table) is True
+
+    # Reload the file dumped before that change: the data goes back to having
+    # flagged rows, and the counts and stats swapped in are empty clones this
+    # reload never wrote, so it does not vouch for them.
+    cached_table.reload(searchfile, restat=False)
+    table = cached_table._db[cached_table.search_table]
+    assert stats_valid_in_meta(table) is False
+    assert table.stats.count({"flag": True}) == NFLAGGED
+
+
+def test_a_swapping_update_from_file_with_restat_ends_valid(cached_table, tmp_path):
+    """
+    The other half of the contract: when the counts and stats reaching the live
+    names were rebuilt for the data reaching the live name, the swap says so,
+    and the rebuilt value is served.
+    """
+    cached_table.stats.add_stats(["flag"])
+    assert cached_table.stats.quick_count({"flag": True}) == NFLAGGED
+
+    # Start invalid, so that ending valid is a transition this swap made
+    # rather than one it inherited from the table it replaced.
+    cached_table.update({"label": "l0"}, {"x": 6.5}, restat=False)
+    assert stats_valid_in_meta(cached_table) is False
+
+    datafile = str(tmp_path / "flags.txt")
+    _write_flag_file(datafile, ["l%d" % i for i in range(200)], value=True)
+    cached_table.update_from_file(datafile, "label", inplace=False, restat=True)
+
+    assert stats_valid_in_meta(cached_table) is True
+    assert cached_table.stats.quick_count({"flag": True}) == 200
+
+
+def test_a_reload_with_restat_ends_valid(cached_table, tmp_path):
+    cached_table.stats.add_stats(["flag"])
+    searchfile = str(tmp_path / "data.txt")
+    cached_table.copy_to(searchfile)
+
+    cached_table.update({"flag": True}, {"flag": False}, restat=False)
+    assert stats_valid_in_meta(cached_table) is False
+
+    cached_table.reload(searchfile, restat=True)
+    table = cached_table._db[cached_table.search_table]
+    assert stats_valid_in_meta(table) is True
+    assert table.stats.quick_count({"flag": True}) == NFLAGGED
+
+
+def test_a_reload_with_a_metafile_does_not_take_its_validity_from_the_file(
+    cached_table, tmp_path
+):
+    """
+    A metafile's ``stats_valid`` describes the table it was exported from at
+    export time, and cannot know whether this reload rebuilt anything.  The
+    swap's own answer wins, and the rest of the row still lands.
+    """
+    searchfile = str(tmp_path / "data.txt")
+    metafile = str(tmp_path / "meta.txt")
+    cached_table.copy_to(searchfile, metafile=metafile)
+    with open(metafile) as F:
+        assert "|t|" in F.read()  # exported while valid
+
+    cached_table.reload(searchfile, metafile=metafile, restat=False, silence_meta=True)
+    table = cached_table._db[cached_table.search_table]
+    assert stats_valid_in_meta(table) is False
+
+
+def test_reload_revert_invalidates(cached_table, tmp_path):
+    """
+    A backup carries no validity bit of its own: meta_tables has one row, and
+    it stayed with the live name.  So a backup taken while the table was
+    invalid can be swapped back under a flag that has since been set true, and
+    the only safe answer is to clear it.
+    """
+    table = cached_table
+    table.stats.add_stats(["flag"])
+    searchfile = str(tmp_path / "data.txt")
+    table.copy_to(searchfile)
+
+    # Back up an invalid state: change the data, do not restat, then reload
+    # (which files the current relations away as _old1 and ends valid).
+    table.update({"flag": True}, {"flag": False}, restat=False)
+    assert stats_valid_in_meta(table) is False
+    table.reload(searchfile, restat=True)
+    table = table._db[table.search_table]
+    assert stats_valid_in_meta(table) is True
+
+    table.reload_revert()
+    assert stats_valid_in_meta(table) is False
+    # and the total describes what is now live, not what was
+    assert table.stats.quick_count({}) == table.stats._slow_count({}, record=False)
+
+
+def test_the_flag_and_the_swap_roll_back_together(cached_table, tmp_path, monkeypatch):
+    """
+    The transition is written in the transaction that does the renames, so a
+    failure between them cannot commit one without the other.
+    """
+    table = cached_table
+    searchfile = str(tmp_path / "data.txt")
+    table.copy_to(searchfile)
+    table.update({"label": "l0"}, {"x": 4.5}, restat=False)
+    assert stats_valid_in_meta(table) is False
+
+    def boom(self, *args, **kwds):
+        raise RuntimeError("the swap blew up")
+
+    # The last thing reload_final_swap does inside its transaction, after both
+    # the renames and the flag.
+    monkeypatch.setattr(type(table._db), "_notify_schema_change", boom)
+    with pytest.raises(RuntimeError):
+        table.reload(searchfile, restat=True)
+    table._db.conn.rollback()
+
+    # Neither half committed: the flag is still what it was, and there is no
+    # backup, so the renames did not happen either.  (DDL is transactional, so
+    # the rollback took the _tmp relations the reload had built with it.)
+    assert stats_valid_in_meta(table) is False
+    assert not table._table_exists(table.search_table + "_old1")
+    assert not table._table_exists(table.search_table + "_tmp")
+    assert table.stats.count({}) == 200
+
+
+@pytest.mark.parametrize(
+    "path,after",
+    [
+        ("update", 0),
+        ("delete", 0),
+        ("upsert", 0),
+        ("insert_many", 0),
+        ("copy_from", 2 * NFLAGGED),
+    ],
+)
+def test_the_row_level_paths_still_invalidate(cached_table, flagged, tmp_path, path, after):
+    """
+    The paths that always did, re-checked now that the transition is
+    unconditional -- a table object whose copy of the flag has drifted must not
+    skip it.
+    """
+    table = cached_table
+    if path == "update":
+        table.update({"flag": True}, {"flag": False}, restat=False)
+    elif path == "delete":
+        table.delete({"flag": True}, restat=False)
+    elif path == "upsert":
+        for i in range(0, 200, 3):
+            table.upsert({"label": "l%d" % i}, {"flag": False})
+    elif path == "insert_many":
+        table.delete({"flag": True}, restat=False)
+        table._restore_stats()
+        table.insert_many([dict(sample_row(1000), flag=False)], restat=False)
+    else:
+        # include_id=False so the appended rows get fresh ids after the
+        # existing ones rather than colliding with them.
+        searchfile = str(tmp_path / "more.txt")
+        table.copy_to(searchfile, query={"flag": True}, include_id=False)
+        table.copy_from(searchfile, restat=False)
+    assert_disowned(table, flagged, after)
+
+
+def test_a_staged_commit_invalidates(cached_table, flagged):
+    """
+    A staged commit swaps in empty counts and stats tables, so whatever the
+    live ones held is gone and nothing has been rebuilt.
+    """
+    with cached_table.staged() as staged:
+        staged.update({"flag": True}, {"flag": False}, restat=False)
+    table = cached_table._db[cached_table.search_table]
+    assert_disowned(table, flagged)
+
+
+# ---------------------------------------------------------------------------
+# "may this be served" is not "is this row here"
+#
+# Cache maintenance chooses between INSERT and UPDATE by asking whether the row
+# it is about to write already exists.  Routed through the gated lookups, that
+# question is answered "no" on every invalid table -- which is every table the
+# maintenance runs on -- and each recorder leaves a second row behind under a
+# key the rest of the code takes to identify at most one.
+# ---------------------------------------------------------------------------
+
+def stored_counts_for(table, query, split=False):
+    """
+    Every count physically stored under this cache key, gate or no gate.
+    """
+    cols, vals = table.stats._split_dict(query)
+    cur = table._execute(
+        SQL(
+            "SELECT count FROM {0} WHERE cols = %s AND values = %s AND split = %s"
+        ).format(Identifier(table.stats.counts)),
+        [cols, vals, split],
+    )
+    return [row[0] for row in cur]
+
+
+def stored_stat_values(table, cols, kind, query={}):
+    """
+    Every statistic physically stored under this cache key.
+    """
+    from psycodict.encoding import Json
+
+    ccols, cvals = table.stats._split_dict(query)
+    cur = table._execute(
+        SQL(
+            "SELECT value FROM {0} WHERE stat = %s AND cols = %s "
+            "AND constraint_cols = %s AND constraint_values = %s"
+        ).format(Identifier(table.stats.stats)),
+        [kind, Json(cols), ccols, cvals],
+    )
+    return [int(row[0]) for row in cur]
+
+
+def test_updating_the_total_while_invalid_leaves_one_row(cached_table):
+    """
+    The reproducible case: a write clears the flag and then maintains the
+    total, and the maintenance asked the gated lookup whether the ``{}`` row
+    was there.  It said no, because the flag was false, so a second ``{}`` row
+    was inserted -- by the write that had just cleared the flag itself.
+    """
+    assert stored_counts_for(cached_table, {}) == [200]
+
+    cached_table.insert_many([sample_row(1000)], restat=False)
+    assert stats_valid_in_meta(cached_table) is False
+
+    assert stored_counts_for(cached_table, {}) == [201]
+    assert cached_table.stats.quick_count({}) == 201
+
+
+def test_recording_a_count_again_while_invalid_leaves_one_row(cached_table):
+    query = {"n": {"$lt": 100}}
+    assert cached_table.stats.count(query, record=True) == 100
+    assert stored_counts_for(cached_table, query) == [100]
+
+    cached_table.delete({"n": {"$lt": 50}}, restat=False)
+    assert stats_valid_in_meta(cached_table) is False
+
+    assert cached_table.stats.count(query, record=True) == 50
+    # One row, holding the recomputed value -- not two that happen to agree.
+    assert stored_counts_for(cached_table, query) == [50]
+
+
+def test_recording_a_distinct_count_again_while_invalid_leaves_one_row(cached_table):
+    """
+    Also the first thing ever to run ``_record_count_distinct``'s update
+    statement, which named a column ``stats`` that has always been called
+    ``stat``: while the gated lookup answered this question, the update branch
+    was unreachable on exactly the tables that needed it.
+    """
+    cols = ["flag"]
+    assert cached_table.stats._slow_count_distinct(cols, record=True) == 2
+    assert stored_stat_values(cached_table, cols, "distinct") == [2]
+
+    cached_table.update({"flag": True}, {"flag": False}, restat=False)
+    assert stats_valid_in_meta(cached_table) is False
+
+    assert cached_table.stats._slow_count_distinct(cols, record=True) == 1
+    assert stored_stat_values(cached_table, cols, "distinct") == [1]
+
+
+@pytest.mark.parametrize("kind,before,after", [("max", 199, 99), ("min", 0, 0), ("sum", 19900, 4950)])
+def test_recording_a_statistic_again_while_invalid_leaves_one_row(
+    cached_table, kind, before, after
+):
+    assert getattr(cached_table.stats, kind)("n") == before
+    assert stored_stat_values(cached_table, ["n"], kind) == [before]
+
+    cached_table.delete({"n": {"$gte": 100}}, restat=False)
+    assert stats_valid_in_meta(cached_table) is False
+
+    assert getattr(cached_table.stats, kind)("n") == after
+    assert stored_stat_values(cached_table, ["n"], kind) == [after]
+
+
+def test_refreshing_an_invalid_table_leaves_every_key_unique(cached_table):
+    """
+    A refresh records the total through the same recorder, on a table it has
+    just marked invalid, so it could duplicate the very keys it was rebuilding.
+    """
+    from test_stats_duplicates import duplicated_count_keys, duplicated_stat_keys
+
+    table = cached_table
+    table.stats.add_stats(["flag"])
+    assert table.stats.count({"n": {"$lt": 100}}, record=True) == 100  # an extra count
+    table.stats.max("n")
+
+    table.delete({"n": {"$gte": 150}}, restat=False)
+    assert stats_valid_in_meta(table) is False
+
+    table.stats.refresh_stats()
+    assert stats_valid_in_meta(table) is True
+
+    assert duplicated_count_keys(table) == []
+    assert duplicated_stat_keys(table) == []
+    assert stored_counts_for(table, {}) == [150]
+    assert stored_counts_for(table, {"n": {"$lt": 100}}) == [100]
+    assert stored_counts_for(table, {"flag": True}) == [len([i for i in range(150) if i % 3 == 0])]

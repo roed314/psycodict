@@ -110,11 +110,27 @@ These mutate the live table directly.  They are convenient for small edits; for 
 
 **Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call; otherwise they are simply marked invalid.
 
+Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
+
+### What `stats_valid` promises
+
 `stats_valid` is enforced rather than merely recorded: while it is false, a
 cached nonempty-query count, distinct count, minimum, maximum or sum reports a
 miss, and the method computes the answer instead of returning the stored one.
 The empty-query `total` is the exception, since it is maintained on every write
 and so stays exact.
+
+The promise is made by the database, not by the process making it.  Each of
+those lookups tests `meta_tables.stats_valid` **in the same `SELECT`** that
+reads the cached row, so a cached answer can only be served under a snapshot
+that says the cache is valid; a table object's `_stats_valid` attribute is
+advisory, and correctness never rests on it.  That is what makes the flag hold
+in a deployment running several webserver processes: one process's
+`restat=False` write stops every other process from serving the affected
+counts, without any of them being told.  For the same reason `count()` on an
+empty query answers from `meta_tables.total` rather than from the copy its
+table object was built with, which is a single-row metadata lookup and not a
+scan.
 
 `column_counts`, `numstats` and `null_counts` are the other exception, and a
 caveat worth knowing.  The line is what a cache miss costs: the counts above
@@ -124,16 +140,56 @@ column.  Making them miss while the table is invalid would rebuild on every
 call and never converge, since only `refresh_stats()` restores the flag, so
 they read what is recorded.  A value recorded before an unrefreshed write is
 therefore still reported by them; run `refresh_stats()` after a write you did
-not `restat`.  The flag goes back to true only in `refresh_stats()`, inside
-the transaction that rebuilt the caches, so a refresh that fails part-way leaves
-the table marked invalid rather than claiming a cache it does not have.
-Refreshing a `_tmp` copy does not validate the live table.
+not `restat`.
+
+The flag goes back to true only in `refresh_stats()`, inside the transaction
+that rebuilt the caches, so a refresh that fails part-way leaves the table
+marked invalid rather than claiming a cache it does not have; a rollback
+likewise leaves the stored flag false whatever the Python object was left
+saying.  Refreshing a `_tmp` copy does not validate the live table.
+
+A live `refresh_stats()` claims the table's `meta_tables` row at the start, by
+marking it invalid, and holds that row lock for the whole rebuild.  Every
+library write marks the same row, so a write that overlaps a refresh waits for
+it, and the result is one of the two orderings rather than a race: either the
+write went first and its rows are in the caches the refresh commits, or the
+refresh went first and the write's invalidation lands after it, leaving the
+table invalid.
+
+### Which operations set it, and to what
+
+Every write and swap makes its validity transition **in the same transaction as
+the data change or rename**, so the flag and the relations cannot come apart:
+
+| operation | leaves `stats_valid` |
+| --- | --- |
+| `insert_many`, `upsert`, `update`, `delete`, `copy_from`, in-place `update_from_file` | false, then true if `saving` and `restat` refreshed the caches |
+| non-inplace `update_from_file`, `rewrite` | true iff `saving` and `restat` (which is exactly when the rebuilt `_tmp` counts and stats are swapped in with the data) |
+| `reload`, `reload_all` | true iff `saving` and either `restat`, or both a `countsfile` and a `statsfile` were supplied |
+| staged commit, `staged_force_swap` | false — the staged counts and stats tables are empty, not refreshed |
+| `reload_revert` | false |
+| `refresh_stats()` on the live table | true |
+
+`reload_final_swap` and `_swap_in_tmp` take the intended state as a
+`stats_valid=` argument, defaulting to false; a deferred final swap (`reload`
+with `final_swap=False`) should be given the value its `reload` would have
+computed.  Nothing inherits the old live table's flag, which was a fact about
+data that is no longer there.
+
+Two consequences worth spelling out.  A `metafile` carries a `stats_valid`
+column, and the swap's own answer overrules it: the file records what was true
+of the table it was exported from, at export time, and cannot know whether the
+relations being swapped in were rebuilt.  And `reload_revert` clears the flag
+because a backup carries no validity bit of its own — `meta_tables` has one row
+and it stayed with the live name — so a backup taken while the table was
+invalid could otherwise come back under a flag that had since been set true; it
+also recounts the total for the same reason.
 
 Bulk paths also run PostgreSQL's own `ANALYZE`, which is a different thing from
 psycodict's statistics: a freshly loaded relation has no planner statistics
 until autovacuum reaches it.  Replacement tables are analyzed while still named
 `_tmp`, before the swap, since the catalog entry follows the relation through
-the rename; `copy_from` analyzes the live table it loaded into.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
+the rename; `copy_from` analyzes the live table it loaded into.
 
 ### Resorting is disabled
 

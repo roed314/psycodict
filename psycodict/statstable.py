@@ -260,7 +260,9 @@ class PostgresStatsTable(PostgresBase):
         ``_set_total``, which stores the result of a recount.
         """
         if total is None:
-            total = self.quick_count({}, startup=True)
+            # The physical row, not the maintained total: this runs precisely
+            # when there is no maintained total to read.
+            total = self._cached_count({})
             if total is None:
                 total = self._slow_count({}, extra=False)
         self.total = total
@@ -277,10 +279,25 @@ class PostgresStatsTable(PostgresBase):
         distinct count and custom statistic for the live table agrees with the
         live data.  A write that does not refresh them clears it, and until a
         refresh restores it a cached row is a stale answer, not an answer -- so
-        every lookup that would serve one is routed through here and reports a
-        miss instead, leaving the caller to compute or recompute.
+        every lookup that would serve one is gated on it and reports a miss
+        instead, leaving the caller to compute or recompute.
 
-        Two things are deliberately outside this rule:
+        The flag is read from ``meta_tables`` rather than from
+        ``self.table._stats_valid``, which is a copy taken when the table
+        object was built: another process invalidating or refreshing the table
+        moves the row and not the copy, and the copy is what a second
+        webserver process would otherwise be serving stale counts on the
+        strength of.  The copy is refreshed from the row here, and remains
+        advisory.
+
+        The gated lookups do not call this.  A separate "is it valid" query
+        followed by a cache query is still two snapshots, and another
+        connection's write can commit between them; they inline
+        :meth:`_cache_gate` instead, so that one statement reads both.  This
+        is the readable form of the same question, for callers -- and tests --
+        that want the flag itself.
+
+        Two things are deliberately outside the rule:
 
         - the empty-query ``total``, which is maintained on every write and
           stays usable regardless (see :meth:`quick_count`);
@@ -292,7 +309,10 @@ class PostgresStatsTable(PostgresBase):
         question about the data -- ``_status``, ``status``, ``extra_counts`` --
         are also not gated: ``refresh_stats`` uses them to discover what to
         recompute, so gating them would make an invalid table forget what
-        statistics it is supposed to have.
+        statistics it is supposed to have.  Neither are the *physical* lookups
+        (``_cached_count`` and friends), which ask whether a row with a given
+        cache key exists rather than whether its value is an answer; cache
+        maintenance runs on invalid tables by definition.
 
         The line this draws is whether a miss costs one bounded query or a
         rebuild.  ``quick_count``, ``quick_count_distinct`` and
@@ -315,7 +335,71 @@ class PostgresStatsTable(PostgresBase):
         """
         if suffix:
             return True
-        return self.table._stats_valid
+        cur = self._execute(
+            SQL("SELECT stats_valid FROM meta_tables WHERE name = %s"),
+            [self.search_table],
+        )
+        row = cur.fetchone()
+        # A table with no meta_tables row has no assertion to go on, and the
+        # conservative reading of a missing assertion is that it does not hold.
+        valid = bool(row) and bool(row[0])
+        self.table._stats_valid = valid
+        return valid
+
+    def _cache_gate(self, suffix=""):
+        """
+        A ``WHERE``-clause fragment, and its parameters, restricting a cache
+        read to the case where the live table's statistics are valid.
+
+        Returned as SQL rather than evaluated, so that the caller can put it in
+        the statement that reads the cached row.  Testing the flag in one
+        statement and reading the cache in the next leaves a window between two
+        snapshots, and a ``restat=False`` write committing inside it is exactly
+        the case this is here to stop: the answer served would be one the
+        database had already disowned by the time it was served.  One statement
+        has one snapshot, and no window.
+
+        A suffixed relation is not gated; see :meth:`_may_use_cache` for that
+        and for the rest of the contract.
+
+        OUTPUT:
+
+        A pair ``(sql, values)``, to be appended to the ``WHERE`` clause and to
+        the parameter list respectively.
+        """
+        if suffix:
+            return SQL(""), []
+        return (
+            SQL(" AND EXISTS (SELECT 1 FROM meta_tables WHERE name = %s AND stats_valid)"),
+            [self.search_table],
+        )
+
+    def _live_total(self):
+        """
+        The live table's row count, as recorded in ``meta_tables``.
+
+        ``self.total`` is a copy taken when this object was built; a write from
+        another process updates the row rather than the copy, so an old table
+        object answering ``count()`` from the copy reports a total that is
+        simply out of date.  The row is what every writer maintains, so the row
+        is what is answered from, and the copy is refreshed from it here.
+
+        This is a single-row lookup on ``meta_tables``, not a scan of the
+        search table, which is why ``count()`` can afford to make it on every
+        empty query -- the reason the total is exempt from the validity gate in
+        the first place is that it is maintained rather than cached.
+        """
+        cur = self._execute(
+            SQL("SELECT total FROM meta_tables WHERE name = %s"),
+            [self.search_table],
+        )
+        row = cur.fetchone()
+        if row is None or row[0] is None:
+            # No meta_tables row, or none recorded in it: nothing better than
+            # the value this object was built with.
+            return self.total
+        self.total = row[0]
+        return self.total
 
     def _has_stats(self, jcols, ccols, cvals, threshold, split_list=False, threshold_inequality=False, suffix=""):
         """
@@ -362,6 +446,32 @@ class PostgresStatsTable(PostgresBase):
         cur = self._execute(selecter, values)
         return cur.rowcount > 0
 
+    def _cached_count(self, query, split_list=False, suffix=""):
+        """
+        The count stored under this cache key, or None if there is no such row.
+
+        The physical counterpart of :meth:`quick_count`: it answers "is there a
+        row here", not "may this value be served", so it does not consult
+        ``stats_valid``.  Cache maintenance needs precisely that question --
+        ``_record_count`` chooses between ``INSERT`` and ``UPDATE``/``DELETE``
+        by it, and a gated lookup calling an existing row missing would insert
+        a second row under a key the rest of the code takes to identify at most
+        one.  See :meth:`_may_use_cache` for the distinction.
+
+        INPUT:
+
+        - ``query`` -- a mongo-style dictionary, as in the ``search`` method.
+        - ``split_list`` -- see the ``add_stats`` method
+        - ``suffix`` -- if provided, the table with that suffix added is read
+        """
+        cols, vals = self._split_dict(query)
+        selecter = SQL(
+            "SELECT count FROM {0} WHERE cols = %s AND values = %s AND split = %s"
+        ).format(Identifier(self.counts + suffix))
+        cur = self._execute(selecter, [cols, vals, split_list])
+        if cur.rowcount:
+            return int(cur.fetchone()[0])
+
     def quick_count(self, query, split_list=False, suffix="", startup=False):
         """
         Tries to quickly determine the number of results for a given query
@@ -373,22 +483,29 @@ class PostgresStatsTable(PostgresBase):
         - ``split_list`` -- see the ``add_stats`` method
         - ``suffix`` -- if provided, the table with that suffix added will be
             used to perform the count
+        - ``startup`` -- for an empty query, read the counts table rather than
+            the maintained total.  Used when ``meta_tables`` has no total yet.
 
         OUTPUT:
 
-        Either an integer giving the number of results, or None if not cached.
+        Either an integer giving the number of results, or None if not cached
+        or if the cache may not be used.
         """
-        if not query and not startup:
-            # The empty-query total is maintained on every write, so it is
-            # exact even when the rest of the cache is not.
-            return self.total
-        if not self._may_use_cache(suffix):
-            return None
+        if not query:
+            # The empty-query total is maintained on every write rather than
+            # cached, so it is exact even when the rest of the cache is not,
+            # and it is not gated.  A suffixed relation has no maintained
+            # total -- the live one describes the live table -- so there, as
+            # at startup, the counts row is what there is to read.
+            if startup or suffix:
+                return self._cached_count(query, split_list, suffix)
+            return self._live_total()
+        gate, gate_values = self._cache_gate(suffix)
         cols, vals = self._split_dict(query)
         selecter = SQL(
-            "SELECT count FROM {0} WHERE cols = %s AND values = %s AND split = %s"
-        ).format(Identifier(self.counts + suffix))
-        cur = self._execute(selecter, [cols, vals, split_list])
+            "SELECT count FROM {0} WHERE cols = %s AND values = %s AND split = %s{1}"
+        ).format(Identifier(self.counts + suffix), gate)
+        cur = self._execute(selecter, [cols, vals, split_list] + gate_values)
         if cur.rowcount:
             return int(cur.fetchone()[0])
 
@@ -510,11 +627,12 @@ class PostgresStatsTable(PostgresBase):
         data = [count, cols, vals, split_list]
         # Consult the counts table itself to decide between INSERT and UPDATE,
         # passing split_list so that we test the same key we are about to
-        # write.  startup=True skips the in-memory total shortcut for an empty
-        # query: that total says nothing about whether the row is actually
-        # present (in particular in a suffixed counts table during a reload),
-        # and updating a missing row would silently record nothing.
-        if self.quick_count(query, split_list, suffix=suffix, startup=True) is None:
+        # write.  This is the *physical* lookup, not quick_count: the question
+        # is whether a row is there to update, and while stats_valid is false
+        # -- which, on every path that gets here after a write, it is -- the
+        # gated lookup would call an existing row missing and this would insert
+        # a second row under the same key.
+        if self._cached_count(query, split_list, suffix=suffix) is None:
             if count == 0 and not nullrec:
                 return # we don't want to store 0 counts since it can break stats
             updater = SQL("INSERT INTO {0} (count, cols, values, split, extra) VALUES (%s, %s, %s, %s, %s)")
@@ -606,10 +724,28 @@ class PostgresStatsTable(PostgresBase):
         Either an integer giving the number of distinct values, or None if not
         cached or if the cache may not be used.
         """
-        if not self._may_use_cache(suffix):
-            return None
+        gate, gate_values = self._cache_gate(suffix)
         ccols, cvals = self._split_dict(query)
-        selecter = SQL("SELECT value FROM {0} WHERE stat = %s AND cols = %s AND constraint_cols = %s AND constraint_values = %s").format(Identifier(self.stats + suffix))
+        selecter = SQL(
+            "SELECT value FROM {0} WHERE stat = %s AND cols = %s "
+            "AND constraint_cols = %s AND constraint_values = %s{1}"
+        ).format(Identifier(self.stats + suffix), gate)
+        cur = self._execute(selecter, ["distinct", Json(cols), ccols, cvals] + gate_values)
+        if cur.rowcount:
+            return int(cur.fetchone()[0])
+
+    def _cached_count_distinct(self, cols, query={}, suffix=""):
+        """
+        Whether a distinct count is stored under this cache key, and its value.
+
+        The physical counterpart of :meth:`quick_count_distinct`, ungated for
+        the reason given in :meth:`_cached_count`.
+        """
+        ccols, cvals = self._split_dict(query)
+        selecter = SQL(
+            "SELECT value FROM {0} WHERE stat = %s AND cols = %s "
+            "AND constraint_cols = %s AND constraint_values = %s"
+        ).format(Identifier(self.stats + suffix))
         cur = self._execute(selecter, ["distinct", Json(cols), ccols, cvals])
         if cur.rowcount:
             return int(cur.fetchone()[0])
@@ -656,10 +792,15 @@ class PostgresStatsTable(PostgresBase):
         """
         ccols, cvals = self._split_dict(query)
         data = [count, Json(cols), "distinct", ccols, cvals]
-        if self.quick_count_distinct(cols, query, suffix=suffix) is None:
+        # The physical lookup, for the reason given in ``_record_count``.
+        if self._cached_count_distinct(cols, query, suffix=suffix) is None:
             updater = SQL("INSERT INTO {0} (value, cols, stat, constraint_cols, constraint_values) VALUES (%s, %s, %s, %s, %s)")
         else:
-            updater = SQL("UPDATE {0} SET value = %s WHERE cols = %s AND stats = %s AND constraint_cols = %s AND constraint_values = %s")
+            # ``stat``, not ``stats``: the column is singular, and with the
+            # gated lookup here this branch was never reached on a table whose
+            # flag a write had just cleared, so the misspelling went unnoticed
+            # until the physical lookup started sending rows down it.
+            updater = SQL("UPDATE {0} SET value = %s WHERE cols = %s AND stat = %s AND constraint_cols = %s AND constraint_values = %s")
         try:
             # This will fail if we don't have write permission,
             # for example, if we're running as the lmfdb user
@@ -800,16 +941,38 @@ class PostgresStatsTable(PostgresBase):
           the constraint columns take on these values.
         - ``kind`` -- either "min" or "max" or "sum"
         """
-        if not self._may_use_cache():
-            return None
+        gate, gate_values = self._cache_gate()
         constraint = SQL("constraint_cols = %s AND constraint_values = %s")
-        values = [kind, Json([col]), ccols, cvals]
+        values = [kind, Json([col]), ccols, cvals] + gate_values
         selecter = SQL(
-            "SELECT value FROM {0} WHERE stat = %s AND cols = %s AND threshold IS NULL AND {1}"
-        ).format(Identifier(self.stats), constraint)
+            "SELECT value FROM {0} WHERE stat = %s AND cols = %s AND threshold IS NULL AND {1}{2}"
+        ).format(Identifier(self.stats), constraint, gate)
         cur = self._execute(selecter, values)
         if cur.rowcount:
             return cur.fetchone()[0]
+
+    def _cached_statistic(self, col, ccols, cvals, kind="max"):
+        """
+        Whether a statistic is stored under this cache key, and its value.
+
+        The physical counterpart of :meth:`_quick_statistic`, ungated for the
+        reason given in :meth:`_cached_count`.  ``None`` here means no row: a
+        row holding a NULL value is reported as ``(True, None)``, since
+        ``_record_statistic`` must still update it rather than insert beside
+        it.
+
+        OUTPUT:
+
+        A pair ``(present, value)``.
+        """
+        constraint = SQL("constraint_cols = %s AND constraint_values = %s")
+        selecter = SQL(
+            "SELECT value FROM {0} WHERE stat = %s AND cols = %s AND threshold IS NULL AND {1}"
+        ).format(Identifier(self.stats), constraint)
+        cur = self._execute(selecter, [kind, Json([col]), ccols, cvals])
+        if cur.rowcount:
+            return True, cur.fetchone()[0]
+        return False, None
 
     def _slow_statistic(self, col, constraint, kind="max"):
         """
@@ -867,15 +1030,28 @@ class PostgresStatsTable(PostgresBase):
         - ``kind`` -- the kind of statistic. Usually ``min`` or ``max`` or ``sum``
         """
         try:
-            inserter = SQL(
-                "INSERT INTO {0} "
-                "(cols, stat, value, constraint_cols, constraint_values) "
-                "VALUES (%s, %s, %s, %s, %s)"
-            )
-            self._execute(
-                inserter.format(Identifier(self.stats)),
-                [Json([col]), kind, m, ccols, cvals],
-            )
+            # Replace the row under this key if there is one.  ``max`` and
+            # friends only get here when the gated lookup missed, which
+            # happens both when nothing is recorded and when the table is
+            # invalid -- so the physical lookup is what distinguishes "record
+            # this" from "correct what is recorded", and without it every
+            # max/min/sum taken on an invalid table left another row behind.
+            present, _ = self._cached_statistic(col, ccols, cvals, kind)
+            if present:
+                updater = SQL(
+                    "UPDATE {0} SET value = %s "
+                    "WHERE cols = %s AND stat = %s AND threshold IS NULL "
+                    "AND constraint_cols = %s AND constraint_values = %s"
+                )
+                values = [m, Json([col]), kind, ccols, cvals]
+            else:
+                updater = SQL(
+                    "INSERT INTO {0} "
+                    "(cols, stat, value, constraint_cols, constraint_values) "
+                    "VALUES (%s, %s, %s, %s, %s)"
+                )
+                values = [Json([col]), kind, m, ccols, cvals]
+            self._execute(updater.format(Identifier(self.stats)), values)
         except Exception:
             pass
 
@@ -1877,10 +2053,31 @@ ORDER BY v.ord LIMIT %s"""
         - ``reset_None_to_1`` -- change threshold None to 1 in stored statistics
         - ``suffix`` -- appended to the table name when computing and storing stats.
             Used when reloading a table.
+
+        A live refresh claims the table's ``meta_tables`` row before it starts,
+        by marking it invalid, and marks it valid again only at the end -- so
+        the flag is false for the whole rebuild, and the row lock that claim
+        takes is held until this transaction ends.  Every library write marks
+        the same row too, so a writer and a refresh that overlap cannot
+        interleave; one of them waits, and the two possible orders are the two
+        acceptable outcomes:
+
+        - the writer went first, so its rows are in the data this rebuild
+          reads, and the caches this commits describe them; or
+        - the refresh went first, and the writer's ``_break_stats`` lands
+          afterwards, leaving the table invalid -- correctly, since its rows
+          are not in the caches just built.
+
+        Restoring the flag at the end without claiming it at the start would
+        admit a third: a write committing mid-rebuild, its invalidation then
+        overwritten by a refresh that had already counted some families
+        without it.
         """
         self._logger.info("Refreshing statistics on %s" % self.search_table)
         t0 = time.time()
         with DelayCommit(self, silence=True):
+            if not suffix:
+                self.table._break_stats()
             # Determine the stats and counts currently recorded
             stat_cmds, split_cmds, nstat_cmds = self._status(reset_None_to_1)
             col_value_dict = self.extra_counts(include_counts=False, suffix=suffix)

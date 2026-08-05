@@ -370,29 +370,66 @@ hardening standalone use; the highlights:
   flag but read paths ignored it, so a count cached before a `restat=False`
   write kept being served afterwards -- verified: a query counted at 67, then
   every matching row changed, still answered 67. Every lookup that would serve
-  a cached answer now goes through one predicate and reports a miss while the
-  flag is false: `quick_count`, `quick_count_distinct` and `_quick_statistic`,
-  which is what makes `count`, `max`, `min` and `sum` compute the answer
-  instead of returning a recorded one. The line is whether a miss costs one
-  bounded query or a rebuild, so these are deliberately not gated: the
-  empty-query `total`, maintained on every write and so exact; the `_status` /
-  `status` / `extra_counts` inventory, which is how `refresh_stats` discovers
-  what to recompute; `_has_stats` / `_has_numstats`, which decide whether a
-  whole statistics family needs computing; and `null_counts`, whose fallback
-  is one full count *per search column*. Gating that last group made
-  `column_counts`, `numstats` and `null_counts` rebuild on every call with
-  nothing to converge on, since only `refresh_stats` restores the flag --
-  measured on the LMFDB, four minutes of downstream suite became over
-  forty-five. **The gap that leaves:** `column_counts`, `numstats` and
-  `null_counts` can still report a value recorded before an unrefreshed
-  write.
+  a cached answer now reports a miss while the flag is false: `quick_count`,
+  `quick_count_distinct` and `_quick_statistic`, which is what makes `count`,
+  `max`, `min` and `sum` compute the answer instead of returning a recorded
+  one. The line is whether a miss costs one bounded query or a rebuild, so
+  these are deliberately not gated: the empty-query `total`, maintained on
+  every write and so exact; the `_status` / `status` / `extra_counts`
+  inventory, which is how `refresh_stats` discovers what to recompute;
+  `_has_stats` / `_has_numstats`, which decide whether a whole statistics
+  family needs computing; and `null_counts`, whose fallback is one full count
+  *per search column*. Gating that last group made `column_counts`, `numstats`
+  and `null_counts` rebuild on every call with nothing to converge on, since
+  only `refresh_stats` restores the flag -- measured on the LMFDB, four minutes
+  of downstream suite became over forty-five. **The gap that leaves:**
+  `column_counts`, `numstats` and `null_counts` can still report a value
+  recorded before an unrefreshed write.
   Closing it needs freshness per statistic rather than one flag per table,
   which is a metadata format change; `refresh_stats()` is the remedy
   meanwhile. A suffixed (`_tmp`, `_oldN`) table is not gated by the live
-  table's flag, since it carries its own caches. The flag is restored only by
-  `refresh_stats()`, inside the transaction that rebuilt the caches, so a
-  failed refresh leaves the table invalid; refreshing a `_tmp` copy does not
-  validate the live table.
+  table's flag, since it carries its own caches.
+- **The flag is the database's, and it is tested in the same statement as the
+  cache.** Each gated lookup carries `AND EXISTS (SELECT 1 FROM meta_tables
+  WHERE name = %s AND stats_valid)` into the `SELECT` that reads the cached
+  row, rather than consulting the `_stats_valid` attribute a table object was
+  built with. That attribute is a copy: another process's `restat=False` write
+  moves the row and not the copy, so a second webserver process would have gone
+  on serving the counts it had cached, and a rolled-back transaction moves the
+  copy and not the row. Testing the flag in one statement and reading the cache
+  in the next would leave a window between two snapshots for a write to commit
+  in, so both readings go into one statement. `count()` on an empty query
+  likewise answers from `meta_tables.total` rather than from `self.total` --
+  a single-row metadata lookup, not a scan -- so a total another process
+  changed is the one served. `_break_stats` and `_restore_stats` now issue
+  their `UPDATE` unconditionally, since a transition skipped because the local
+  copy already said so is a transition skipped on stale information; the row
+  lock that `UPDATE` takes is also what serializes a refresh against concurrent
+  writers, a refresh now claiming the row before it rebuilds anything rather
+  than only restoring it at the end.
+- **Every replacement and bulk path makes its validity transition, in the
+  transaction that does the work.** `update_from_file` (in place or not),
+  `rewrite`, `reload`, `reload_all`, `reload_revert` and the staged swaps could
+  all change the live data while leaving `stats_valid = true`, so the new gate
+  went on serving the old counts. `_swap_in_tmp` and `reload_final_swap` now
+  take the intended state as an argument and write it with the renames:
+  true when the counts and stats arriving at the live names were rebuilt or
+  loaded for the data arriving with them, false when the old cache companions
+  are kept. A `metafile`'s own `stats_valid` is overruled by what the swap
+  actually did, `reload_revert` invalidates (a backup carries no validity bit
+  of its own) and also recounts the total, and nothing inherits the old live
+  table's flag.
+- **Cache maintenance asks whether the row exists, not whether it may be
+  served.** `_record_count`, `_record_count_distinct` and `_record_statistic`
+  chose between `INSERT` and `UPDATE`/`DELETE` by calling the public lookups,
+  which under the new gate answer "missing" for a row that is physically there
+  -- on every invalid table, which is every table they run on. Each write left
+  a second row behind under a key the rest of the code takes to identify at
+  most one; the plainest case was a write clearing the flag and then
+  duplicating the `{}` total row it maintains. They now use private physical
+  lookups that ignore the flag. This is also the first thing ever to reach
+  `_record_count_distinct`'s update statement, which named a column `stats`
+  that has always been called `stat`.
 - **Bulk paths run `ANALYZE`.** A relation that has just been bulk loaded has
   no planner statistics until autovacuum reaches it, so queries against it are
   costed as though it were tiny. Replacement tables are analyzed while still

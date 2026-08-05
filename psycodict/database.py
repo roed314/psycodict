@@ -2268,7 +2268,17 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
             for table, filedata, included in file_list:
                 if table in failures:
                     continue
-                table.reload_final_swap(tables=included, metafile=filedata[-1], sep=sep)
+                # The swaps are deferred to this second pass, so each one has
+                # to be told the validity its own reload established -- the
+                # call that knew the files is long over, and reload_final_swap
+                # invalidates by default.
+                countsfile, statsfile = filedata[1:3]
+                table.reload_final_swap(
+                    tables=included,
+                    metafile=filedata[-1],
+                    sep=sep,
+                    stats_valid=table._reload_stats_valid(countsfile, statsfile, restat),
+                )
 
         if failures:
             print("Reloaded %s" % (", ".join(tablenames)))
