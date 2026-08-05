@@ -1635,7 +1635,9 @@ class PostgresSearchTable(PostgresTable):
         rows in the table; this can occur if the ids are not consecutive
         due to deletions.
         If there are no results satisfying the query, None is returned
-        (analogously to the ``lucky`` method).
+        (analogously to the ``lucky`` method).  None is also what a projection
+        naming a single column gives when the row chosen has NULL there, again
+        as in ``lucky``.
 
         EXAMPLES::
 
@@ -1696,18 +1698,28 @@ class PostgresSearchTable(PostgresTable):
                 return None
             # a temporary hack FIXME
             minid = self.min_id()
+            # A scalar projection returns the value rather than a dictionary, so
+            # None from lucky is ambiguous: either no row has that id, or the
+            # row is there and the column it projects is NULL.  Only the first
+            # is a miss to try again on, and only a scalar projection needs the
+            # extra query to tell them apart.
+            scalar = projection == 0 or isinstance(projection, str)
             for _ in range(maxtries):
                 # The id may not exist if rows have been deleted
                 # a temporary hack FIXME
                 # rid = random.randint(1, maxid)
                 rid = random.randint(minid, maxid)
                 res = self.lucky({"id": rid}, projection=projection)
-                # lucky returns None when no row has that id.  Anything else is
-                # a hit, including a projection whose value is 0, False, "" or
-                # an empty list -- testing truthiness discarded those rows and
-                # could exhaust maxtries on a table full of them.
+                # Anything that is not None is a hit, including a projection
+                # whose value is 0, False, "" or an empty list -- testing
+                # truthiness discarded those rows and could exhaust maxtries on
+                # a table full of them.
                 if res is not None:
                     return res
+                if scalar and self.exists({"id": rid}):
+                    # A real row whose projected column is NULL.  None is that
+                    # row's value, the same as lucky would return for it.
+                    return None
             raise RuntimeError("Random selection failed!")
 
     def random_sample(self, ratio, query={}, projection=1, mode=None, repeatable=None, silent=False):

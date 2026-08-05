@@ -2,10 +2,12 @@
 """
 Regression tests for the correctness fixes in the rc3 review round.
 
-Each test here fails on the code as it stood at v1.0.0rc2.  They are grouped by
-the thing that was wrong rather than by the method, since several of them are
-the same mistake made in two places: a value formatted into SQL text instead of
-composed, and a result tested for truth instead of for existence.
+Most of these fail on the code as it stood at v1.0.0rc2; the rest pin down the
+behavior next to a fix, so that a later change cannot quietly trade one of these
+bugs for its neighbour.  They are grouped by the thing that was wrong rather
+than by the method, since several of them are the same mistake made in two
+places: a value formatted into SQL text instead of composed, and a result tested
+for truth instead of for existence.
 """
 import random
 
@@ -58,13 +60,26 @@ def test_max_id_does_not_execute_an_injected_statement(db, empty_table):
     """
     The marker table must not exist afterwards: a name carrying its own
     statement has to fail to resolve as a relation, not run.
+
+    The payload starts with a table that really exists and closes that statement
+    cleanly, so on the old code the SELECT succeeds and the CREATE TABLE after
+    it runs.  A payload naming a nonexistent relation would prove nothing: the
+    first statement would fail and abort the transaction before the marker
+    statement was reached, and the test would pass on vulnerable code.
     """
     marker = "marker_%s" % empty_table.search_table[-8:]
-    injected = 'nonexistent"; CREATE TABLE %s (x int); --' % marker
-    with pytest.raises(Exception):
-        empty_table.max_id(injected)
-    db.conn.rollback()
-    assert not db._table_exists(marker)
+    injected = "%s; CREATE TABLE %s (x int); --" % (empty_table.search_table, marker)
+    try:
+        with pytest.raises(Exception):
+            empty_table.max_id(injected)
+        db.conn.rollback()
+        assert not db._table_exists(marker)
+    finally:
+        # A no-op unless the injection ran, which is to say unless this test is
+        # being run against vulnerable code -- where without it the marker table
+        # would outlive the run.
+        db.conn.rollback()
+        db._execute(SQL("DROP TABLE IF EXISTS {0}").format(Identifier(marker)))
 
 
 def test_max_id_reports_empty_as_minus_one(empty_table):
@@ -95,10 +110,41 @@ def test_approx_most_common_scales_by_the_owning_table(db, table_factory):
     big_est = dict(big.stats._approx_most_common("flag", 2))
     assert small_est and big_est
 
-    # every row has flag set, so the estimates must bracket the real counts
+    # flag is boolean and never NULL, so the two values are the whole table and
+    # their estimates have to add up to its size
     assert sum(small_est.values()) == pytest.approx(50, rel=0.25)
     assert sum(big_est.values()) == pytest.approx(1000, rel=0.25)
     assert sum(big_est.values()) > 5 * sum(small_est.values())
+
+
+@pytest.mark.parametrize("coltype", ['text COLLATE "C"', 'text[] COLLATE "C"'])
+def test_approx_most_common_handles_a_collated_column(db, table_factory, coltype):
+    """
+    The cast target was built by appending "[]" to the column declaration, which
+    for a collated column produced 'text COLLATE "C"[]': COLLATE is a clause on
+    the column, not part of the type, so the brackets cannot follow it.
+
+    add_column stores the spelling it was given, so this is reachable without
+    reconnecting -- the method has to work on the table object that added the
+    column.  Collation "C" is the one every server has.
+    """
+    table = table_factory()
+    table.add_column("coll", coltype)
+    scalar = not coltype.startswith("text[]")
+    rows = [
+        dict(conftest.sample_row(i), coll=("v%d" % (i % 3)) if scalar else ["v%d" % (i % 3)])
+        for i in range(200)
+    ]
+    table.insert_many(rows)
+    db._execute(SQL("ANALYZE {0}").format(Identifier(table.search_table)))
+
+    # three values over 200 rows: they are all common, so PostgreSQL keeps every
+    # one of them in most_common_vals and they account for the whole table
+    common = dict(table.stats._approx_most_common("coll", 3))
+    assert len(common) == 3
+    assert sum(common.values()) == pytest.approx(200, rel=0.25)
+    if scalar:
+        assert common.keys() == {"v0", "v1", "v2"}
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +251,39 @@ def test_random_returns_a_false_valued_projection(db, table_factory):
     table.insert_many([dict(conftest.sample_row(i), num=0) for i in range(20)])
     for _ in range(10):
         assert table.random({}, "num") == 0
+
+
+def test_random_returns_none_for_a_null_scalar_projection(db, table_factory):
+    """
+    For a projection naming one column, lucky returns None both when no row has
+    the sampled id and when the row is there with NULL in that column.  Treating
+    the second as a missing id exhausted maxtries and raised "Random selection
+    failed!" on a table whose ids are consecutive.
+    """
+    table = table_factory()
+    table.insert_many([dict(conftest.sample_row(i), num=None) for i in range(20)])
+    # the no-query branch: consecutive ids, so every id it samples is a real row
+    assert (table.min_id(), table.max_id()) == (0, 19)
+    for _ in range(10):
+        assert table.random({}, "num") is None
+
+
+def test_random_retries_a_missing_id_before_giving_up(db, table_factory):
+    """
+    The other half of the same branch: an id that really is absent must send the
+    loop round again rather than returning None for it.
+    """
+    table = table_factory()
+    table.insert_many([conftest.sample_row(i) for i in range(20)])
+    # everything between the extremes is gone, so most draws miss
+    db._execute(
+        SQL("DELETE FROM {0} WHERE id > 0 AND id < 19").format(
+            Identifier(table.search_table)
+        )
+    )
+    assert (table.min_id(), table.max_id()) == (0, 19)
+    for _ in range(10):
+        assert table.random({}, "num") in (7, 197)
 
 
 def test_random_returns_none_for_an_empty_table(empty_table):

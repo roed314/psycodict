@@ -21,7 +21,7 @@ from psycopg import DatabaseError
 from psycopg.sql import SQL, Identifier, Literal
 
 from .base import PostgresBase
-from .validation import column_type_sql, physical_table_name
+from .validation import array_cast_type_sql, physical_table_name
 from .encoding import Json, numeric_converter
 from .utils import DelayCommit, KeyedDefaultDict, make_tuple
 
@@ -1655,11 +1655,16 @@ class PostgresStatsTable(PostgresBase):
         # used to be read from a hard-coded public.nf_fields, so on any other
         # table the estimate was that table's frequencies scaled by an
         # unrelated row count.
+        #
+        # most_common_vals is an anyarray, read out as text and cast back to an
+        # array of the column's type.  That cast target comes from
+        # array_cast_type_sql rather than from the column declaration, which may
+        # carry a COLLATE clause that cannot take array brackets.
         selecter = SQL(
             """SELECT v.{0}, (c.reltuples * freq)::int as estimate_ct
 FROM pg_stats s
 CROSS JOIN LATERAL
-   unnest(s.most_common_vals::text::{1}[]
+   unnest(s.most_common_vals::text::{1}
         , s.most_common_freqs) WITH ORDINALITY v ({0}, freq, ord)
 CROSS  JOIN (
    SELECT c.reltuples FROM pg_class c
@@ -1667,7 +1672,7 @@ CROSS  JOIN (
    WHERE n.nspname = current_schema() AND c.relname = %s) c
 WHERE schemaname = current_schema() AND tablename = %s AND attname = %s
 ORDER BY v.ord LIMIT %s"""
-        ).format(Identifier(col), column_type_sql(self.table.col_type[col]))
+        ).format(Identifier(col), array_cast_type_sql(self.table.col_type[col]))
         cur = self._execute(selecter, [self.search_table, self.search_table, col, n])
         return [tuple(x) for x in cur]
 

@@ -351,8 +351,10 @@ hardening standalone use; the highlights:
   `_approx_most_common` took `reltuples` from a hard-coded `public.nf_fields`
   while taking frequencies from the real table, so on every other table the
   estimate was that table's frequencies multiplied by an unrelated row count.
-  The column type it interpolates now goes through the validated
-  `column_type_sql`.
+  The array type it casts to is now built by the validated
+  `array_cast_type_sql`, which adds the dimension to the data type instead of
+  after the column declaration: appending `[]` to a collated column type gave
+  the unparseable `text COLLATE "C"[]`.
 - **`update_from_file` no longer shares log state between calls.** Its
   `logging` default was a dictionary literal that the method wrote `logid` and
   `aborted` into, so consecutive default calls saw each other's values and a
@@ -361,7 +363,9 @@ hardening standalone use; the highlights:
 - **Random selection edge cases.** `random(query, pick_first=...)` returned
   `None` rather than raising `IndexError` when nothing satisfies the query; a
   projected value of `0`, `False`, `""` or `[]` counts as a result instead of
-  being skipped until `maxtries` ran out; `random_sample` raises `ValueError`
+  being skipped until `maxtries` ran out; a row that exists with SQL `NULL` in
+  the column a scalar projection names returns `None`, as `lucky` does, rather
+  than being mistaken for a missing id; `random_sample` raises `ValueError`
   naming the accepted modes instead of silently returning `None` for an
   unknown one; and a repeatable `choice` sample uses a local
   `random.Random(seed)` rather than reseeding the process-wide generator.

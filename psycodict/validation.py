@@ -231,6 +231,30 @@ def validate_column_type(typ):
         ...
         psycodict.validation.InvalidColumnTypeError: 'text; DROP TABLE students; --' is not a valid type: it contains the character ';'
     """
+    scalar, depth, collation, cost = _split_column_type(typ)
+    spelling = scalar
+    if depth:
+        # an array is variable-width whatever its element type is
+        spelling, cost = spelling + "[]" * depth, -1
+    if collation is not None:
+        spelling = "%s %s" % (spelling, collation)
+    return spelling, cost
+
+
+def _split_column_type(typ):
+    """
+    The layers of a column declaration, validated and taken apart.
+
+    Returns ``(scalar, depth, collation, cost)``: the validated spelling of the
+    underlying scalar type, how many array dimensions were written after it, the
+    ``COLLATE`` clause as it should be emitted (or ``None``), and the storage
+    width of the scalar type.
+
+    :func:`validate_column_type` puts the layers back together into a column
+    declaration.  A cast target is built from the same pieces but leaves the
+    collation out, since ``COLLATE`` is a clause applied to a column or an
+    expression rather than part of the type.
+    """
     if not isinstance(typ, str):
         raise InvalidColumnTypeError("Column type must be a string, not %s" % type(typ).__name__)
     typ = typ.strip()
@@ -262,12 +286,7 @@ def validate_column_type(typ):
             "%s is not a collatable type, so it cannot take a COLLATE clause"
             % (spelling,)
         )
-    if depth:
-        # an array is variable-width whatever its element type is
-        spelling, cost = spelling + "[]" * depth, -1
-    if collation is not None:
-        spelling = "%s %s" % (spelling, collation)
-    return spelling, cost
+    return spelling, depth, collation, cost
 
 
 def _validate_scalar_type(typ):
@@ -309,6 +328,48 @@ def column_type_sql(typ):
         'numeric(10, 2)'
     """
     spelling, _ = validate_column_type(typ)
+    return _type_sql(spelling)
+
+
+def array_cast_type_sql(typ):
+    """
+    The SQL fragment for casting to an array whose elements have type ``typ``,
+    validated by :func:`validate_column_type`.
+
+    This is not ``column_type_sql(typ)`` with ``[]`` appended.  A column type may
+    end in a ``COLLATE`` clause, which belongs to the column rather than to the
+    type: ``text COLLATE "C"[]`` is a syntax error, and the cast target wants the
+    data type alone.  So the collation is dropped and the dimension is added to
+    the type underneath it.
+
+    INPUT:
+
+    - ``typ`` -- a string giving a PostgreSQL column type
+
+    OUTPUT:
+
+    A ``psycopg.sql.SQL`` fragment naming the array type, ready to be
+    interpolated after a ``::``.
+
+    EXAMPLES::
+
+        >>> from psycodict.validation import array_cast_type_sql
+        >>> array_cast_type_sql("text").as_string()
+        'text[]'
+        >>> array_cast_type_sql("integer[]").as_string()
+        'integer[][]'
+        >>> array_cast_type_sql('text COLLATE "C"').as_string()
+        'text[]'
+    """
+    scalar, depth, _, _ = _split_column_type(typ)
+    return _type_sql(scalar + "[]" * (depth + 1))
+
+
+def _type_sql(spelling):
+    """
+    A validated type spelling as SQL, reusing the preconstructed fragment when
+    the spelling is one of the fixed types.
+    """
     fixed = _FIXED_TYPE_SQL.get(spelling)
     return SQL(spelling) if fixed is None else fixed
 
