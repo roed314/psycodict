@@ -20,9 +20,19 @@ deliberate step rather than a side effect of connecting.
 | 0 | 0.x | Baseline: `meta_tables`, `meta_indexes`, `meta_constraints` and their `_hist` counterparts, with no format stamp. |
 | 1 | 1.0 | `meta_indexes` / `meta_indexes_hist` gain a nullable `whereclause` column, holding the predicate of a partial index (NULL for an ordinary index).  Compatible with format 0: everything keeps working against a format-0 database except creating partial indexes. |
 
-The format number is aligned with psycodict's major version: format *N* is
-introduced by psycodict *N*.0, and plans to change the format should be
-scheduled for a major release.
+The format number is a protocol revision in its own right, not psycodict's
+major version; format 1 arriving with psycodict 1.0 is where the two happened
+to start, not a rule that ties them together.  Which release a revision may
+ship in follows from what it does to `min_compat` (see
+[Versioning.md](Versioning.md)):
+
+ * a **compatible, additive** revision — new columns, `min_compat` left low
+   enough that every supported client still connects — may ship in a minor
+   release;
+ * a **breaking** revision — one that raises `min_compat` past a client of the
+   current major series, or otherwise makes that client unsafe — requires a new
+   major version, since under semantic versioning that is what a break in the
+   compatibility promise means.
 
 ## The stamp
 
@@ -102,7 +112,7 @@ it never reads them.
 > mixed-version rollout; once every process has been upgraded to 1.0+ there is
 > nothing to watch for.  (The alternative — leaving a tombstone in the old
 > `meta_version` table so pre-1.0 clients refuse — was declined in favor of the
-> single-stamp design; the numbering aligns with the major version instead.)
+> single-stamp design, which pre-1.0 clients simply cannot see.)
 
 ## Migrating
 
@@ -206,22 +216,26 @@ Suppose the layout of the meta tables must change.  Then:
    reordering or repurposing an existing column is a *breaking* change; avoid
    it if at all possible, and see step 4 if not.
 2. **Bump `META_FORMAT`** in `psycodict/base.py`, add a line to its History
-   comment and to the table at the top of this file.  Schedule the bump for
-   the next major release, so the format number and the major version stay
-   aligned.
+   comment and to the table at the top of this file.  The bump is a protocol
+   revision, so which release it may ship in is decided in step 4, by what it
+   does to `min_compat` — not by matching the format number to the major
+   version.
 3. **Register the migration** in `META_MIGRATIONS` in
    `psycodict/database.py`: a one-line description, the `compatible` flag,
    the `min_compat` to stamp, and the name of a `PostgresDatabase` method
    performing the DDL.  The method does only the DDL, idempotently
    (`IF NOT EXISTS` / `IF EXISTS`); stamping is handled by
    `upgrade_metadata`.
-4. **Choose the compatibility flags honestly.**
+4. **Choose the compatibility flags honestly** — they decide which release
+   the revision may ship in.
    - A purely additive change: `compatible=True`, and `min_compat` stays
-     what it was (0 today).
+     what it was (0 today).  No supported client is shut out, so this may go
+     out in a minor release.
    - A breaking change: `compatible=False` (older-format databases are
      refused rather than warned) and `min_compat` raised to the new format
-     (older psycodicts are refused by newer databases).  Say so loudly in
-     the CHANGELOG.
+     (older psycodicts are refused by newer databases).  That shuts out
+     clients of the current major series, so it requires a new major version.
+     Say so loudly in the CHANGELOG.
 5. **Gate the feature.**  Code that reads or writes the new columns must
    consult `self._db._meta_format` and either degrade (reads: the column is
    absent, so treat it as its default) or raise with instructions (writes

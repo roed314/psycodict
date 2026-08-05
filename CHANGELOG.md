@@ -21,10 +21,13 @@ migration note.
 - **Ported from psycopg2 to psycopg 3.** psycodict no longer depends on
   psycopg2, and it re-exports `SQL`, `Identifier`, `Placeholder`, `Literal`,
   `Composable` and `Composed` from `psycodict` so callers need not import a
-  driver directly. *Migration:* install with the `pgbinary` or `pgsource` extra
-  (`pip install "psycodict[pgbinary]"`; psycopg 3.2.4 or newer -- the
+  driver directly. *Migration:* psycopg is a plain dependency, so
+  `pip install psycodict` brings the pure-Python driver for your system
+  `libpq`; add the `pgbinary` extra for the bundled binary build
+  (`pip install "psycodict[pgbinary]"`) or `pgc` for a locally compiled one.
+  The supported range is psycopg 3.x, version 3.2.4 or later -- the
   notification listener relies on psycopg 3.2 APIs and on 3.2.4's
-  notification-delivery fix), and import the SQL composition classes
+  notification-delivery fix. Import the SQL composition classes
   from `psycodict` rather than `psycopg2.sql`. (#88)
 - **The old `join_search` method is removed.** *Migration:* pass `join=` to
   `search` (or `count` / `lucky`) instead; see the joins section of
@@ -52,7 +55,7 @@ migration note.
   *Migration:* pass `include_nones=False` at `create_table` to keep the old
   behavior of omitting `None`-valued keys from result dictionaries. (#103)
 - **Metadata format 1.** The layout of the `meta_*` tables is now versioned
-  (format 0 is the unstamped 0.x baseline; format 1, aligned with this major
+  (format 0 is the unstamped 0.x baseline; format 1, which arrives with this
   release, adds `meta_indexes.whereclause`), stamped in the new `meta_format`
   table and checked on connect.  A format-0 database keeps working — every
   connection warns and operates at the old format, with the format-1 features
@@ -453,10 +456,12 @@ hardening standalone use; the highlights:
   not necessarily the reverse) and decouples both format numbers from the
   package major version.
 - **Generic defaults instead of LMFDB ones.** The default database name is
-  `postgres` (libpq's own default) rather than `lmfdb`; deployments name their
-  own database in the config or constructor, as LMFDB already does. The unused
-  `secretsfile` argument to `PostgresDatabase` is removed (secrets-file
-  resolution lives in `Configuration`).
+  `postgres` rather than `lmfdb` -- the maintenance database conventionally
+  created with a PostgreSQL cluster, so the one most likely to exist. (Note
+  that it is not libpq's own default, which is the connection user name.)
+  Deployments name their own database in the config or constructor, as LMFDB
+  already does. The unused `secretsfile` argument to `PostgresDatabase` is
+  removed (secrets-file resolution lives in `Configuration`).
 - **Packaging.** The source distribution is complete -- tests including
   `conftest.py`, the maintenance scripts, the guides and metadata files -- and
   CI unpacks it and runs its database-free tests, so a missing file fails the

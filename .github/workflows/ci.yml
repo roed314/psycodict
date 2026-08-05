@@ -216,6 +216,14 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/sdist" && tar xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist"
           src="$(echo "$RUNNER_TEMP"/sdist/psycodict-*)"
+          # Files the sdist must carry that no test would miss: name them, so
+          # dropping one fails here instead of shipping.
+          for f in config.ini.example CHANGELOG.md CONTRIBUTING.md SECURITY.md \
+                   CITATION.cff DataManagement.md MetadataFormats.md \
+                   QueryLanguage.md Searching.md Versioning.md \
+                   tests/conftest.py; do
+            test -f "$src/$f" || { echo "sdist is missing $f"; exit 1; }
+          done
           python -m venv "$RUNNER_TEMP/sdist-venv"
           "$RUNNER_TEMP/sdist-venv/bin/pip" install "${src}[pgbinary,test]"
           cd "$src"

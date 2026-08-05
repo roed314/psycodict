@@ -59,8 +59,10 @@ python -m pip install -e ".[pgbinary,test]"
 python -m pip install ruff
 ```
 
-The `pgsource` extra may be used instead of `pgbinary` when testing against a
-system installation of libpq.
+To test against a system installation of libpq, leave `pgbinary` out and run
+`pip install -e ".[test]"` instead: psycopg is a plain dependency, so the base
+install already brings the pure-Python driver, which uses whatever libpq the
+system provides.  (`pgc` compiles against it instead, and needs build tools.)
 
 ## PostgreSQL test database
 

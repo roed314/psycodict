@@ -75,7 +75,7 @@ after a reconnect.
  * **`meta_tables`** — one row per search table, holding `name`, `sort`, `count_cutoff`, `id_ordered`, `out_of_order`, `stats_valid`, `label_col`, `total`, `important` and `include_nones`.  This is the source of truth psycodict reads on connection to reconstruct each table object.
  * **`meta_indexes`** and **`meta_constraints`** — one row per index / constraint, recording how to rebuild it.  `reload` and `restore_indexes` rebuild from these rows, **not** from whatever is physically on the table (see [reload](#reload)).
  * **`meta_tables_hist`**, **`meta_indexes_hist`**, **`meta_constraints_hist`** — versioned history of the three tables above, so that `reload_meta`/`revert_meta` can roll a table's metadata forward and back.
- * **`meta_format`** — a single-row `(version, min_compat)` stamp of the metadata *format*: the layout of the `meta_*` tables, versioned by an integer aligned with psycodict's major version (`META_FORMAT`).  Every connection checks it.  The same format connects silently; an older but compatible format connects with a warning and operates at that older format (newer features unavailable) so a not-yet-migrated or read-only database — the LMFDB devmirror, say — keeps working; a newer format connects when its stamped `min_compat` admits this psycodict, and is otherwise refused.  A database that has meta tables but no `meta_format` is the unstamped 0.x baseline (format 0); one with no meta tables at all is fresh and must be connected to with `PostgresDatabase(create=True)`, which bootstraps all of the above.  Migrating to a newer format is deliberate — `db.upgrade_metadata()` or `PostgresDatabase(upgrade=True)`, never a side effect of connecting.  See [MetadataFormats.md](MetadataFormats.md) for the full policy (including why a pre-1.0 psycodict must not be pointed at a migrated database).
+ * **`meta_format`** — a single-row `(version, min_compat)` stamp of the metadata *format*: the layout of the `meta_*` tables, versioned by an integer of its own (`META_FORMAT`), independent of psycodict's major version.  Every connection checks it.  The same format connects silently; an older but compatible format connects with a warning and operates at that older format (newer features unavailable) so a not-yet-migrated or read-only database — the LMFDB devmirror, say — keeps working; a newer format connects when its stamped `min_compat` admits this psycodict, and is otherwise refused.  A database that has meta tables but no `meta_format` is the unstamped 0.x baseline (format 0); one with no meta tables at all is fresh and must be connected to with `PostgresDatabase(create=True)`, which bootstraps all of the above.  Migrating to a newer format is deliberate — `db.upgrade_metadata()` or `PostgresDatabase(upgrade=True)`, never a side effect of connecting.  See [MetadataFormats.md](MetadataFormats.md) for the full policy (including why a pre-1.0 psycodict must not be pointed at a migrated database).
 
 Rows of `meta_indexes` and `meta_constraints` become DDL when an index or
 constraint is rebuilt, so psycodict validates them both when they are imported
@@ -215,6 +215,7 @@ The reader (`_read_header_lines`/`_check_header_lines`) checks that these names 
 Here is a genuine two-row export (`db.demo_circles.copy_to("demo_circles.txt")`) of the table created above:
 
 ```
+# psycodict-export-format: 1
 id|center|label|props|radius
 bigint|integer[]|text|jsonb|integer
 
@@ -222,11 +223,11 @@ bigint|integer[]|text|jsonb|integer
 1|{3,4}|big|{"note": "3-4-5", "unit": false}|5
 ```
 
-Note the id column first, the `integer[]` written as `{0,0}`, the `jsonb` keys reordered by Postgres, and (had a value contained a `|`) it would be escaped as `\|`.
+Note the marker line, the id column first, the `integer[]` written as `{0,0}`, the `jsonb` keys reordered by Postgres, and (had a value contained a `|`) it would be escaped as `\|`.
 
 ### `copy_to` and `copy_from`
 
-**`copy_to(searchfile, countsfile=None, statsfile=None, indexesfile=None, constraintsfile=None, metafile=None, columns=None, query=None, include_id=True)`** exports via `COPY ... TO STDOUT`.  Only the *search* file gets the three header lines; the counts, stats, meta, index and constraint files are headerless raw rows (their column layout is fixed and known).  `query` restricts which rows are exported; `columns` restricts which columns.  The counts and stats files are written only if the table has `saving` on.
+**`copy_to(searchfile, countsfile=None, statsfile=None, indexesfile=None, constraintsfile=None, metafile=None, columns=None, query=None, include_id=True)`** exports via `COPY ... TO STDOUT`.  Only the *search* file gets the marker and the three header lines; the counts, stats, meta, index and constraint files are headerless raw rows (their column layout is fixed and known).  `query` restricts which rows are exported; `columns` restricts which columns.  The counts and stats files are written only if the table has `saving` on.
 
 **`copy_from(searchfile, resort=False, reindex=None, restat=True)`** streams a search file into the **existing** table via `COPY ... FROM STDIN`, *appending* rows.  It validates the header, and if the file has no `id` column it assigns ids contiguously starting just after the current maximum (using a temporary sequence).  `reindex` defaults to `True` for files with more than 1000 data rows.  `total` is incremented and statistics invalidated.
 

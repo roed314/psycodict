@@ -1956,8 +1956,9 @@ class PostgresTable(PostgresBase):
 
     def _write_header_lines(self, F, cols, sep="|", include_id=True):
         """
-        Writes the header lines to a file
-        (row of column names, row of column types, blank line).
+        Writes the header lines to a file (the format marker, the row of column
+        names, the row of column types and the blank line that ends the
+        header).
 
         INPUT:
 
@@ -3062,11 +3063,12 @@ class PostgresTable(PostgresBase):
         try:
             with DelayCommit(self, silence=True):
                 if reindex is None:
-                    rowcount = 0
-                    with open(searchfile) as F:
-                        for line in F:
-                            rowcount += 1
-                    reindex = rowcount > 1003 # 3 header lines
+                    # Data rows, not physical lines: the header is three lines
+                    # in a format-0 file and four in a marked one, so counting
+                    # lines would put the documented boundary in a different
+                    # place for each format.
+                    rowcount = self._count_data_rows(searchfile, sep=kwds.get("sep", "|"))
+                    reindex = rowcount > 1000
                 if reindex:
                     self.drop_indexes(permanent=False)
                 now = time.time()

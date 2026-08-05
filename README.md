@@ -131,7 +131,7 @@ See the [CHANGELOG](https://github.com/roed314/psycodict/blob/main/CHANGELOG.md)
 
 - Python 3.9 or newer.
 - PostgreSQL 13 through 18.
-- psycopg 3.2.4 or newer (a plain dependency; the `pgbinary`/`pgc` extras above pick a build).
+- psycopg 3.x, version 3.2.4 or later (`psycopg>=3.2.4,<4`, a plain dependency; the `pgbinary`/`pgc` extras above pick a build).
 
 Python 3.9 and PostgreSQL 13 are already past their upstream end of life;
 psycodict keeps supporting them as legacy compatibility for downstream

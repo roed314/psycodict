@@ -71,9 +71,11 @@ def jsonb_idx(cols, cols_type):
 
 
 # The version of the metadata format described by the constants below: the
-# layout of the meta_* tables, versioned by a single integer aligned with
-# psycodict's major version (format N is introduced by psycodict N.0).  The
-# format of a database is stamped into the single-row meta_format table as
+# layout of the meta_* tables, versioned by a single integer.  That integer is
+# a protocol revision of its own, not psycodict's major version -- a compatible
+# additive revision may ship in a minor release, while one that raises
+# min_compat past a supported client needs a major one.  The format of a
+# database is stamped into the single-row meta_format table as
 # (version, min_compat), and every connection checks it: an older but
 # compatible format connects with a warning and reduced functionality, while
 # a layout this psycodict cannot safely use is refused.  The policy, and the
@@ -102,12 +104,44 @@ META_FORMAT = 1
 EXPORT_FORMAT = 1
 EXPORT_FORMAT_MARKER = "# psycodict-export-format:"
 
+# The whole of the marker grammar: the prefix, then a nonnegative decimal
+# version and nothing else.  Only a line matching this is a version; a line
+# that merely begins with the prefix may well be a format-0 row of column
+# names, since a column may be called anything that is not empty and holds no
+# control characters (see validate_column_name).
+_EXPORT_FORMAT_MARKER_RE = re.compile(
+    r"%s[ \t]*([0-9]+)" % re.escape(EXPORT_FORMAT_MARKER)
+)
+
 
 def export_format_line():
     """
     The marker line a new search-data export begins with, without a newline.
     """
     return "%s %s" % (EXPORT_FORMAT_MARKER, EXPORT_FORMAT)
+
+
+def export_format_version(line):
+    """
+    The export-format version a marker line declares.
+
+    INPUT:
+
+    - ``line`` -- a line known to be a format marker rather than a row of
+      column names.
+
+    OUTPUT:
+
+    The nonnegative integer version, or a ``ValueError`` if ``line`` is not
+    exactly ``# psycodict-export-format: N``.  A signed or non-decimal version
+    is malformed: psycodict has never written one, so a file carrying one was
+    not written by any psycodict.
+    """
+    marker = line.strip()
+    match = _EXPORT_FORMAT_MARKER_RE.fullmatch(marker)
+    if match is None:
+        raise ValueError("Malformed export-format marker: %r" % (marker,))
+    return int(match.group(1))
 
 
 _meta_tables_cols = (
@@ -921,9 +955,10 @@ class PostgresBase():
         self, F, table_name, columns_set, sep="|", prohibit_missing=True
     ):
         """
-        Reads the header lines from a file (row of column names, row of column
-        types, blank line), checking if these names match the columns set and
-        the types match the expected types in the table.
+        Reads the header lines from a file (an optional format marker, the row
+        of column names, the row of column types and the blank line), checking
+        if these names match the columns set and the types match the expected
+        types in the table.
         Returns a list of column names present in the header.
 
         INPUT:
@@ -1043,7 +1078,7 @@ class PostgresBase():
         with DelayCommit(self, silence=True):
             with open(filename) as F:
                 if header:
-                    # This consumes the first three lines
+                    # This consumes the header, leaving F at the first data row
                     columns = self._check_header_lines(F, table, set(columns), sep=sep)
                     addid = "id" not in columns
                 else:
@@ -1359,38 +1394,68 @@ class PostgresBase():
         one is format 0, the historical layout, so every file psycodict has
         ever written still reads.  A version newer than this psycodict
         understands is refused here, before any of the data is loaded.
+
+        A format-0 names row may itself begin with the marker prefix, since a
+        column may be called anything printable, so the prefix alone does not
+        decide which layout this is.  The blank line does: a format-0 header is
+        ``names / types / blank`` and a marked one ``marker / names / types /
+        blank``, so if the third physical line is blank the first line was a
+        row of column names.
         """
         first = F.readline()
-        marker = first.strip()
-        if marker.startswith(EXPORT_FORMAT_MARKER):
-            version_text = marker[len(EXPORT_FORMAT_MARKER):].strip()
-            try:
-                version = int(version_text)
-            except ValueError:
-                raise ValueError(
-                    "Malformed export-format marker: %r" % (marker,)
-                )
-            if version > EXPORT_FORMAT:
-                raise ValueError(
-                    "This file is psycodict export format %s, but this psycodict "
-                    "understands only up to format %s; upgrade psycodict to read "
-                    "it" % (version, EXPORT_FORMAT)
-                )
-            names_line = F.readline()
+        if first.strip().startswith(EXPORT_FORMAT_MARKER):
+            second = F.readline()
+            third = F.readline()
+            if third.strip():
+                # Not a format-0 header, so the first line really is a marker.
+                version = export_format_version(first)
+                if version > EXPORT_FORMAT:
+                    raise ValueError(
+                        "This file is psycodict export format %s, but this psycodict "
+                        "understands only up to format %s; upgrade psycodict to read "
+                        "it" % (version, EXPORT_FORMAT)
+                    )
+                names_line, types_line = second, third
+                blank = F.readline()
+            else:
+                # Format 0, whose one column happens to be named like a marker.
+                names_line, types_line, blank = first, second, third
         else:
             # No marker: format 0, and this first line is the column names.
             names_line = first
+            types_line = F.readline()
+            blank = F.readline()
         names = [x.strip() for x in names_line.strip().split(sep)]
-        types = [x.strip() for x in F.readline().strip().split(sep)]
-        blank = F.readline()
+        types = [x.strip() for x in types_line.strip().split(sep)]
         if blank.strip():
-            raise ValueError("The third line must be blank")
+            raise ValueError("The header must end with a blank line")
         if len(names) != len(types):
             raise ValueError(
                 "The first line specifies %s columns, while the second specifies %s"
                 % (len(names), len(types))
             )
         return list(zip(names, types))
+
+    def _count_data_rows(self, filename, sep="|"):
+        """
+        The number of data rows in a search-data file.
+
+        INPUT:
+
+        - ``filename`` -- the search-data file to count.
+        - ``sep`` -- a string giving the column separator, since the header is
+          parsed to find where the data starts.
+
+        OUTPUT:
+
+        The number of lines after the header.  Counting physical lines instead
+        would count the header too, and a marked file's header is one line
+        longer than an unmarked one's, so the two formats would not agree on
+        what "1000 rows" means.
+        """
+        with open(filename) as F:
+            self._read_header_lines(F, sep=sep)
+            return sum(1 for _ in F)
 
     ##################################################################
     # Exporting, importing, reloading and reverting meta_*           #

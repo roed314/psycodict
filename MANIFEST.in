@@ -21,6 +21,13 @@ include CHANGELOG.md
 include CONTRIBUTING.md
 include SECURITY.md
 
+# The configuration example the guides tell users to copy to config.ini.  It is
+# named here rather than left to setuptools' implicit list, which does not
+# cover it.  (The remaining tracked files at the top level are either included
+# by setuptools itself -- LICENSE, README.md, pyproject.toml, MANIFEST.in -- or
+# development-only: .gitignore and .readthedocs.yaml.)
+include config.ini.example
+
 # The documentation sources, so the sdist can rebuild the docs.
 graft docs
 prune docs/_build

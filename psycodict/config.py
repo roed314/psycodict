@@ -197,8 +197,11 @@ class Configuration():
                 metavar="DBNAME",
                 help="PostgreSQL database name [default: %(default)s]",
                 # A generic default, not an LMFDB one: "postgres" is the
-                # database libpq itself falls back to.  Deployments name their
-                # own database in the config file or constructor.
+                # maintenance database conventionally created with a PostgreSQL
+                # cluster, so it is the one most likely to exist.  (It is not
+                # libpq's own default, which is the connection user name.)
+                # Deployments name their own database in the config file or
+                # constructor.
                 default=defaults.get("postgresql_dbname", "postgres"),
             )
 
