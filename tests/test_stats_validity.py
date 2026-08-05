@@ -323,3 +323,228 @@ def test_copy_from_analyzes_the_live_table(cached_table, table_factory, tmp_path
 
     assert seen == [([target.search_table], "")]
     assert target.count() == 200
+
+
+# ---------------------------------------------------------------------------
+# no changed-data path keeps a cached answer by forgetting the flag
+#
+# The whole gate above is worth nothing if a write changes rows, does not
+# refresh the caches, and leaves stats_valid true: the cached rows are then
+# still served as answers.  These check the flag, the cache and the truth.
+# ---------------------------------------------------------------------------
+
+QUERY = {"flag": True}
+
+
+@pytest.fixture
+def counted(cached_table):
+    """
+    ``cached_table`` with a nonempty-query count actually recorded and served.
+    """
+    before = cached_table.stats.count(QUERY, record=True)
+    assert before == 67
+    assert cached_table.stats.quick_count(QUERY) == before
+    assert stats_valid_in_meta(cached_table) is True
+    return cached_table
+
+
+def assert_invalidated(table, expected):
+    """
+    The flag is false, no cached answer is served, and the truth is available.
+    """
+    assert table._stats_valid is False
+    assert stats_valid_in_meta(table) is False
+    assert table.stats.quick_count(QUERY) is None
+    assert table.count(QUERY) == expected
+
+
+def _flag_flip_file(table, tmp_path, name="u.txt"):
+    """
+    An update file clearing ``flag`` on the rows the cached query counts.
+    """
+    labels = [
+        rec["label"]
+        for rec in table.search(QUERY, projection=["label"])
+    ]
+    path = tmp_path / name
+    with open(path, "w") as F:
+        F.write("label|flag\ntext|boolean\n\n")
+        for label in labels:
+            F.write("%s|f\n" % label)
+    return str(path)
+
+
+def test_inplace_update_from_file_without_restat_invalidates(counted, tmp_path):
+    counted.update_from_file(
+        _flag_flip_file(counted, tmp_path), inplace=True, restat=False
+    )
+    assert_invalidated(counted, 0)
+
+
+def test_replacement_update_from_file_without_restat_invalidates(db, counted, tmp_path):
+    name = counted.search_table
+    counted.update_from_file(_flag_flip_file(counted, tmp_path), restat=False)
+    assert_invalidated(db[name], 0)
+
+
+def test_rewrite_without_restat_invalidates(db, counted):
+    name = counted.search_table
+
+    def clear_flag(rec):
+        rec["flag"] = False
+        return rec
+
+    counted.rewrite(clear_flag, restat=False)
+    assert_invalidated(db[name], 0)
+
+
+def test_inplace_rewrite_without_restat_invalidates(counted):
+    def clear_flag(rec):
+        rec["flag"] = False
+        return rec
+
+    counted.rewrite(clear_flag, inplace=True, restat=False)
+    assert_invalidated(counted, 0)
+
+
+def test_reload_without_matching_caches_invalidates(db, counted, tmp_path):
+    """
+    A reload with no counts/stats files swaps changed search data in beside
+    companions it merely cloned; with restat off nothing rebuilds them.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    counted.copy_to(str(searchfile), include_id=False)
+    # a file whose rows differ from the cached ones
+    text = open(searchfile).read().replace("|t|", "|f|")
+    with open(searchfile, "w") as F:
+        F.write(text)
+
+    counted.reload(str(searchfile), restat=False)
+    assert_invalidated(db[name], 0)
+
+
+def test_a_metafile_cannot_vouch_for_caches_the_reload_did_not_build(db, counted, tmp_path):
+    """
+    meta_tables is replaced wholesale by the metafile, stats_valid included.
+    That flag describes the database the file came from; it must not be
+    installed over caches this reload never rebuilt.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    metafile = tmp_path / "meta.txt"
+    counted.copy_to(str(searchfile), include_id=False, metafile=str(metafile))
+    assert "|t|" in open(metafile).read()  # the file asserts stats_valid
+
+    text = open(searchfile).read().replace("|t|", "|f|")
+    with open(searchfile, "w") as F:
+        F.write(text)
+    counted.reload(str(searchfile), metafile=str(metafile), restat=False)
+
+    assert_invalidated(db[name], 0)
+
+
+def test_a_reload_carrying_its_own_caches_stays_valid(db, counted, tmp_path):
+    """
+    The other half of the rule: an export that supplies counts and stats
+    alongside the search file installed caches built for exactly that data,
+    so the table is entitled to go on serving them.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    countsfile = tmp_path / "counts.txt"
+    statsfile = tmp_path / "stats.txt"
+    counted.copy_to(str(searchfile), countsfile=str(countsfile), statsfile=str(statsfile))
+
+    counted.reload(str(searchfile), countsfile=str(countsfile), statsfile=str(statsfile))
+
+    table = db[name]
+    assert table._stats_valid is True
+    assert stats_valid_in_meta(table) is True
+    assert table.stats.quick_count(QUERY) == 67
+
+
+def test_a_refreshing_replacement_restores_validity(db, counted, tmp_path):
+    """
+    And a replacement that does recompute its caches ends valid, serving the
+    new answer rather than the old one.
+    """
+    name = counted.search_table
+    counted.update_from_file(_flag_flip_file(counted, tmp_path), restat=True)
+
+    table = db[name]
+    assert table._stats_valid is True
+    assert stats_valid_in_meta(table) is True
+    assert table.count(QUERY) == 0
+
+
+def test_a_failed_swap_does_not_leave_validity_behind(counted, tmp_path, monkeypatch):
+    """
+    The flag moves in the same transaction as the swap, so a swap that fails
+    leaves the table exactly as it was -- still valid, still holding the data
+    the caches describe.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    counted.copy_to(str(searchfile), include_id=False)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("swap blew up")
+
+    monkeypatch.setattr(type(counted), "_swap_in_tmp", boom)
+    with pytest.raises(RuntimeError):
+        counted.reload(str(searchfile), restat=False)
+    counted._db.conn.rollback()
+    counted.drop_tmp()
+
+    counted._refresh()
+    assert counted._stats_valid is True
+    assert stats_valid_in_meta(counted) is True
+    assert counted.stats.quick_count(QUERY) == 67
+    assert counted.search_table == name
+
+
+def test_resort_of_a_non_saving_table_ends_invalid(db, table_factory):
+    """
+    Pins the one place the rule is deliberately pessimistic.  ``resort()``
+    renumbers rows without changing them, so the cached counts would still be
+    accurate -- but it goes through the replacement path, which rebuilds the
+    caches only with ``saving`` on and otherwise cannot know they still match.
+    Documented in ``resort``'s docstring: refresh afterwards.
+    """
+    table = table_factory(sort=["n"])
+    table.insert_many([sample_row(i) for i in [3, 1, 2, 0]])
+    assert table.stats.saving is False
+    name = table.search_table
+    table._execute(
+        SQL("UPDATE meta_tables SET stats_valid = true WHERE name = %s"), [name]
+    )
+    table._db.conn.commit()
+    table._refresh()
+
+    table.resort()
+    assert stats_valid_in_meta(db[name]) is False
+
+
+def test_resort_of_a_saving_table_stays_valid(db, counted):
+    """
+    With saving on, the resort rebuilds the counts against the renumbered
+    rows, so the table is entitled to go on serving cached answers.  (The
+    rebuild recomputes the recorded statistics families; a one-off count
+    recorded by hand beforehand is not among them and is not restored.)
+    """
+    name = counted.search_table
+    # sample_row(1000) has flag False, so the cached query still counts 67;
+    # the insert is here to break the order and give resort() work to do.
+    counted.insert_many([sample_row(1000)], restat=False)
+    counted.stats.refresh_stats()
+    counted.resort()
+
+    # The swap installs a fresh table object, and `saving` lives on the
+    # object rather than in meta_tables, so turn it back on to record.
+    table = db[name]
+    table.stats.saving = True
+    assert table._stats_valid is True
+    assert stats_valid_in_meta(table) is True
+    assert table.stats.count(QUERY, record=True) == 67
+    assert table.stats.quick_count(QUERY) == 67

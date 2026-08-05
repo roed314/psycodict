@@ -582,3 +582,113 @@ def test_staged_swap_preserves_column_storage(db, filled_table):
     if version >= 140000:
         assert att("attcompression") == "p"
     assert db[name].lucky({"n": 0}, projection="label") == "stored"
+
+
+##################################################################
+# order bookkeeping across the swap                              #
+##################################################################
+
+
+def _flags(table):
+    """
+    ``out_of_order`` as meta_tables records it for the live table.
+    """
+    cur = table._execute(
+        SQL("SELECT out_of_order FROM meta_tables WHERE name = %s"), [table.search_table]
+    )
+    return cur.fetchone()[0]
+
+
+@pytest.fixture
+def staged_ordered(table_factory):
+    """
+    An ordered table of 20 rows sorted by n, ready to be staged.
+    """
+    table = table_factory(sort=["n"])
+    table.insert_many([sample_row(i) for i in range(20)])
+    table.resort()
+    assert _flags(table) is False
+    return table
+
+
+def test_staged_rewrite_of_a_sort_key_lands_out_of_order(db, staged_ordered):
+    """
+    A staged write is deliberately not allowed to rebuild in sort order, so
+    whatever it did to the sort keys has to reach the live table as
+    out_of_order.  The staged wrapper drops the rewrite's resort request; when
+    that request was also the only record that a sort column had moved, the
+    replacement went live claiming ORDER BY id still matched the sort.
+    """
+    name = staged_ordered.search_table
+
+    def reverse_n(rec):
+        rec["n"] = 1000 - rec["n"]
+        return rec
+
+    with staged_ordered.staged() as staged:
+        staged.rewrite(reverse_n)
+
+    live = db[name]
+    assert live._out_of_order is True
+    assert _flags(live) is True
+    # And the claim is true: ids no longer follow the sort.
+    ns = list(live.search({}, projection="n", sort=[["id", 1]]))
+    assert ns != sorted(ns)
+
+
+def test_staged_rewrite_of_a_sort_key_is_seen_by_the_audit(db, staged_ordered):
+    """
+    The audit is the ground truth the flag is checked against: it must report
+    the same broken ordering, and report OK again once resort() has rebuilt.
+    """
+    from test_id_order_audit import audit
+
+    name = staged_ordered.search_table
+
+    def reverse_n(rec):
+        rec["n"] = 1000 - rec["n"]
+        return rec
+
+    with staged_ordered.staged() as staged:
+        staged.rewrite(reverse_n)
+
+    assert audit.audit_table(db, name)[0] == "MISMATCH"
+    db[name].resort()
+    assert audit.audit_table(db, name)[0] == "OK"
+    assert _flags(db[name]) is False
+
+
+def test_staged_update_from_file_records_the_broken_order(db, staged_ordered, tmp_path):
+    """
+    An explicit resort=True on a staged update still does not rebuild inside
+    the staged context, but it must not lose the fact that the file moves a
+    sort column either.
+    """
+    name = staged_ordered.search_table
+    dump = tmp_path / "u.txt"
+    with open(dump, "w") as F:
+        F.write("label|n\ntext|integer\n\nl5|9999\n")
+
+    with staged_ordered.staged() as staged:
+        staged.update_from_file(str(dump), resort=True)
+        # The staged copy was edited in place, not rebuilt: no renumbering.
+        assert staged._out_of_order is True
+
+    assert _flags(db[name]) is True
+    assert db[name].lucky({"label": "l5"}, projection="n") == 9999
+
+
+def test_staged_write_leaves_untouched_sort_columns_alone(db, staged_ordered, tmp_path):
+    """
+    Staging does not break the order flag by itself; only a write that could
+    have moved a sort key does.
+    """
+    name = staged_ordered.search_table
+    dump = tmp_path / "u.txt"
+    with open(dump, "w") as F:
+        F.write("label|data\ntext|jsonb\n\nl5|{\"a\": 1}\n")
+
+    with staged_ordered.staged() as staged:
+        staged.update_from_file(str(dump))
+
+    assert _flags(db[name]) is False

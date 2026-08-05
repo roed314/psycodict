@@ -137,6 +137,18 @@ the transaction that rebuilt the caches, so a refresh that fails part-way leaves
 the table marked invalid rather than claiming a cache it does not have.
 Refreshing a `_tmp` copy does not validate the live table.
 
+The replacement paths — `reload`, `rewrite`, a non-inplace `update_from_file`,
+and the staged swap — decide the flag in one place, in the same transaction as
+the swap.  The table ends up valid only when the counts and stats that go live
+were built from the data that goes live with them: either recomputed here
+(`restat`, on a table with `saving` on) or supplied whole by the export
+(`reload` given **both** `countsfile` and `statsfile`).  Anything else — a
+`restat=False` write, a partial cache set, companions that were merely cloned
+or left in place beside replaced rows — is marked invalid.  A `metafile`
+carries a `stats_valid` of its own describing the database it was exported
+from; it does not vouch for caches the reload did not install, and is
+overridden to false with a message when it disagrees.
+
 Bulk paths also run PostgreSQL's own `ANALYZE`, which is a different thing from
 psycodict's statistics: a freshly loaded relation has no planner statistics
 until autovacuum reaches it.  Replacement tables are analyzed while still named
@@ -175,11 +187,26 @@ table.update(...)          # marks out_of_order
 table.resort()             # rebuild in sort order
 ```
 
+`resort=False` says *do not rebuild*; it does not say the sort was left alone.
+Whether an update can move the ids is decided from the file — does it carry a
+sort column? — independently of the option, so a write that touches one always
+records `out_of_order = true`, on the in-place path and on the replacement path
+alike.  A `rewrite` runs an arbitrary function and dumps every search column, so
+one that is not rebuilt always marks the table out of order; there is no way to
+tell that it did not move a sort key.  A staged write is not allowed to rebuild
+inside the staged context, but it carries that fact through the commit, so the
+swapped-in table is marked out of order and `resort()` afterwards puts it right.
+
 `scripts/audit_id_order.py` checks the flag against reality: it streams each
 `id_ordered` table in sort order and reports `OK`, `MISMATCH` or an error
-without modifying anything.  Use it before trusting `out_of_order = false` on a
-table whose history includes non-inplace updates, which could have left the flag
-stale.
+without modifying anything.  Each table is audited in a read transaction of its
+own, so one that errors does not affect the tables audited after it.  Use it
+before trusting `out_of_order = false` on a table whose history includes
+non-inplace updates, which could have left the flag stale.
+
+```bash
+python scripts/audit_id_order.py --all
+```
 
 ### Locking
 
