@@ -13,7 +13,16 @@ import json
 import pytest
 
 import psycodict.encoding
-from psycodict.encoding import SAGE_MODE, Array, Json, copy_dumps, numeric_converter
+from conftest import FakeInteger
+from psycodict.encoding import (
+    SAGE_MODE,
+    Array,
+    Json,
+    copy_dumps,
+    homogenize_int_arrays,
+    homogenize_values,
+    numeric_converter,
+)
 
 
 # COPY FROM applies these escapes to every text field it reads; undoing them is
@@ -599,3 +608,112 @@ def test_array_getquoted(seq, expected):
     # array literal instead (sent with unknown oid, so the server casts by
     # context, via ArrayDumper).
     assert Array(seq).getquoted() == expected
+
+
+# ---------------------------------------------------------------------------
+# arrays of more than one integer type
+# ---------------------------------------------------------------------------
+
+def flatten(seq):
+    """
+    Every non-list entry of a possibly nested list, in order.
+    """
+    for item in seq:
+        if isinstance(item, list):
+            yield from flatten(item)
+        else:
+            yield item
+
+
+@pytest.mark.parametrize("value,expected", [
+    # The shape that broke LMFDB: a list assembled from a computed Sage
+    # integer and a couple of literals.
+    ([FakeInteger(1), -1, 1], [1, -1, 1]),
+    ([1, -1, FakeInteger(1)], [1, -1, 1]),
+    # A nested array is a single array to Postgres, and to psycopg, so the
+    # types have to agree across the whole of it and not row by row.
+    ([[FakeInteger(1), 2], [3, 4]], [[1, 2], [3, 4]]),
+    ([[1, 2], [FakeInteger(3), 4]], [[1, 2], [3, 4]]),
+    ([[[FakeInteger(1)], [2]], [[3], [4]]], [[[1], [2]], [[3], [4]]]),
+    # NULL takes no part in the comparison and stays NULL.
+    ([None, FakeInteger(1), 2], [None, 1, 2]),
+    ([[None, FakeInteger(1)], [2, None]], [[None, 1], [2, None]]),
+    # int() of an integral value is exact however big it is.
+    ([FakeInteger(2**80), 1], [2**80, 1]),
+])
+def test_homogenize_converts_arrays_of_several_integer_types(value, expected):
+    out = homogenize_int_arrays(value)
+    assert out == expected
+    assert {type(x) for x in flatten(out) if x is not None} == {int}
+
+
+@pytest.mark.parametrize("value", [
+    # One type is all psycopg asks for, whatever that type is.
+    [1, -1, 1],
+    [FakeInteger(1), FakeInteger(2)],
+    [[1, 2], [3, 4]],
+    [[FakeInteger(1)], [FakeInteger(2)]],
+    # Nothing to compare.
+    [],
+    [None, None],
+    # Not an array at all.  A tuple is a composite value to psycopg, not an
+    # array, so it is none of this function's business either.
+    3,
+    FakeInteger(3),
+    "abc",
+    (FakeInteger(1), 2),
+    # Not all integers: what psycopg makes of these is for psycopg to say.
+    [0.5, 1],
+    [FakeInteger(1), 0.5],
+    ["a", FakeInteger(1)],
+    # bool is an integer to Python but a distinct type to Postgres, so a
+    # list holding one is never quietly turned into a list of numbers.
+    [True, FakeInteger(1)],
+    [True, False],
+])
+def test_homogenize_leaves_everything_else_alone(value):
+    assert homogenize_int_arrays(value) is value
+
+
+@pytest.mark.parametrize("wrapper", ["Int2", "Int4", "Int8", "IntNumeric"])
+def test_homogenize_keeps_the_oid_psycopgs_wrappers_ask_for(wrapper):
+    # These subclass int precisely to pin down the oid an integer is sent
+    # with; replacing them with plain ints would discard the choice.
+    import psycopg.types.numeric
+
+    value = [getattr(psycopg.types.numeric, wrapper)(1), 2]
+    assert homogenize_int_arrays(value) is value
+
+
+def test_homogenize_values_fixes_every_parameter():
+    assert homogenize_values(["a", [FakeInteger(1), 2], 3]) == ["a", [1, 2], 3]
+
+
+def test_homogenize_values_fixes_every_row_of_a_multi_row_insert():
+    rows = [["a", [FakeInteger(1), 2]], ["b", [3, 4]]]
+    assert homogenize_values(rows, values_list=True) == [["a", [1, 2]], ["b", [3, 4]]]
+
+
+@pytest.mark.parametrize("values,values_list", [
+    (["a", [1, 2], 3], False),
+    ([["a", [1, 2]], ["b", [3, 4]]], True),
+    ([], False),
+    (None, False),
+])
+def test_homogenize_values_returns_what_it_was_given_when_nothing_needs_fixing(values, values_list):
+    # Every query psycodict runs goes through this, so the ordinary case of a
+    # query with no mixed array in it must not copy the values.
+    assert homogenize_values(values, values_list) is values
+
+
+@pytest.mark.skipif(not SAGE_MODE, reason="needs SageMath")
+def test_with_sage_arrays_of_integers_and_ints_become_ints():
+    from sage.rings.integer import Integer
+
+    # The real thing, and the real query: the CM field lookup on an elliptic
+    # curve isogeny class page built its coefficient list this way, and every
+    # such page returned a 500 until psycodict homogenized it.
+    D = Integer(-4)
+    out = homogenize_int_arrays([-D, 0, 1])
+    assert out == [4, 0, 1]
+    assert {type(x) for x in out} == {int}

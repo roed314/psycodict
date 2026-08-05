@@ -141,6 +141,13 @@ hardening standalone use; the highlights:
   including nested jsonb decoding. (#61–#87)
 - `$maxgte` and related operators work without requiring custom SQL functions.
   (#61–#87)
+- An array value whose entries are integers of more than one type -- a list
+  built from a Sage `Integer` and a couple of Python `int` literals, say -- is
+  made homogeneous before it is bound, instead of failing with psycopg's
+  `DataError: cannot dump lists of mixed types`. Nested arrays count as one
+  array, as they do in Postgres. Values that psycopg handles on its own,
+  including its `Int2`/`Int4`/`Int8`/`IntNumeric` oid wrappers and anything
+  holding a `bool`, are untouched.
 - Statistics and counts no longer accumulate duplicate rows, and `refresh_stats`
   converges. (#97)
 - Sage-free statistics, fresh-database bootstrap (`create=True`), and jsonb
