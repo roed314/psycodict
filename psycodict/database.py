@@ -2191,12 +2191,9 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     self.create_table(tablename, search_columns, None, force_description=False)
 
             for tablename in self.tablenames:
-                included = []
-
                 searchfile = data_folder / (tablename + ".txt")
                 if not searchfile.exists():
                     continue
-                included.append(tablename)
 
                 table = self[tablename]
 
@@ -2208,15 +2205,11 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     )
 
                 countsfile = data_folder / (tablename + "_counts.txt")
-                if countsfile.exists():
-                    included.append(tablename + "_counts")
-                else:
+                if not countsfile.exists():
                     countsfile = None
 
                 statsfile = data_folder / (tablename + "_stats.txt")
-                if statsfile.exists():
-                    included.append(tablename + "_stats")
-                else:
+                if not statsfile.exists():
                     statsfile = None
 
                 indexesfile = data_folder / (tablename + "_indexes.txt")
@@ -2242,15 +2235,24 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                             constraintsfile,
                             metafile,
                         ),
-                        included,
                     )
                 )
                 tablenames.append(tablename)
             print("Reloading {0}".format(", ".join(tablenames)))
             failures = []
-            for table, filedata, included in file_list:
+            # Every reload happens before any swap, so what each one prepared
+            # has to be carried to the second pass.  Deriving it there instead
+            # -- from which files the folder happened to contain -- is how the
+            # two came apart: a saving table's reload always prepares both
+            # cache companions, refreshing them when a file is missing, so a
+            # folder with no _counts.txt yielded a swap list naming only the
+            # search table.  The refreshed companions then stayed under _tmp
+            # while the old live ones, describing data that had just been
+            # replaced, were marked valid.
+            plans = {}
+            for table, filedata in file_list:
                 try:
-                    table.reload(
+                    plans[table.search_table] = table.reload(
                         *filedata,
                         resort=resort,
                         restat=restat,
@@ -2265,10 +2267,17 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
                     else:
                         traceback.print_exc()
                         failures.append(table)
-            for table, filedata, included in file_list:
+            for table, filedata in file_list:
                 if table in failures:
                     continue
-                table.reload_final_swap(tables=included, metafile=filedata[-1], sep=sep)
+                plan = plans[table.search_table]
+                table.reload_final_swap(
+                    tables=plan.tables,
+                    metafile=filedata[-1],
+                    sep=sep,
+                    ordered=plan.ordered,
+                    stats_valid=plan.stats_valid,
+                )
 
         if failures:
             print("Reloaded %s" % (", ".join(tablenames)))

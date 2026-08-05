@@ -17,6 +17,7 @@ import tempfile
 import time
 import re
 from bisect import bisect
+from collections import namedtuple
 from functools import partial
 
 from psycopg.sql import SQL, Identifier, Placeholder, Literal
@@ -55,6 +56,17 @@ assert _operator_classes and _valid_storage_params
 ##################################################################
 # counts and stats columns and their types                       #
 ##################################################################
+
+# What a reload prepared, and therefore what its final swap must do: the exact
+# base names whose _tmp copies are to be renamed into place, whether the counts
+# and stats arriving with them describe the data arriving with them, and whether
+# the ids were successfully resorted.  Returned by ``PostgresTable.reload`` so
+# that a deferred swap (``PostgresDatabase.reload_all``) finalizes what was
+# prepared rather than re-deriving it from the arguments -- the two drifted
+# apart, and a swap list assembled from the input filenames could leave a
+# refreshed cache companion stranded under _tmp while marking the table valid.
+ReloadPlan = namedtuple("ReloadPlan", ["tables", "stats_valid", "ordered"])
+
 
 _counts_cols = ("cols", "values", "count", "extra", "split")
 _counts_types = dict(zip(_counts_cols, ("jsonb", "jsonb", "bigint", "boolean", "boolean")))
@@ -1172,15 +1184,49 @@ class PostgresTable(PostgresBase):
                 print(locktype + " " * (typelen - len(locktype)) + str(pid))
             raise LockError("Table is locked.  Please resolve the lock by killing the above processes and try again")
 
+    def _set_stats_valid(self, valid):
+        """
+        Write this table's ``stats_valid`` flag, unconditionally.
+
+        The ``UPDATE`` is issued whatever ``self._stats_valid`` says, and that
+        is the point of the method.  The attribute is a copy taken when this
+        object was built: another process's refresh or ``restat=False`` write
+        moves the row without moving the copy, and a rolled-back transaction
+        moves the copy without moving the row, so a transition skipped because
+        "it is already in that state" is a transition skipped on the strength
+        of a value that may be describing neither the database nor the present.
+
+        Issuing it always is also what serializes refreshes against writers:
+        the ``UPDATE`` takes a row lock on this table's ``meta_tables`` row
+        that is held to the end of the transaction, so a writer and a refresh
+        that overlap are ordered by it rather than racing (see
+        :meth:`PostgresStatsTable.refresh_stats`).
+
+        INPUT:
+
+        - ``valid`` -- whether the cached counts and statistics agree with the
+          live data.
+        """
+        updater = SQL("UPDATE meta_tables SET stats_valid = %s WHERE name = %s")
+        self._execute(updater, [valid, self.search_table], silent=True)
+        self._stats_valid = valid
+
     def _break_stats(self):
         """
         This function should be called when the statistics are invalidated by an insertion or update.
         """
-        if self._stats_valid:
-            # Only need to interact with database in this case.
-            updater = SQL("UPDATE meta_tables SET stats_valid = false WHERE name = %s")
-            self._execute(updater, [self.search_table], silent=True)
-            self._stats_valid = False
+        self._set_stats_valid(False)
+
+    def _restore_stats(self):
+        """
+        Record that the cached counts and statistics agree with the live data.
+
+        The counterpart of :meth:`_break_stats`, and the only way the flag goes
+        back to true.  Call it from inside the transaction that rebuilt or
+        loaded the caches, so that a failure part-way through leaves the table
+        marked invalid rather than claiming a cache it does not have.
+        """
+        self._set_stats_valid(True)
 
     def _break_order(self):
         """
@@ -1350,7 +1396,7 @@ class PostgresTable(PostgresBase):
         resort=None,
         reindex=None,
         restat=True,
-        logging={"operation":"file_update"},
+        logging=None,
         **kwds
     ):
         """
@@ -1373,7 +1419,9 @@ class PostgresTable(PostgresBase):
         - ``resort`` -- whether this table should be resorted after updating (default is to resort when the sort columns intersect the updated columns)
         - ``reindex`` -- only meaningful when ``inplace`` is set: whether to drop the indexes touching the updated columns before the update and recreate them afterward, which is faster when many rows change (by default this is done when more than 1000 rows are updated).  Without ``inplace``, all indexes are necessarily recreated on the replacement table, so ``reindex=True`` is redundant and ``reindex=False`` raises an error.
         - ``restat`` -- whether to recompute stats for the table
-        - ``logging`` -- a dictionary of keyword arguments for _log_db_change
+        - ``logging`` -- a dictionary of keyword arguments for _log_db_change.
+          A copy is taken, so the caller's dictionary is not modified and two
+          calls sharing one dictionary do not see each other's ``logid``.
         - ``kwds`` -- passed on to the ``COPY`` command.  Cannot include "columns".
         """
         self._forbid_reindex_false(reindex, inplace)
@@ -1384,8 +1432,12 @@ class PostgresTable(PostgresBase):
             # The counts and stats tables are not checked: this method
             # deliberately reuses their _tmp versions when they exist.
             self._check_tmp_leftovers([self.search_table])
-        logid = self._check_locks(logging["operation"], datafile=datafile)
-        logging["aborted"] = True
+        # Copied rather than used directly: this dictionary is mutated below,
+        # and the default used to be a shared literal, so consecutive default
+        # calls carried the previous call's logid and aborted flag.
+        log_data = {"operation": "file_update"} if logging is None else dict(logging)
+        logid = self._check_locks(log_data["operation"], datafile=datafile)
+        log_data["aborted"] = True
         try:
             sep = kwds.get("sep", "|")
             print("Updating %s from %s..." % (self.search_table, datafile))
@@ -1464,6 +1516,14 @@ class PostgresTable(PostgresBase):
                         Identifier(tmp_table),
                         Identifier(self.search_table),
                         Identifier(label_col)))
+                # The rows this table serves have changed, whatever happens to
+                # the caches below, so say so now: the invalidation rides the
+                # same transaction as the change, and a refresh that overlaps
+                # this one is serialized against it by the row lock this takes
+                # (see PostgresStatsTable.refresh_stats).  If the caches are
+                # rebuilt or replaced further down, the flag goes back to true
+                # there, in this transaction, once they have been.
+                self._break_stats()
                 if reindex and inplace:
                     # also restores constraints
                     self.restore_indexes(columns[1:])
@@ -1491,7 +1551,13 @@ class PostgresTable(PostgresBase):
                     # and the _tmp tables are left orphaned.  reload builds its
                     # swap list the same way.
                     tables = [self.search_table]
-                    if restat and self.stats.saving:
+                    # The same condition decides both what is swapped in and
+                    # what the swap leaves true: with it, the counts and stats
+                    # arriving at the live names were rebuilt from the _tmp
+                    # data just above; without it, the live counts and stats
+                    # are the old ones and the data underneath them is new.
+                    swapped_caches = bool(restat and self.stats.saving)
+                    if swapped_caches:
                         tables += [self.stats.counts, self.stats.stats]
                     if self.stats.counts in tables:
                         # _clone built the _tmp counts table with a bare LIKE,
@@ -1500,16 +1566,16 @@ class PostgresTable(PostgresBase):
                         # table keeps them (otherwise cached-count lookups
                         # degrade to sequential scans).  reload does the same.
                         self._create_counts_indexes(suffix=suffix)
-                    self._swap_in_tmp(tables)
+                    self._swap_in_tmp(tables, stats_valid=swapped_caches)
                     if ordered:
                         self._set_ordered()
                 # Delete the temporary table used to load the data
                 drop_tmp()
-                logging["logid"] = logid
-                logging["aborted"] = False
+                log_data["logid"] = logid
+                log_data["aborted"] = False
                 print("Updated %s in %.3f secs" % (self.search_table, time.time() - now))
         finally:
-            self._log_db_change(**logging)
+            self._log_db_change(**log_data)
 
     def delete(self, query, restat=True):
         """
@@ -1937,7 +2003,68 @@ class PostgresTable(PostgresBase):
                 )
         return backup_number
 
-    def _swap_in_tmp(self, tables):
+    def _analyze(self, tables, suffix=""):
+        """
+        Refresh PostgreSQL's planner statistics for the given relations.
+
+        These are the server's own statistics, not the counts and stats
+        psycodict maintains: a relation that has just been bulk loaded has none
+        until autovacuum reaches it, and until then the planner costs queries
+        against it as though it were tiny.
+
+        Run on a ``_tmp`` copy before the swap rather than on the live table
+        after it, so that no query is served by an unanalyzed relation; the
+        catalog entry follows the relation through the rename.
+        """
+        for table in tables:
+            self._execute(
+                SQL("ANALYZE {0}").format(Identifier(table + suffix)), silent=True
+            )
+
+    def _reload_stats_valid(self, tables, countsfile, statsfile, restat):
+        """
+        Whether a reload leaves the live counts and stats describing the live
+        data.
+
+        A reload replaces the search table wholesale, so the old cached answers
+        are about data that is no longer there; whether the new ones are about
+        the data that is comes down to two things.
+
+        They have to *arrive*: both cache companions must be in ``tables``, the
+        list this reload is actually going to swap.  A swap list holding the
+        search table and one companion, or none, leaves the live table paired
+        with a cache relation describing data that has just been replaced --
+        and a refreshed ``_tmp`` companion stranded under its temporary name.
+        Nothing in a reload builds such a list on purpose, but the deferred
+        swap in ``PostgresDatabase.reload_all`` used to assemble one from the
+        input filenames, so the check is made against the list rather than
+        against the arguments that suggested it.
+
+        And they have to *describe the new data*: either the caller supplied
+        both files alongside the search file, which gets the same trust the
+        search file itself gets, or ``restat`` rebuilt them from the loaded
+        ``_tmp`` data.  Failing both, what is swapped in is an empty clone
+        (nothing lost, but nothing vouched for either) or, if some earlier
+        operation left a ``_tmp`` copy behind, a relation this reload never
+        wrote.  Without ``saving``, no companions are swapped at all.
+
+        INPUT:
+
+        - ``tables`` -- the exact list of base table names this reload will
+          hand to :meth:`reload_final_swap`
+        - ``countsfile``, ``statsfile`` -- as passed to :meth:`reload`
+        - ``restat`` -- as passed to :meth:`reload`, before or after its
+          ``None`` is resolved; both give the same answer
+        """
+        if not self.stats.saving:
+            return False
+        if self.stats.counts not in tables or self.stats.stats not in tables:
+            return False
+        if restat is None:
+            restat = countsfile is None or statsfile is None
+        return bool(restat or (countsfile is not None and statsfile is not None))
+
+    def _swap_in_tmp(self, tables, stats_valid=False):
         """
         Helper function for ``reload``: appends _old{n} to the names of tables/indexes/pkeys
         and renames the _tmp versions to the live versions.
@@ -1945,12 +2072,26 @@ class PostgresTable(PostgresBase):
         INPUT:
 
         - ``tables`` -- a list of tables to rename (e.g. self.search_table, self.stats.counts, self.stats.stats)
+        - ``stats_valid`` -- whether the counts and statistics the live names
+          are left addressing describe the data the live names are left
+          addressing.  Written in this method's transaction, with the renames,
+          so that the two cannot come apart: a caller that swaps in a search
+          table while keeping the old cache companions has just made every
+          cached answer stale, and one that swaps in companions rebuilt or
+          loaded for the new data has just made them all correct.  The default
+          is the conservative answer, since a caller that has not thought about
+          it has usually done the former.
         """
         now = time.time()
+        # Before the swap, and outside its transaction: the _tmp relations are
+        # complete by now, and analyzing them here keeps the window in which
+        # the live names are locked as short as it was.
+        self._analyze(tables, "_tmp")
         backup_number = self._next_backup_number()
         with DelayCommit(self, silence=True):
             self._swap(tables, "", "_old" + str(backup_number))
             self._swap(tables, "_tmp", "")
+            self._set_stats_valid(stats_valid)
             # Which relation is which is known here, so the policy is looked up
             # by it rather than guessed from the name: a search table may end
             # in _stats (the LMFDB has one), and granting it a counts table's
@@ -2137,12 +2278,24 @@ class PostgresTable(PostgresBase):
         - ``restat`` -- whether to refresh statistics afterward.  Default behavior
             is to refresh stats if either countsfile or statsfile is missing.
         - ``final_swap`` -- whether to perform the final swap exchanging the
-            temporary table with the live one.
+            temporary table with the live one.  Deferring it defers the
+            validity transition too, so pass the returned plan's ``tables``,
+            ``ordered`` and ``stats_valid`` to ``reload_final_swap`` when the
+            time comes; it invalidates by default, and reassembling the swap
+            list by hand is how a refreshed cache companion gets stranded.
         - ``silence_meta`` -- suppress the warning message when using a metafile
         - ``adjust_schema`` -- If True, it will create the new tables using the
             header columns, otherwise expects the schema specified by the files
             to match the current one
         - ``kwds`` -- passed on to the ``COPY`` command.  Cannot include "columns".
+
+        OUTPUT:
+
+        A :data:`ReloadPlan` describing the swap: the exact list of base table
+        names whose ``_tmp`` copies belong at the live names, whether the
+        resulting cache companions describe the resulting data, and whether the
+        ids were resorted.  With ``final_swap`` it says what the swap did; with
+        ``final_swap=False`` it is what the deferred swap must be told.
 
         .. NOTE:
 
@@ -2276,15 +2429,28 @@ class PostgresTable(PostgresBase):
                     # create index on counts table
                     self._create_counts_indexes(suffix=suffix)
 
+                # What the final swap has to be told, decided here, where the
+                # relations this reload prepared are known.  A deferred swap
+                # gets it from the return value rather than reconstructing it,
+                # so that it cannot swap a different set than was prepared.
+                plan = ReloadPlan(
+                    tables=list(tables),
+                    stats_valid=self._reload_stats_valid(tables, countsfile, statsfile, restat),
+                    ordered=bool(ordered),
+                )
                 if final_swap:
-                    self.reload_final_swap(tables=tables,
-                                           metafile=metafile,
-                                           ordered=ordered)
+                    self.reload_final_swap(
+                        tables=plan.tables,
+                        metafile=metafile,
+                        ordered=plan.ordered,
+                        stats_valid=plan.stats_valid,
+                    )
                 elif metafile is not None and not silence_meta:
                     print("Warning: since the final swap was not requested, we have not updated meta_tables")
                     print("when performing the final swap with reload_final_swap, pass the metafile as an argument to update the meta_tables")
                 print("Reloaded %s in %.3f secs" % (self.search_table, time.time() - now_overall))
             aborted = False
+            return plan
         finally:
             self._log_db_change(
                 "reload",
@@ -2294,7 +2460,8 @@ class PostgresTable(PostgresBase):
                 stats=(statsfile is not None),
             )
 
-    def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|"):
+    def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|",
+                          stats_valid=False):
         """
         Renames the ``_tmp`` versions of ``tables`` to the live versions,
         and updates the corresponding meta_tables row if ``metafile`` is provided.
@@ -2304,6 +2471,20 @@ class PostgresTable(PostgresBase):
         - ``tables`` -- list of strings (optional), of the tables to be renamed.  If None is provided, renames all the tables ending in ``_tmp``
         - ``metafile`` -- a string (optional), giving a file containing the meta information for the table.
         - ``sep`` -- a character (default ``|``) to separate columns
+        - ``stats_valid`` -- whether the counts and statistics that end up at
+          the live names describe the search table that ends up at the live
+          name.  Passed to :meth:`_swap_in_tmp`, which writes it with the
+          renames; the caller states it rather than the flag being inherited,
+          since what the old live table's flag said is a fact about data that
+          is no longer there.  The default is the conservative answer.
+
+        A ``metafile`` carries a ``stats_valid`` column of its own, and it is
+        deliberately overruled: it records what was true of the table the file
+        was exported from, at export time, and cannot know whether the counts
+        and stats relations swapped in here were rebuilt.  It is applied first
+        so that the rest of the row (the sort order, ``id_ordered``, and the
+        rest) takes effect, and ``stats_valid`` is then set to what this swap
+        actually did.
         """
         with DelayCommit(self, silence=True):
             if tables is None:
@@ -2316,9 +2497,12 @@ class PostgresTable(PostgresBase):
                     if self._table_exists(tablename + "_tmp"):
                         tables.append(tablename)
 
-            self._swap_in_tmp(tables)
+            self._swap_in_tmp(tables, stats_valid=stats_valid)
             if metafile is not None:
                 self.reload_meta(metafile, sep=sep)
+                # reload_meta rewrote the whole row, including the flag the
+                # swap had just set; restate it (see the docstring).
+                self._set_stats_valid(stats_valid)
             if ordered:
                 self._set_ordered()
             # The swapped-in table's row count bears no relation to the old
@@ -2391,6 +2575,18 @@ class PostgresTable(PostgresBase):
             self._swap(tables, "", "_tmp")
             self._swap(tables, old, "")
             self._swap(tables, "_tmp", old)
+            # A backup carries no validity bit of its own -- meta_tables has
+            # one row, for the live name, and it followed the live table
+            # rather than the relations just restored.  It may therefore say
+            # true of caches that were invalid when they were backed up, so
+            # the flag is cleared and a refresh is what earns it back.  Marked
+            # here, with the renames, so the two commit together.
+            self._set_stats_valid(False)
+            # The total is maintained rather than cached, so the gate above
+            # does not cover it and it has to be made true: what meta_tables
+            # holds counts the table that is now the backup.  reload_final_swap
+            # recounts for the same reason.
+            self.stats._set_total(self.stats._slow_count({}, record=False))
             # The exchange moved each relation's privileges to the other one,
             # so both are told again what they are -- inside this DelayCommit,
             # with the renames.
@@ -2777,16 +2973,18 @@ class PostgresTable(PostgresBase):
           may have broken) the id ordering.
         """
         # The staged writes could not update the meta_tables row (it is
-        # keyed on the live name), so transfer the order flag and invalidate
-        # the statistics: the swapped-in counts and stats tables are empty,
-        # not refreshed
+        # keyed on the live name), so transfer the order flag here.
         if out_of_order:
             self._break_order()
-        self._break_stats()
         # reload_final_swap backs the live tables up under _old<n>, renames
         # the _tmp ones into place, recounts the total and replaces the
-        # table object held by the database
-        self.reload_final_swap(tables=self._staged_tables(), ordered=False)
+        # table object held by the database.  stats_valid=False because the
+        # counts and stats tables it swaps in are the staged ones, which are
+        # empty rather than refreshed; it is written with the renames, so the
+        # invalidation and the swap commit together.
+        self.reload_final_swap(
+            tables=self._staged_tables(), ordered=False, stats_valid=False
+        )
 
     def staged_force_swap(self):
         """
@@ -2848,10 +3046,16 @@ class PostgresTable(PostgresBase):
     def max_id(self, table=None):
         """
         The largest id occurring in the given table.  Used in the random method.
+
+        Returns -1 for a table with no rows, which is below every id psycodict
+        generates; callers distinguishing "empty" from "has rows" must test
+        ``< 0`` rather than ``< 1``, since 0 is a legitimate id.
         """
         if table is None:
             table = self.search_table
-        res = self._execute(SQL("SELECT MAX(id) FROM {}".format(table))).fetchone()[0]
+        res = self._execute(
+            SQL("SELECT MAX(id) FROM {0}").format(Identifier(table))
+        ).fetchone()[0]
         if res is None:
             res = -1
         return res
@@ -2860,10 +3064,16 @@ class PostgresTable(PostgresBase):
     def min_id(self, table=None):
         """
         The smallest id occurring in the given table.  Used in the random method.
+
+        Returns 0 for a table with no rows.  Unlike :meth:`max_id` that is not a
+        sentinel a caller can test for, since 0 is also a real id; pair it with
+        ``max_id() < 0`` to detect an empty table.
         """
         if table is None:
             table = self.search_table
-        res = self._execute(SQL("SELECT MIN(id) FROM {}".format(table))).fetchone()[0]
+        res = self._execute(
+            SQL("SELECT MIN(id) FROM {0}").format(Identifier(table))
+        ).fetchone()[0]
         if res is None:
             res = 0
         return res
@@ -2919,6 +3129,10 @@ class PostgresTable(PostgresBase):
                 if reindex:
                     self.restore_indexes()
                 self._break_stats()
+                # A bulk COPY can change the table's size and distribution
+                # enough that the planner's statistics no longer describe it,
+                # and the stats refresh below plans against them.
+                self._analyze([self.search_table])
                 if self.stats.saving and restat:
                     self.stats.refresh_stats(total=False)
                 self.stats._update_total(search_count)

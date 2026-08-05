@@ -339,6 +339,119 @@ hardening standalone use; the highlights:
   Connect — no long-lived token is stored anywhere. (#113)
 - `CITATION.cff`, so GitHub renders a citation for the package. (#124)
 
+### Fixed after the first release candidates
+
+- **`max_id` and `min_id` compose the table name they are given.** Both took a
+  `table=` argument and formatted it into the statement as text, so a name
+  needing quotes was a syntax error and a name carrying its own statement ran
+  it. Both now use `Identifier`. `max_id` returns -1 for an empty table, which
+  is the only empty sentinel: 0 is a real id, and `random()` treated a table
+  whose single row had id 0 as empty.
+- **Approximate statistics are scaled by the table they describe.**
+  `_approx_most_common` took `reltuples` from a hard-coded `public.nf_fields`
+  while taking frequencies from the real table, so on every other table the
+  estimate was that table's frequencies multiplied by an unrelated row count.
+  The column type it interpolates now goes through the validated
+  `column_type_sql`.
+- **`update_from_file` no longer shares log state between calls.** Its
+  `logging` default was a dictionary literal that the method wrote `logid` and
+  `aborted` into, so consecutive default calls saw each other's values and a
+  caller-supplied dictionary came back modified. The default is now `None` and
+  the mapping is copied per call.
+- **Random selection edge cases.** `random(query, pick_first=...)` returned
+  `None` rather than raising `IndexError` when nothing satisfies the query; a
+  projected value of `0`, `False`, `""` or `[]` counts as a result instead of
+  being skipped until `maxtries` ran out; `random_sample` raises `ValueError`
+  naming the accepted modes instead of silently returning `None` for an
+  unknown one; and a repeatable `choice` sample uses a local
+  `random.Random(seed)` rather than reseeding the process-wide generator.
+
+- **`stats_valid` is enforced, not just recorded.** Write paths cleared the
+  flag but read paths ignored it, so a count cached before a `restat=False`
+  write kept being served afterwards -- verified: a query counted at 67, then
+  every matching row changed, still answered 67. Every lookup that would serve
+  a cached answer now reports a miss while the flag is false: `quick_count`,
+  `quick_count_distinct` and `_quick_statistic`, which is what makes `count`,
+  `max`, `min` and `sum` compute the answer instead of returning a recorded
+  one. The line is whether a miss costs one bounded query or a rebuild, so
+  these are deliberately not gated: the empty-query `total`, maintained on
+  every write and so exact; the `_status` / `status` / `extra_counts`
+  inventory, which is how `refresh_stats` discovers what to recompute;
+  `_has_stats` / `_has_numstats`, which decide whether a whole statistics
+  family needs computing; and `null_counts`, whose fallback is one full count
+  *per search column*. Gating that last group made `column_counts`, `numstats`
+  and `null_counts` rebuild on every call with nothing to converge on, since
+  only `refresh_stats` restores the flag -- measured on the LMFDB, four minutes
+  of downstream suite became over forty-five. **The gap that leaves:**
+  `column_counts`, `numstats` and `null_counts` can still report a value
+  recorded before an unrefreshed write.
+  Closing it needs freshness per statistic rather than one flag per table,
+  which is a metadata format change; `refresh_stats()` is the remedy
+  meanwhile. A suffixed (`_tmp`, `_oldN`) table is not gated by the live
+  table's flag, since it carries its own caches.
+- **The flag is the database's, and it is tested in the same statement as the
+  cache.** Each gated lookup carries `AND EXISTS (SELECT 1 FROM meta_tables
+  WHERE name = %s AND stats_valid)` into the `SELECT` that reads the cached
+  row, rather than consulting the `_stats_valid` attribute a table object was
+  built with. That attribute is a copy: another process's `restat=False` write
+  moves the row and not the copy, so a second webserver process would have gone
+  on serving the counts it had cached, and a rolled-back transaction moves the
+  copy and not the row. Testing the flag in one statement and reading the cache
+  in the next would leave a window between two snapshots for a write to commit
+  in, so both readings go into one statement. `count()` on an empty query
+  likewise answers from `meta_tables.total` rather than from `self.total` --
+  a single-row metadata lookup, not a scan -- so a total another process
+  changed is the one served. `_break_stats` and `_restore_stats` now issue
+  their `UPDATE` unconditionally, since a transition skipped because the local
+  copy already said so is a transition skipped on stale information; the row
+  lock that `UPDATE` takes is also what serializes a refresh against concurrent
+  writers, a refresh now claiming the row before it rebuilds anything rather
+  than only restoring it at the end.
+- **Every replacement and bulk path makes its validity transition, in the
+  transaction that does the work.** `update_from_file` (in place or not),
+  `rewrite`, `reload`, `reload_all`, `reload_revert` and the staged swaps could
+  all change the live data while leaving `stats_valid = true`, so the new gate
+  went on serving the old counts. `_swap_in_tmp` and `reload_final_swap` now
+  take the intended state as an argument and write it with the renames:
+  true when the counts and stats arriving at the live names were rebuilt or
+  loaded for the data arriving with them, false when the old cache companions
+  are kept. A `metafile`'s own `stats_valid` is overruled by what the swap
+  actually did, `reload_revert` invalidates (a backup carries no validity bit
+  of its own) and also recounts the total, and nothing inherits the old live
+  table's flag.
+- **`reload` returns what it prepared, and `reload_all` finalizes that.**
+  `reload_all` runs every reload before any swap, and built each deferred
+  swap's list of relations from the files in the input folder. That is not the
+  list `reload` prepared: a saving table's reload always readies *both* cache
+  companions, refreshing them when a file is missing, so a folder with no
+  `_counts.txt` produced a swap naming only the search table — stranding the
+  refreshed companions under `_tmp` and leaving the old live ones, describing
+  data that had just been replaced, paired with the new data and (once the
+  transitions above were added) marked valid. `reload` now returns a
+  `ReloadPlan` with the exact swap list, the intended `stats_valid` and the
+  resolved `ordered`, and `reload_all` passes it straight through, so
+  preparation and finalization cannot drift apart. `stats_valid` is true only
+  when both cache companions are in the list actually being swapped.
+- **Cache maintenance asks whether the row exists, not whether it may be
+  served.** `_record_count`, `_record_count_distinct` and `_record_statistic`
+  chose between `INSERT` and `UPDATE`/`DELETE` by calling the public lookups,
+  which under the new gate answer "missing" for a row that is physically there
+  -- on every invalid table, which is every table they run on. Each write left
+  a second row behind under a key the rest of the code takes to identify at
+  most one; the plainest case was a write clearing the flag and then
+  duplicating the `{}` total row it maintains. They now use private physical
+  lookups that ignore the flag. This is also the first thing ever to reach
+  `_record_count_distinct`'s update statement, which named a column `stats`
+  that has always been called `stat`.
+- **Bulk paths run `ANALYZE`.** A relation that has just been bulk loaded has
+  no planner statistics until autovacuum reaches it, so queries against it are
+  costed as though it were tiny. Replacement tables are analyzed while still
+  named `_tmp` -- before the swap, and outside its transaction, since the
+  catalog entry follows the relation through the rename -- which covers
+  `reload`, `rewrite`, non-inplace `update_from_file` and staged commits
+  through the one helper they share; `copy_from` analyzes the live table it
+  loaded into.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores
