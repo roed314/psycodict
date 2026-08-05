@@ -47,12 +47,20 @@ from .validation import (
     check_new_table_name,
     derived_identifier,
     physical_table_name,
+    validate_schema_name,
     validate_search_table_name,
     validate_search_table_registry,
 )
 from .grants import GRANT_ACTIONS, GrantPolicy
 from .searchtable import PostgresSearchTable
 from .utils import DelayCommit, safe_child_path
+
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresDatabase",
+]
 
 # The registry of metadata-format migrations.  Entry N describes the step
 # from format N-1 to format N; MetadataFormats.md has the checklist a new
@@ -186,8 +194,8 @@ class PostgresDatabase(PostgresBase):
       (``statement_timeout``, ``lock_timeout``,
       ``idle_in_transaction_session_timeout``, ``application_name``) applied to
       the main database connection and to every replacement main connection.
-      Defaults to a 25 second statement timeout when connecting as
-      ``webserver``, and to nothing otherwise.  A notification listener's
+      Defaults to no session settings; a deployment passes the ones it wants
+      (LMFDB sets its statement timeout here).  A notification listener's
       connection deliberately does not inherit them: it exists to wait, and a
       statement timeout on it would be more likely to be wrong than right.  It
       does inherit the connection overrides below, so that it reaches the same
@@ -232,39 +240,35 @@ class PostgresDatabase(PostgresBase):
     # Override the following to use a different class for search tables
     _search_table_class_ = PostgresSearchTable
 
-    # The session settings psycodict will apply, and what it applies to a
-    # webserver connection when the caller asks for nothing else.  Settings are
-    # applied with set_config, which takes the name and the value as bound
-    # parameters; the closed set here is what keeps a caller from setting
-    # something unrelated through the same door.
+    # The session settings psycodict applies to the main connection and every
+    # replacement main connection.  Settings are applied with set_config, which
+    # takes the name and value as bound parameters; the closed set here is what
+    # keeps a caller from setting something unrelated through the same door.
     _allowed_session_settings = (
         "statement_timeout",
         "lock_timeout",
         "idle_in_transaction_session_timeout",
         "application_name",
     )
-    _webserver_session_settings = {"statement_timeout": "25s"}
 
     def _resolve_session_settings(self, session_settings):
         """
-        The session settings to apply to every connection of this database.
+        The session settings to apply to the main connection and its replacements.
 
         INPUT:
 
         - ``session_settings`` -- a dictionary of PostgreSQL settings, or None
-          to take the default for the connecting role
+          for no session settings
 
-        A connection as ``webserver`` has always been given a 25 second
-        statement timeout; that is now the default rather than a special case
-        applied once, so it survives a reconnect and can be overridden.  The
-        settings apply to the main connection and its replacements, not to a
-        listener's separate connection.
+        psycodict applies no session setting unless one is asked for: a role
+        named ``webserver`` used to be handed a 25 second statement timeout, but
+        a generic library should not act on a role name.  A deployment that
+        wants a timeout passes it explicitly (LMFDB does, through its
+        subclass), and it then applies to the main connection and every
+        replacement, not to a listener's separate connection.
         """
         if session_settings is None:
-            user = self._connection_options().get("user")
-            session_settings = (
-                self._webserver_session_settings if user == "webserver" else {}
-            )
+            session_settings = {}
         unknown = set(session_settings) - set(self._allowed_session_settings)
         if unknown:
             raise ValueError(
@@ -347,6 +351,11 @@ class PostgresDatabase(PostgresBase):
         # Note that it has some global effects, since register_adapter
         # is not limited to just one connection
         setup_connection(conn)
+        # Pin the schema first: everything below, and every statement this
+        # connection later runs, resolves unqualified names in it.  pg_catalog
+        # is still searched -- PostgreSQL puts it first implicitly when it is
+        # not named -- so the built-in types and functions stay reachable.
+        conn.execute("SELECT set_config('search_path', %s, false)", [self.schema])
         for name, value in self._session_settings.items():
             # set_config takes both as bound values, so nothing is interpolated
             conn.execute("SELECT set_config(%s, %s, false)", [name, str(value)])
@@ -387,7 +396,7 @@ class PostgresDatabase(PostgresBase):
                 "SELECT count(*) FROM information_schema.role_table_grants "
                 "WHERE grantee = %s AND table_schema = %s "
                 "AND privilege_type IN (" + ",".join(["%s"] * len(privileges)) + ")",
-                [user, "public"] + privileges,
+                [user, self.schema] + privileges,
             )
             read_only = rows[0][0] == 0
 
@@ -405,12 +414,12 @@ class PostgresDatabase(PostgresBase):
             rows = sorted(query(
                 "SELECT table_name, privilege_type "
                 "FROM information_schema.role_table_grants "
-                "WHERE grantee = %s AND table_name IN ("
+                "WHERE grantee = %s AND table_schema = %s AND table_name IN ("
                 + ",".join(["%s"] * len(knowls_tables))
                 + ") AND privilege_type IN ("
                 + ",".join(["%s"] * len(privileges))
                 + ")",
-                [user] + knowls_tables + privileges,
+                [user, self.schema] + knowls_tables + privileges,
             ))
             read_and_write_knowls = rows == sorted(
                 [(table, priv) for table in knowls_tables for priv in privileges]
@@ -521,12 +530,20 @@ class PostgresDatabase(PostgresBase):
         obj.conn = self.conn
         self._objects.append(obj)
 
-    def __init__(self, config=None, secretsfile=None, create=False, upgrade=False,
-                 session_settings=None, grant_policy=None, **kwargs):
+    def __init__(self, config=None, create=False, upgrade=False,
+                 session_settings=None, grant_policy=None, schema="public", **kwargs):
         if config is None:
             from .config import Configuration
             config = Configuration()
         self.config = config
+        # The one schema this database operates in.  Every relation psycodict
+        # creates goes here, every relation it looks for is looked for here,
+        # and every catalog query is filtered to it -- so that a table of the
+        # same name in another schema can neither stand in for one of these nor
+        # be merged with it.  Checked once, here, rather than at each use.
+        # Deliberately not part of _connect_kwargs: it is psycodict's own
+        # setting, and psycopg.connect has no such parameter.
+        self.schema = validate_schema_name(schema)
         self.server_side_counter = 0
         self._nocommit_stack = 0
         self._silenced = False
@@ -576,9 +593,9 @@ class PostgresDatabase(PostgresBase):
         # Refuse to run against a database that still uses the removed
         # search/extras table split
         legacy = self._execute(SQL(
-            "SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' "
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = %s "
             "AND table_name = 'meta_tables' AND column_name = 'has_extras'"
-        ))
+        ), [self.schema])
         if legacy.rowcount:
             cur = self._execute(SQL("SELECT name FROM meta_tables WHERE has_extras"))
             if cur.rowcount:
@@ -637,8 +654,9 @@ class PostgresDatabase(PostgresBase):
         """
         cur = self._execute(SQL(
             "SELECT table_name, column_name, udt_name::regtype "
-            "FROM information_schema.columns ORDER BY table_name, ordinal_position"
-        ))
+            "FROM information_schema.columns WHERE table_schema = %s "
+            "ORDER BY table_name, ordinal_position"
+        ), [self.schema])
         data_types = {}
         for table_name, column_name, regtype in cur:
             if table_name not in data_types:
@@ -794,9 +812,9 @@ class PostgresDatabase(PostgresBase):
         cur = self._execute(
             SQL(
                 "SELECT DISTINCT grantee FROM information_schema.role_table_grants "
-                "WHERE table_name = %s AND grantee <> grantor"
+                "WHERE table_schema = %s AND table_name = %s AND grantee <> grantor"
             ),
-            [table_name],
+            [self.schema, table_name],
             silent=True,
         )
         return {rec[0] for rec in cur}
@@ -925,12 +943,12 @@ class PostgresDatabase(PostgresBase):
         query = (
             "SELECT c.relname FROM pg_class c "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname = current_schema()"
+            "WHERE n.nspname = %s"
         )
-        values = None
+        values = [self._db.schema]
         if relkinds is not None:
             query += " AND c.relkind = ANY(%s)"
-            values = [list(relkinds)]
+            values.append(list(relkinds))
         cur = self._execute(SQL(query), values, silent=True)
         return {rec[0] for rec in cur}
 
@@ -1033,10 +1051,10 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
          pg_total_relation_size(reltoastrelid) AS toast_bytes
   FROM pg_class c
   LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-  WHERE n.nspname = 'public' AND relkind = 'r'
+  WHERE n.nspname = %s AND relkind = 'r'
 ) a"""
         sizes = defaultdict(lambda: defaultdict(int))
-        cur = self._execute(SQL(query))
+        cur = self._execute(SQL(query), [self.schema])
         for (
             table_name,
             row_estimate,
@@ -1337,8 +1355,8 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         existing = {
             rec[0] for rec in self._execute(SQL(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'public'"
-            ))
+                "WHERE table_schema = %s"
+            ), [self.schema])
         }
         stored, _ = self._stored_meta_format()
         fmt = META_FORMAT if stored is None else min(stored, META_FORMAT)
@@ -2411,7 +2429,13 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         """
         Returns a dictionary giving giving the tablespace for all tables
         """
-        D = {rec[0]: rec[1] for rec in self._execute(SQL("SELECT tablename, tablespace FROM pg_tables"))}
+        D = {
+            rec[0]: rec[1]
+            for rec in self._execute(
+                SQL("SELECT tablename, tablespace FROM pg_tables WHERE schemaname = %s"),
+                [self.schema],
+            )
+        }
         return {name: space if space else "" for (name, space) in D.items()}
 
     def compare(self, other, tables=None, row_counts=True, null_counts=False, exact=False):

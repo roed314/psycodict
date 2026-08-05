@@ -9,12 +9,14 @@ metadata tables living inside your database.
 
 ## What is public
 
- * **Non-underscore names** in the `psycodict` package that are documented — in
-   the specification documents ([QueryLanguage.md](QueryLanguage.md),
-   [Searching.md](Searching.md), [DataManagement.md](DataManagement.md),
-   [MetadataFormats.md](MetadataFormats.md)) or in docstrings.  Names with a
-   leading underscore are private, whatever module they live in, and may change
-   in any release.
+ * **The names each module exports in its `__all__`**, and their documented
+   behavior.  These are exactly the names in the [API reference](api/index.md),
+   and the snapshot test `tests/test_public_api.py` freezes them, so the promise
+   and the code cannot drift apart.  A non-underscore name that is *not* in an
+   `__all__` (and every underscore-prefixed name, whatever module it lives in)
+   is implementation: it may still be importable, but it is not part of this
+   promise and may change in any release.  Having a docstring does not make a
+   name public; being in `__all__` does.
  * **The query language** as specified in [QueryLanguage.md](QueryLanguage.md):
    the meaning of a query dictionary is stable within a major version: new
    features may be added in minor versions, but functioning queries will
@@ -23,19 +25,35 @@ metadata tables living inside your database.
    Identifier, ...`).  Downstream code should import these from `psycodict`
    rather than from the driver; the re-export point is the stable name.
  * **The export file format** written by `copy_to` and read by `copy_from` /
-   `reload` (three header lines, `|` delimiter, `\N` nulls — see
-   [DataManagement.md](DataManagement.md)): files written by one 1.x release
-   can be loaded by any other.
+   `reload` (see [DataManagement.md](DataManagement.md)).  A file may begin with
+   a `# psycodict-export-format: N` marker, and a file without one is format 0,
+   the historical layout.  A **newer** 1.x reader reads files written by an
+   earlier 1.x release; an **older** reader is not guaranteed to understand a
+   file a newer release wrote (it may carry a format the older reader predates),
+   and a reader refuses a marked file whose version it does not understand
+   rather than mis-loading it.  An incompatible change to the file format
+   requires a new major version.
  * **The `meta_*` tables**, whose layout is governed by the metadata format
    protocol below.
 
+## Reaching a table
+
+`db[name]` is the canonical, collision-free way to reach a search table, and the
+one covered by this promise.  `db.<name>` (attribute access) is convenience
+syntax for the same lookup, with one caveat: a real attribute or method of the
+database object wins over a table of the same name, so a table called `config`
+or `tablenames` is reachable only through `db["config"]`.  Adding a method to
+the database class in a minor release therefore never makes a table inaccessible
+through the canonical `db[name]` lookup, even if it shadows an attribute-access
+name.
+
 ## What is not covered
 
-Underscore-prefixed names; the exact SQL text psycodict emits (only its
-semantics); performance characteristics; the contents of log files; and
-undocumented behavior generally, even where observable.  If something
-undocumented matters to your project, open an issue — turning it into
-documented (hence stable) behavior is usually easy.
+Non-`__all__` names, whether or not they carry a docstring; underscore-prefixed
+names; the exact SQL text psycodict emits (only its semantics); performance
+characteristics; the contents of log files; and undocumented behavior generally,
+even where observable.  If something undocumented matters to your project, open
+an issue — turning it into documented (hence stable) behavior is usually easy.
 
 ## Database metadata compatibility
 
@@ -44,9 +62,12 @@ number stored in each database (`meta_format`, with a `min_compat` column
 declaring the oldest client format the database still admits); the protocol —
 including how clients degrade gracefully against older databases and when a
 migration is required — is specified in
-[MetadataFormats.md](MetadataFormats.md).  The format number is bumped only at
-major releases, so within 1.x a database migrated once is understood by every
-client.
+[MetadataFormats.md](MetadataFormats.md).  The metadata format number and the
+export file format number are protocol revisions in their own right, not the
+package major version: a compatible, additive revision may ship in a minor
+release while keeping `min_compat` low enough for existing clients.  What
+requires a new major version is a change that raises `min_compat` past an
+earlier 1.x client, or otherwise makes that client unsafe.
 
 ## Deprecation policy
 

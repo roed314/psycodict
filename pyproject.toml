@@ -13,6 +13,14 @@ description = "dictionary-based python interface to PostgreSQL databases"
 # has no long_description and the PyPI project page renders empty.
 readme = "README.md"
 requires-python = ">=3.9"
+# psycopg is a plain dependency: ``pip install psycodict`` gets a working
+# package on a system with libpq.  The floor is 3.2.4 -- 3.2 introduced
+# Connection.notifies(timeout=..., stop_after=...), which the notification
+# listener uses, and 3.2.4 fixed notifications being dropped while no generator
+# was consuming them, essential for the pull-based NotificationListener.poll().
+# The ``<4`` ceiling keeps an unreviewed future driver major out of a 1.x
+# environment.
+dependencies = ["psycopg>=3.2.4,<4"]
 authors = [{name = "David Roe", email = "roed.math@gmail.com"}, {name = "Edgar Costa", email = "edgarc@mit.edu"}]
 license = "GPL-2.0-or-later"
 keywords = ["postgres", "database", "interface"]
@@ -37,12 +45,12 @@ Repository = "https://github.com/roed314/psycodict"
 Changelog = "https://github.com/roed314/psycodict/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# 3.2 introduced Connection.notifies(timeout=..., stop_after=...), which the
-# notification listener uses, and 3.2.4 fixed notifications being dropped
-# while no generator was consuming them -- essential for the pull-based
-# NotificationListener.poll().
-pgsource = ["psycopg>=3.2.4"]
-pgbinary = ["psycopg[binary]>=3.2.4"]
+# In psycopg 3, plain ``psycopg`` is the pure-Python implementation using the
+# system libpq; ``psycopg[binary]`` adds the bundled binary build (and
+# satisfies the base dependency); ``psycopg[c]`` is a locally compiled
+# extension using system libraries and build tools.
+pgbinary = ["psycopg[binary]>=3.2.4,<4"]
+pgc = ["psycopg[c]>=3.2.4,<4"]
 test = ["pytest>=7"]
 
 [tool.setuptools.dynamic]

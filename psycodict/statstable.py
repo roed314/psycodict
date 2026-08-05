@@ -21,9 +21,16 @@ from psycopg import DatabaseError
 from psycopg.sql import SQL, Identifier, Literal
 
 from .base import PostgresBase
-from .validation import physical_table_name
+from .validation import column_type_sql, physical_table_name
 from .encoding import Json, numeric_converter
 from .utils import DelayCommit, KeyedDefaultDict, make_tuple
+
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresStatsTable",
+]
 
 # The following is used in bucketing for statistics
 pg_to_py = {}
@@ -269,6 +276,54 @@ class PostgresStatsTable(PostgresBase):
         # We use the same tablespace for stats and counts tables as for the main search table
         return self.table._get_tablespace()
 
+    def _may_use_cache(self, suffix=""):
+        """
+        Whether a cached count or statistic may be used as an answer.
+
+        ``stats_valid`` is an assertion that every cached nonempty-query count,
+        distinct count and custom statistic for the live table agrees with the
+        live data.  A write that does not refresh them clears it, and until a
+        refresh restores it a cached row is a stale answer, not an answer -- so
+        every lookup that would serve one is routed through here and reports a
+        miss instead, leaving the caller to compute or recompute.
+
+        Two things are deliberately outside this rule:
+
+        - the empty-query ``total``, which is maintained on every write and
+          stays usable regardless (see :meth:`quick_count`);
+        - a suffixed table.  A ``_tmp`` or ``_oldN`` copy carries its own
+          counts and stats, built or loaded together with its data, and
+          ``stats_valid`` says nothing about them.
+
+        Reads that report what the cache *contains*, rather than answering a
+        question about the data -- ``_status``, ``status``, ``extra_counts`` --
+        are also not gated: ``refresh_stats`` uses them to discover what to
+        recompute, so gating them would make an invalid table forget what
+        statistics it is supposed to have.
+
+        The line this draws is whether a miss costs one bounded query or a
+        rebuild.  ``quick_count``, ``quick_count_distinct`` and
+        ``_quick_statistic`` each fall back to a single statement about the
+        rows in question, so a miss is affordable and they are gated.
+        ``_has_stats`` and ``_has_numstats`` decide whether a whole statistics
+        family needs computing, and ``null_counts`` falls back to one full
+        count *per search column*; gating those makes ``column_counts``,
+        ``numstats`` and ``null_counts`` rebuild on every call with nothing to
+        converge on, since only ``refresh_stats`` restores the flag.  Measured
+        on the LMFDB, that took a four-minute downstream suite past
+        forty-five, mostly inside ``null_counts`` over ``nf_fields`` and
+        friends.
+
+        What that leaves is a real gap: a value recorded before an unrefreshed
+        write is still reported by ``column_counts``, ``numstats`` and
+        ``null_counts``.  Closing it needs freshness per statistic rather than
+        one flag per table, which is a metadata format change;
+        ``refresh_stats()`` is the remedy meanwhile.
+        """
+        if suffix:
+            return True
+        return self.table._stats_valid
+
     def _has_stats(self, jcols, ccols, cvals, threshold, split_list=False, threshold_inequality=False, suffix=""):
         """
         Checks whether statistics have been recorded for a given set of columns.
@@ -284,6 +339,15 @@ class PostgresStatsTable(PostgresBase):
            rows are thrown away.
         - ``split_list`` -- whether entries of lists should be counted once for each entry.
         - ``threshold_inequality`` -- if true, then any lower threshold will still count for having stats.
+
+        Deliberately *not* gated on ``stats_valid``: this answers "is this
+        statistic recorded", which is what ``add_stats`` and ``column_counts``
+        use to decide whether to compute it.  Reporting False while the table
+        is invalid makes them recompute the whole family on every call, and
+        since nothing but ``refresh_stats`` restores the flag, they never stop
+        -- measured on the LMFDB, that turned a four-minute test suite into one
+        still running after forty-five.  See :meth:`_may_use_cache` for what
+        that costs in staleness.
         """
         if split_list:
             values = [jcols, "split_total"]
@@ -322,7 +386,11 @@ class PostgresStatsTable(PostgresBase):
         Either an integer giving the number of results, or None if not cached.
         """
         if not query and not startup:
+            # The empty-query total is maintained on every write, so it is
+            # exact even when the rest of the cache is not.
             return self.total
+        if not self._may_use_cache(suffix):
+            return None
         cols, vals = self._split_dict(query)
         selecter = SQL(
             "SELECT count FROM {0} WHERE cols = %s AND values = %s AND split = %s"
@@ -542,8 +610,11 @@ class PostgresStatsTable(PostgresBase):
 
         OUTPUT:
 
-        Either an integer giving the number of distinct values, or None if not cached.
+        Either an integer giving the number of distinct values, or None if not
+        cached or if the cache may not be used.
         """
+        if not self._may_use_cache(suffix):
+            return None
         ccols, cvals = self._split_dict(query)
         selecter = SQL("SELECT value FROM {0} WHERE stat = %s AND cols = %s AND constraint_cols = %s AND constraint_values = %s").format(Identifier(self.stats + suffix))
         cur = self._execute(selecter, ["distinct", Json(cols), ccols, cvals])
@@ -736,6 +807,8 @@ class PostgresStatsTable(PostgresBase):
           the constraint columns take on these values.
         - ``kind`` -- either "min" or "max" or "sum"
         """
+        if not self._may_use_cache():
+            return None
         constraint = SQL("constraint_cols = %s AND constraint_values = %s")
         values = [kind, Json([col]), ccols, cvals]
         selecter = SQL(
@@ -1290,6 +1363,9 @@ class PostgresStatsTable(PostgresBase):
         - ``threshold`` -- an integer: if the number of rows with a given tuple of
            values for the grouping columns is less than this threshold, those
            rows are thrown away.
+
+        Not gated on ``stats_valid``, for the reason given in
+        :meth:`_has_stats`.
         """
         values = [jcol, "ntotal", cgcols, cvals]
         if threshold is None:
@@ -1651,21 +1727,27 @@ class PostgresStatsTable(PostgresBase):
         """
         if col not in self.table.search_cols:
             raise ValueError("Column %s not a search column for %s" % (col, self.search_table))
+        # reltuples has to come from the table these frequencies are about.  It
+        # used to be read from a hard-coded public.nf_fields, so on any other
+        # table the estimate was that table's frequencies scaled by an
+        # unrelated row count.
         selecter = SQL(
             """SELECT v.{0}, (c.reltuples * freq)::int as estimate_ct
 FROM pg_stats s
 CROSS JOIN LATERAL
-   unnest(s.most_common_vals::text::"""
-            + self.table.col_type[col]
-            + """[]
+   unnest(s.most_common_vals::text::{1}[]
         , s.most_common_freqs) WITH ORDINALITY v ({0}, freq, ord)
 CROSS  JOIN (
-   SELECT reltuples FROM pg_class
-   WHERE oid = regclass 'public.nf_fields') c
-WHERE schemaname = 'public' AND tablename = %s AND attname = %s
+   SELECT c.reltuples FROM pg_class c
+   JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = %s AND c.relname = %s) c
+WHERE schemaname = %s AND tablename = %s AND attname = %s
 ORDER BY v.ord LIMIT %s"""
-        ).format(Identifier(col))
-        cur = self._execute(selecter, [self.search_table, col, n])
+        ).format(Identifier(col), column_type_sql(self.table.col_type[col]))
+        schema = self._db.schema
+        cur = self._execute(
+            selecter, [schema, self.search_table, schema, self.search_table, col, n]
+        )
         return [tuple(x) for x in cur]
 
     def _common_cols(self, threshold=700):
@@ -1844,6 +1926,12 @@ ORDER BY v.ord LIMIT %s"""
                 # Refresh total in meta_tables
                 self._set_total(self._slow_count({}, suffix=suffix, extra=False), suffix=suffix)
             self.refresh_null_counts(suffix=suffix)
+            if not suffix:
+                # Everything above ran in this transaction, so the caches now
+                # agree with the data and the table can be marked valid with
+                # them.  A suffixed refresh is rebuilding some other relation's
+                # caches and says nothing about the live table.
+                self.table._restore_stats()
             self._logger.info("Refreshed statistics in %.3f secs" % (time.time() - t0))
 
     def status(self, reset_None_to_1=False):

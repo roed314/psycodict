@@ -50,6 +50,13 @@ from .validation import (  # noqa: F401
     validate_column_type,
 )
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresBase",
+]
+
 
 ##################################################################
 # meta_* infrastructure                                          #
@@ -90,6 +97,24 @@ def jsonb_idx(cols, cols_type):
 #        Migrate with ``PostgresDatabase.upgrade_metadata`` (or connect with
 #        upgrade=True).
 META_FORMAT = 1
+
+# The format of a search-data export file (the searchfile of copy_to/copy_from/
+# reload), which is a *different* thing from the metadata format above: this
+# describes the layout of a data file, not of the meta_* tables.  A file may
+# begin with a line ``# psycodict-export-format: N``; a file without one is
+# format 0, the historical layout of just names, types and a blank line, so
+# every file psycodict has ever written still reads.  New files are written at
+# EXPORT_FORMAT; a reader refuses a version it does not understand before
+# loading any data.  See Versioning.md for the compatibility promise.
+EXPORT_FORMAT = 1
+EXPORT_FORMAT_MARKER = "# psycodict-export-format:"
+
+
+def export_format_line():
+    """
+    The marker line a new search-data export begins with, without a newline.
+    """
+    return "%s %s" % (EXPORT_FORMAT_MARKER, EXPORT_FORMAT)
 
 
 _meta_tables_cols = (
@@ -423,14 +448,25 @@ class PostgresBase():
 
         - ``tablename`` -- a string, the name of the table
         """
-        cur = self._execute(SQL("SELECT 1 FROM pg_tables where tablename=%s"), [tablename], silent=True)
+        cur = self._execute(
+            SQL("SELECT 1 FROM pg_tables WHERE schemaname = %s AND tablename = %s"),
+            [self._db.schema, tablename],
+            silent=True,
+        )
         return cur.fetchone() is not None
 
     def _all_tablenames(self):
         """
         Return all (postgres) table names in the database
         """
-        return [rec[0] for rec in self._execute(SQL("SELECT tablename FROM pg_tables ORDER BY tablename"), silent=True)]
+        return [
+            rec[0]
+            for rec in self._execute(
+                SQL("SELECT tablename FROM pg_tables WHERE schemaname = %s ORDER BY tablename"),
+                [self._db.schema],
+                silent=True,
+            )
+        ]
 
     def _get_locks(self):
         return self._execute(SQL(
@@ -535,15 +571,18 @@ class PostgresBase():
         """
         if tablename:
             cur = self._execute(
-                SQL("SELECT 1 FROM pg_indexes WHERE indexname = %s AND tablename = %s"),
-                [indexname, tablename],
+                SQL(
+                    "SELECT 1 FROM pg_indexes "
+                    "WHERE schemaname = %s AND indexname = %s AND tablename = %s"
+                ),
+                [self._db.schema, indexname, tablename],
                 silent=True,
             )
             return cur.fetchone() is not None
         else:
             cur = self._execute(
-                SQL("SELECT tablename FROM pg_indexes WHERE indexname=%s"),
-                [indexname],
+                SQL("SELECT tablename FROM pg_indexes WHERE schemaname = %s AND indexname = %s"),
+                [self._db.schema, indexname],
                 silent=True,
             )
             table = cur.fetchone()
@@ -560,7 +599,13 @@ class PostgresBase():
 
         - ``name`` -- a string, the name of the relation
         """
-        cur = self._execute(SQL("SELECT 1 FROM pg_class where relname = %s"), [name])
+        cur = self._execute(
+            SQL(
+                "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND c.relname = %s"
+            ),
+            [self._db.schema, name],
+        )
         return cur.fetchone() is not None
 
     def _constraint_exists(self, constraintname, tablename=None):
@@ -582,9 +627,9 @@ class PostgresBase():
             cur = self._execute(
                 SQL(
                     "SELECT 1 from information_schema.table_constraints "
-                    "WHERE table_name=%s and constraint_name=%s"
+                    "WHERE table_schema = %s AND table_name = %s AND constraint_name = %s"
                 ),
-                [tablename, constraintname],
+                [self._db.schema, tablename, constraintname],
                 silent=True,
             )
             return cur.fetchone() is not None
@@ -592,9 +637,9 @@ class PostgresBase():
             cur = self._execute(
                 SQL(
                     "SELECT table_name from information_schema.table_constraints "
-                    "WHERE constraint_name=%s"
+                    "WHERE table_schema = %s AND constraint_name = %s"
                 ),
-                [constraintname],
+                [self._db.schema, constraintname],
                 silent=True,
             )
             table = cur.fetchone()
@@ -608,8 +653,8 @@ class PostgresBase():
         Lists built index names on the search table ``tablename``
         """
         cur = self._execute(
-            SQL("SELECT indexname FROM pg_indexes WHERE tablename = %s"),
-            [tablename],
+            SQL("SELECT indexname FROM pg_indexes WHERE schemaname = %s AND tablename = %s"),
+            [self._db.schema, tablename],
             silent=True,
         )
         return [elt[0] for elt in cur]
@@ -629,9 +674,9 @@ class PostgresBase():
                 "           ON rel.oid = con.conrelid "
                 "INNER JOIN pg_catalog.pg_namespace nsp "
                 "           ON nsp.oid = connamespace "
-                "WHERE rel.relname = %s"
+                "WHERE nsp.nspname = %s AND rel.relname = %s"
             ),
-            [tablename],
+            [self._db.schema, tablename],
             silent=True,
         )
         return [elt[0] for elt in cur]
@@ -809,9 +854,9 @@ class PostgresBase():
                 cur = self._execute(
                     SQL(
                         "SELECT column_name, udt_name::regtype FROM information_schema.columns "
-                        "WHERE table_name = %s ORDER BY ordinal_position"
+                        "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
                     ),
-                    [tname],
+                    [self._db.schema, tname],
                 )
             else:
                 cur = data_types[tname]
@@ -838,8 +883,11 @@ class PostgresBase():
         one about columns.
         """
         cur = self._execute(
-            SQL("SELECT column_name FROM information_schema.columns WHERE table_name = %s"),
-            [table],
+            SQL(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s"
+            ),
+            [self._db.schema, table],
             silent=True,
             commit=False,
         )
@@ -1300,9 +1348,9 @@ class PostgresBase():
 
     def _read_header_lines(self, F, sep="|"):
         """
-        Reads the header lines from a file
-        (row of column names, row of column types, blank line).
-        Returning the dictionary of columns and their types.
+        Reads the header lines from a search-data file (an optional format
+        marker, the row of column names, the row of column types, and the blank
+        line), returning the columns and their types.
 
         INPUT:
 
@@ -1313,8 +1361,33 @@ class PostgresBase():
 
         A list of pairs where the first entry is the column and the second the
         corresponding type
+
+        A file may begin with ``# psycodict-export-format: N``.  A file without
+        one is format 0, the historical layout, so every file psycodict has
+        ever written still reads.  A version newer than this psycodict
+        understands is refused here, before any of the data is loaded.
         """
-        names = [x.strip() for x in F.readline().strip().split(sep)]
+        first = F.readline()
+        marker = first.strip()
+        if marker.startswith(EXPORT_FORMAT_MARKER):
+            version_text = marker[len(EXPORT_FORMAT_MARKER):].strip()
+            try:
+                version = int(version_text)
+            except ValueError:
+                raise ValueError(
+                    "Malformed export-format marker: %r" % (marker,)
+                )
+            if version > EXPORT_FORMAT:
+                raise ValueError(
+                    "This file is psycodict export format %s, but this psycodict "
+                    "understands only up to format %s; upgrade psycodict to read "
+                    "it" % (version, EXPORT_FORMAT)
+                )
+            names_line = F.readline()
+        else:
+            # No marker: format 0, and this first line is the column names.
+            names_line = first
+        names = [x.strip() for x in names_line.strip().split(sep)]
         types = [x.strip() for x in F.readline().strip().split(sep)]
         blank = F.readline()
         if blank.strip():

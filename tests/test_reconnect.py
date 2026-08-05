@@ -134,32 +134,28 @@ def test_session_settings_are_applied_and_survive_a_reconnect(own_db):
     assert setting(database, "lock_timeout") == "3s"
 
 
-def test_the_resolver_gives_a_webserver_connection_its_timeout(monkeypatch):
+def test_no_role_gets_a_session_setting_implicitly(monkeypatch):
     """
-    The real resolver, on the option set it would see: the 25 second timeout
-    for the webserver role is chosen from the effective connection user, and
-    the test must not stand in for the code it is checking.
+    A generic library must not act on a role name: the ``webserver`` role no
+    longer receives an implicit statement timeout, and neither does any other.
+    A deployment that wants one passes it explicitly.
+    """
+    database = PostgresDatabase.__new__(PostgresDatabase)
+    for role in ("webserver", "postgres", "lmfdb"):
+        monkeypatch.setattr(
+            PostgresDatabase, "_connection_options", lambda self, r=role: {"user": r}
+        )
+        assert database._resolve_session_settings(None) == {}
 
-    No database is opened -- this is about the choice, not the connection -- so
-    a server with a ``webserver`` role is not needed.
-    """
+
+def test_explicit_session_settings_are_kept(monkeypatch):
     database = PostgresDatabase.__new__(PostgresDatabase)
     monkeypatch.setattr(
         PostgresDatabase, "_connection_options", lambda self: {"user": "webserver"}
     )
-    assert database._resolve_session_settings(None) == {"statement_timeout": "25s"}
-    # an explicit setting overrides the default for that role
-    assert database._resolve_session_settings({"lock_timeout": "3s"}) == {
-        "lock_timeout": "3s"
+    assert database._resolve_session_settings({"statement_timeout": "25s"}) == {
+        "statement_timeout": "25s"
     }
-
-
-def test_the_resolver_gives_other_roles_nothing_implicitly(monkeypatch):
-    database = PostgresDatabase.__new__(PostgresDatabase)
-    monkeypatch.setattr(
-        PostgresDatabase, "_connection_options", lambda self: {"user": "postgres"}
-    )
-    assert database._resolve_session_settings(None) == {}
 
 
 def test_unknown_session_settings_are_refused(own_db):
