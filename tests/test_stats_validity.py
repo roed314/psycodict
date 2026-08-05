@@ -502,3 +502,49 @@ def test_a_failed_swap_does_not_leave_validity_behind(counted, tmp_path, monkeyp
     assert stats_valid_in_meta(counted) is True
     assert counted.stats.quick_count(QUERY) == 67
     assert counted.search_table == name
+
+
+def test_resort_of_a_non_saving_table_ends_invalid(db, table_factory):
+    """
+    Pins the one place the rule is deliberately pessimistic.  ``resort()``
+    renumbers rows without changing them, so the cached counts would still be
+    accurate -- but it goes through the replacement path, which rebuilds the
+    caches only with ``saving`` on and otherwise cannot know they still match.
+    Documented in ``resort``'s docstring: refresh afterwards.
+    """
+    table = table_factory(sort=["n"])
+    table.insert_many([sample_row(i) for i in [3, 1, 2, 0]])
+    assert table.stats.saving is False
+    name = table.search_table
+    table._execute(
+        SQL("UPDATE meta_tables SET stats_valid = true WHERE name = %s"), [name]
+    )
+    table._db.conn.commit()
+    table._refresh()
+
+    table.resort()
+    assert stats_valid_in_meta(db[name]) is False
+
+
+def test_resort_of_a_saving_table_stays_valid(db, counted):
+    """
+    With saving on, the resort rebuilds the counts against the renumbered
+    rows, so the table is entitled to go on serving cached answers.  (The
+    rebuild recomputes the recorded statistics families; a one-off count
+    recorded by hand beforehand is not among them and is not restored.)
+    """
+    name = counted.search_table
+    # sample_row(1000) has flag False, so the cached query still counts 67;
+    # the insert is here to break the order and give resort() work to do.
+    counted.insert_many([sample_row(1000)], restat=False)
+    counted.stats.refresh_stats()
+    counted.resort()
+
+    # The swap installs a fresh table object, and `saving` lives on the
+    # object rather than in meta_tables, so turn it back on to record.
+    table = db[name]
+    table.stats.saving = True
+    assert table._stats_valid is True
+    assert stats_valid_in_meta(table) is True
+    assert table.stats.count(QUERY, record=True) == 67
+    assert table.stats.quick_count(QUERY) == 67

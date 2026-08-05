@@ -448,7 +448,11 @@ hardening standalone use; the highlights:
   beside changed data) now mark the table invalid, in the same transaction as
   the swap. A `metafile` no longer installs a `stats_valid = true` describing
   the database it was exported from. Without this a count cached before such a
-  write was still served afterwards, defeating the enforcement above.
+  write was still served afterwards, defeating the enforcement above. The rule
+  is deliberately conservative in one place: `resort()` leaves the rows
+  unchanged, so the caches would still be accurate, but on a table without
+  `saving` nothing rebuilds them and it ends invalid. *Migration:* run
+  `refresh_stats()` after a `resort()` on such a table.
 - **`scripts/audit_id_order.py`**, a read-only check that streams each
   `id_ordered` table in sort order and reports whether its ids actually
   increase, since the flag can drift. Each table is audited in a read

@@ -1994,6 +1994,12 @@ class PostgresTable(PostgresBase):
         disk space for the replacement table, its indexes, the dump file and
         the backup.
 
+        The rows themselves are untouched, so the cached counts and statistics
+        would still be accurate; but the replacement path marks the table
+        invalid unless it rebuilt them, which it does only with ``saving`` on.
+        On a table that does not save statistics, run ``refresh_stats()``
+        afterwards to serve cached counts again.
+
         INPUT:
 
         - ``force`` -- rebuild even when the table is already marked ordered
