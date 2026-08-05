@@ -480,7 +480,7 @@ hardening standalone use; the highlights:
   library should not act on a role name, so that special case is gone.
   `session_settings=` still applies (and survives reconnects) -- a deployment
   that wants a timeout passes it explicitly. **LMFDB does this in its subclass**
-  ([lmfdb#7128](https://github.com/LMFDB/lmfdb/pull/7128)); land that before
+  ([lmfdb#7131](https://github.com/LMFDB/lmfdb/pull/7131)); land that before
   bumping LMFDB to a psycodict that includes this change, or the web workers
   lose their timeout. *Migration:* pass
   `session_settings={"statement_timeout": "25s"}` (or your value) when

@@ -240,11 +240,10 @@ class PostgresDatabase(PostgresBase):
     # Override the following to use a different class for search tables
     _search_table_class_ = PostgresSearchTable
 
-    # The session settings psycodict will apply, and what it applies to a
-    # every connection.  Settings are
-    # applied with set_config, which takes the name and the value as bound
-    # parameters; the closed set here is what keeps a caller from setting
-    # something unrelated through the same door.
+    # The session settings psycodict applies to the main connection and every
+    # replacement main connection.  Settings are applied with set_config, which
+    # takes the name and value as bound parameters; the closed set here is what
+    # keeps a caller from setting something unrelated through the same door.
     _allowed_session_settings = (
         "statement_timeout",
         "lock_timeout",
@@ -254,7 +253,7 @@ class PostgresDatabase(PostgresBase):
 
     def _resolve_session_settings(self, session_settings):
         """
-        The session settings to apply to every connection of this database.
+        The session settings to apply to the main connection and its replacements.
 
         INPUT:
 
