@@ -33,6 +33,8 @@ You can search using the methods ``search``, ``lucky`` and ``lookup``::
 
 # Single source of truth for the package version: pyproject.toml reads it via
 # ``[tool.setuptools.dynamic]``, and it works from an uninstalled checkout too.
+#: The version of psycodict, as a :pep:`440` string.  For an installed copy it
+#: is the same value ``importlib.metadata.version("psycodict")`` reports.
 __version__ = "1.0.0rc2"
 
 try:
@@ -52,3 +54,17 @@ assert DelayCommit
 from psycopg.sql import SQL, Identifier, Placeholder, Literal, Composable, Composed
 
 assert SQL and Identifier and Placeholder and Literal and Composable and Composed
+
+# The names psycodict re-exports at the package root.  The Postgres* classes and
+# the rest of the interface are imported from their submodules; see each
+# module's __all__ and Versioning.md for the full public API.
+__all__ = [
+    "__version__",
+    "SQL",
+    "Identifier",
+    "Placeholder",
+    "Literal",
+    "Composable",
+    "Composed",
+    "DelayCommit",
+]

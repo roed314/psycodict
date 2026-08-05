@@ -1,9 +1,17 @@
 # API reference
 
-Generated from the docstrings.  The map of the library:
+Generated from the docstrings.  Each page documents exactly its module's
+`__all__` — the supported surface [Versioning.md](../Versioning.md) promises to
+keep across 1.x.  The map of the library:
 
+- {mod}`psycodict` — the package root: `__version__` and the names re-exported
+  for convenience ({class}`~psycodict.utils.DelayCommit` and the SQL
+  composition classes `SQL`, `Identifier`, `Placeholder`, `Literal`,
+  `Composable`, `Composed`).
 - {mod}`psycodict.database` — {class}`~psycodict.database.PostgresDatabase`,
-  the connection object; each table in the database is an attribute of it.
+  the connection object; access a table canonically as `db[name]`.  Attribute
+  access `db.<name>` is shorthand for the same lookup when the table name is
+  not shadowed by a real attribute or method of the database object.
 - {mod}`psycodict.searchtable` —
   {class}`~psycodict.searchtable.PostgresSearchTable`, the read API
   (`search`, `lucky`, `lookup`, `count`, `random`, …) driven by the query
@@ -36,6 +44,7 @@ Generated from the docstrings.  The map of the library:
 ```{toctree}
 :maxdepth: 1
 
+package
 database
 searchtable
 table

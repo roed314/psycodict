@@ -12,14 +12,17 @@ database in sync.
 
 ## Install
 
-psycodict runs on [psycopg 3](https://www.psycopg.org/psycopg3/). psycopg is an
-optional dependency so that you can choose between the binary and pure-Python
-builds; install psycodict with one of the two extras:
+psycodict runs on [psycopg 3](https://www.psycopg.org/psycopg3/), which is a
+plain dependency, so a bare install works on a system that has `libpq`:
 
-```
-pip install "psycodict[pgbinary]"    # pulls in psycopg[binary]; no system libpq needed
-pip install "psycodict[pgsource]"    # pulls in pure-Python psycopg, which uses your system libpq
-```
+| Command | psycopg it installs |
+|---|---|
+| `pip install psycodict` | pure-Python, using your system `libpq` |
+| `pip install "psycodict[pgbinary]"` | precompiled, with a bundled `libpq` — the simplest install, no system `libpq` needed |
+| `pip install "psycodict[pgc]"` | locally compiled against your system `libpq` (needs build tools) |
+
+`pgbinary` is the easiest; the plain install keeps psycodict usable as a library
+in an environment that manages `libpq` itself.
 
 ## Quickstart
 
@@ -128,7 +131,7 @@ See the [CHANGELOG](https://github.com/roed314/psycodict/blob/main/CHANGELOG.md)
 
 - Python 3.9 or newer.
 - PostgreSQL 13 through 18.
-- psycopg 3.2.4 or newer (installed through the `pgbinary` or `pgsource` extra above).
+- psycopg 3.2.4 or newer (a plain dependency; the `pgbinary`/`pgc` extras above pick a build).
 
 Python 3.9 and PostgreSQL 13 are already past their upstream end of life;
 psycodict keeps supporting them as legacy compatibility for downstream

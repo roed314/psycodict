@@ -171,6 +171,13 @@ def doc_tables(db):
         sort=["conductor_norm", "label"],
     )
     db.test_curves.insert_many(_rows(CURVE_COLUMNS, CURVES))
+    # insert_many invalidates the statistics, and a cached count may not be
+    # served while they are invalid.  Nothing is cached yet and the totals are
+    # maintained by the inserts, so the caches do agree with the data; saying
+    # so puts both tables in the state a freshly loaded table is in, which is
+    # what the statistics examples assume.
+    db.test_fields._restore_stats()
+    db.test_curves._restore_stats()
     yield db
     # The namespace was verified empty above and the suite runs serially,
     # so everything in it now is ours: the two tables, their stats/counts

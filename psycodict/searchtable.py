@@ -21,9 +21,20 @@ from .table import PostgresTable
 from .encoding import Json
 from .utils import IdentifierWrapper, DelayCommit, filter_sql_injection, postgres_infix_ops
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresSearchTable",
+]
+
 # psycopg3 splits plain and server-side cursors into two classes
 # (psycopg2 had a single cursor class, which this name used to alias)
 pg_cursor = (Cursor, ServerCursor)
+
+# The sampling strategies random_sample accepts, upper-cased because SYSTEM and
+# BERNOULLI go into the TABLESAMPLE clause verbatim.
+_RANDOM_SAMPLE_MODES = ("SYSTEM", "BERNOULLI", "CHOICE")
 
 
 def _qualify(frag, tablename):
@@ -1642,6 +1653,11 @@ class PostgresSearchTable(PostgresTable):
         """
         if pick_first:
             colvals = self.distinct(pick_first, query)
+            if not colvals:
+                # No row satisfies the query, so there is no value to pick;
+                # random.choice([]) would raise IndexError instead of
+                # returning the documented None.
+                return None
             query = dict(query)
             query[pick_first] = random.choice(colvals)
             return self.random(query, projection)
@@ -1680,10 +1696,10 @@ class PostgresSearchTable(PostgresTable):
             # a temporary hack FIXME
             # maxid = self.max('id')
             maxid = self.max_id()
-            # max_id returns -1 on an empty table (MAX(id) is NULL), so
-            # testing for 0 sent an empty table into randint(0, -1);
-            # anything below 1 means there are no rows.
-            if maxid < 1:
+            # max_id returns -1 on an empty table (MAX(id) is NULL).  That is
+            # the only empty sentinel: 0 is a legitimate id, so a table whose
+            # single row has id 0 must not be reported as empty.
+            if maxid < 0:
                 return None
             # a temporary hack FIXME
             minid = self.min_id()
@@ -1693,7 +1709,11 @@ class PostgresSearchTable(PostgresTable):
                 # rid = random.randint(1, maxid)
                 rid = random.randint(minid, maxid)
                 res = self.lucky({"id": rid}, projection=projection)
-                if res:
+                # lucky returns None when no row has that id.  Anything else is
+                # a hit, including a projection whose value is 0, False, "" or
+                # an empty list -- testing truthiness discarded those rows and
+                # could exhaust maxtries on a table full of them.
+                if res is not None:
                     return res
             raise RuntimeError("Random selection failed!")
 
@@ -1719,7 +1739,21 @@ class PostgresSearchTable(PostgresTable):
                 mode = "bernoulli"
             else:
                 mode = "choice"
+        if not isinstance(mode, str):
+            raise ValueError(
+                "mode must be one of %s or None, not %s"
+                % (", ".join(map(repr, _RANDOM_SAMPLE_MODES)), type(mode).__name__)
+            )
         mode = mode.upper()
+        # Checked before any work is done: an unrecognized mode used to fall
+        # through every branch below and return None, which reads like an empty
+        # result rather than a mistake.
+        if mode not in _RANDOM_SAMPLE_MODES:
+            raise ValueError(
+                "%r is not a valid mode; use one of %s, or None to choose "
+                "between 'bernoulli' and 'choice' by result count"
+                % (mode.lower(), ", ".join(map(repr, _RANDOM_SAMPLE_MODES)))
+            )
         search_cols = self._parse_projection(projection)
         if ratio > 1 or ratio <= 0:
             raise ValueError("Ratio must be a positive number between 0 and 1")
@@ -1728,9 +1762,11 @@ class PostgresSearchTable(PostgresTable):
         elif mode == "CHOICE":
             results = list(self.search(query, projection, sort=[]))
             count = int(len(results) * ratio)
-            if repeatable is not None:
-                random.seed(repeatable)
-            return random.sample(results, count)
+            # A local generator, so asking for a repeatable sample does not
+            # reseed the process-wide random module and make every other
+            # caller's sequence repeat with it.
+            rng = random if repeatable is None else random.Random(repeatable)
+            return rng.sample(results, count)
         elif mode in ["SYSTEM", "BERNOULLI"]:
             cols = SQL(", ").join(self._column_composable(c) for c in search_cols)
             if repeatable is None:

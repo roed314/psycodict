@@ -14,6 +14,16 @@ from pathlib import Path
 
 from psycopg.sql import SQL, Identifier, Placeholder
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "DelayCommit",
+    "IdentifierWrapper",
+    "LockError",
+    "SearchParsingError",
+]
+
 
 class SearchParsingError(ValueError):
     """

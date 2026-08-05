@@ -17,6 +17,13 @@ from configparser import ConfigParser
 from collections import defaultdict
 from copy import deepcopy
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "Configuration",
+]
+
 
 def strbool(s):
     """
@@ -196,7 +203,10 @@ class Configuration():
                 dest="postgresql_dbname",
                 metavar="DBNAME",
                 help="PostgreSQL database name [default: %(default)s]",
-                default=defaults.get("postgresql_dbname", "lmfdb"),
+                # A generic default, not an LMFDB one: "postgres" is the
+                # database libpq itself falls back to.  Deployments name their
+                # own database in the config file or constructor.
+                default=defaults.get("postgresql_dbname", "postgres"),
             )
 
         def sec_opt(key):

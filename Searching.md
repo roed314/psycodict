@@ -22,9 +22,11 @@ change without notice.  Code outside psycodict should call only the
 non-underscore methods described below (on the table, and on its public
 `table.stats` attribute).
 
-A search table is reached as `db.<table_name>` (equivalently `db["<table_name>"]`)
-on a `PostgresDatabase`.  Every example in this document uses `db` for the
-database and a table variable such as `nf = db.nf_fields`.
+A search table is reached as `db["<table_name>"]` on a `PostgresDatabase`, and
+as `db.<table_name>` when the name is not shadowed by a real attribute or method
+of the database object (see [Versioning.md](Versioning.md#reaching-a-table)).
+Every example in this document uses `db` for the database and a table variable
+such as `nf = db.nf_fields`.
 
 ## Contents
 

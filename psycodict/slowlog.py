@@ -40,6 +40,15 @@ from datetime import datetime
 from heapq import heapify, heappop, heappush
 from math import ceil, floor, log10
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "parse_slow_log",
+    "slow_query_report",
+    "show_slow_report",
+]
+
 _TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - ")
 _ANSI_RE = re.compile("\x1b\\[[0-9;]*m")
 _NUMBER = r"(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
