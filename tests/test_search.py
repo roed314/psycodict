@@ -13,7 +13,7 @@ from decimal import Decimal
 
 import pytest
 
-from conftest import sample_row
+from conftest import FakeInteger, sample_row
 
 
 @pytest.fixture
@@ -474,6 +474,31 @@ def test_array_contains(filled_table):
     assert filled_table.search({"vec": {"$contains": [5, 6]}}, "n", limit=5) == [5]
     # a scalar is wrapped in a singleton array; 5 appears in vec for n = 4 and n = 5
     assert filled_table.count({"vec": {"$contains": 5}}) == 2
+
+
+def test_array_of_several_integer_types(filled_table):
+    # psycopg dumps an array with one dumper for the whole of it, and refuses
+    # a list whose entries are integers of different types.  A caller building
+    # a query array out of a computed value and a literal or two produces such
+    # a list without noticing, so psycodict makes it homogeneous first.
+    assert filled_table.search({"vec": [FakeInteger(5), 6, 0]}, "n", limit=5) == [5]
+    assert filled_table.search({"mat": [FakeInteger(3), 9]}, "n", limit=5) == [3]
+    assert filled_table.count({"vec": [FakeInteger(5), 6, 1]}) == 0
+    # and through the array operators, which build their arrays the same way
+    assert filled_table.search({"vec": {"$contains": [FakeInteger(5), 6]}}, "n", limit=5) == [5]
+    assert filled_table.search(
+        {"vec": {"$in": [[FakeInteger(5), 6, 0], [7, 8, 2]]}}, "n", limit=5
+    ) == [5, 7]
+
+
+def test_array_of_several_integer_types_when_nested(table_factory):
+    # Nesting makes no difference: a two dimensional array is one array to
+    # Postgres, so its entries must agree throughout, not row by row.
+    table = table_factory(columns=[("n", "integer"), ("grid", "integer[]")], label_col=None)
+    table.insert_many([{"n": i, "grid": [[i, i + 1], [i + 2, i + 3]]} for i in range(5)])
+    assert table.search({"grid": [[3, 4], [5, 6]]}, "n", limit=5) == [3]
+    assert table.search({"grid": [[FakeInteger(3), 4], [5, 6]]}, "n", limit=5) == [3]
+    assert table.search({"grid": [[3, 4], [FakeInteger(5), 6]]}, "n", limit=5) == [3]
 
 
 def test_array_containedin(filled_table):

@@ -29,7 +29,7 @@ from psycopg import (
 )
 from psycopg.sql import SQL, Identifier, Placeholder, Literal, Composable
 
-from .encoding import Json
+from .encoding import Json, homogenize_values
 from .utils import reraise, DelayCommit, QueryLogFilter
 from .validation import (
     InvalidDefinitionError,
@@ -338,6 +338,11 @@ class PostgresBase():
                 commit = False
             elif commit:
                 raise ValueError("buffered and commit are incompatible")
+
+        # psycopg refuses an array whose entries are integers of more than one
+        # type, which a caller assembling one from several sources (Sage
+        # integers from one, Python ints from another) produces easily.
+        values = homogenize_values(values, values_list)
 
         try:
             cur = self._db._cursor(buffered=buffered)

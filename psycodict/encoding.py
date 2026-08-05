@@ -7,6 +7,8 @@ import binascii
 import json
 import datetime
 import math
+import numbers
+from collections.abc import Mapping
 from psycopg.adapt import Dumper
 try:
     try:
@@ -235,6 +237,192 @@ class ArrayDumper(Dumper):
         return _pg_array_literal(obj._seq).encode()
 
 
+def _array_element_types(seq, types):
+    """
+    Add the types of the non-``None`` entries of a possibly nested list to
+    the set ``types``, flattening exactly as psycopg does when it decides
+    which dumper an array's elements get.
+    """
+    for item in seq:
+        if isinstance(item, list):
+            _array_element_types(item, types)
+        elif item is not None:
+            types.add(type(item))
+
+
+def _as_ints(seq):
+    """
+    A copy of a possibly nested list with every entry replaced by the
+    equivalent Python ``int``, leaving ``None`` (Postgres NULL) alone.
+    """
+    return [
+        _as_ints(item) if isinstance(item, list)
+        else item if item is None
+        else int(item)
+        for item in seq
+    ]
+
+
+def homogenize_int_arrays(value):
+    """
+    Return ``value`` with the entries of an all-integer list made into
+    Python ints, if they are not all of one type already.
+
+    psycopg dumps a list by picking one dumper for the whole array, so it
+    refuses a list whose entries have different types unless those types
+    dump to the same Postgres oid:  ``[Integer(1), 2]``, mixing Sage's
+    integers with Python's, raises ``DataError: cannot dump lists of mixed
+    types``.  Such a list means one thing only -- an array of integers --
+    and callers assembling one out of several sources (a parsed search box
+    here, a literal there) have no reason to care which flavour of integer
+    each source produced, so psycodict makes them agree rather than making
+    the query fail.
+
+    Only lists that mix an integer type psycopg does not know natively into
+    an otherwise integral list are touched, so this changes the behaviour of
+    no query that worked before:
+
+    - a list of a single type dumps fine as it is, whatever that type is;
+    - a list holding anything non-integral is left for psycopg to judge;
+    - ``bool`` is integral to Python but not to Postgres, so a list holding
+      one is left alone;
+    - subclasses of ``int`` (which is how psycopg's own ``Int2``/``Int4``/
+      ``Int8``/``IntNumeric`` wrappers ask for a particular oid) are left
+      alone, since replacing them would discard the oid they were chosen for.
+
+    INPUT:
+
+    - ``value`` -- anything that might be passed to Postgres as a value
+
+    OUTPUT:
+
+    Either ``value`` itself, or a list of ints with the same shape.
+
+    EXAMPLES::
+
+        >>> import numbers
+        >>> from psycodict.encoding import homogenize_int_arrays
+
+    Sage's ``Integer`` is the type this exists for.  psycodict does not
+    require Sage, so the examples below use a stand-in with the one property
+    that matters here, being registered as an integer::
+
+        >>> class MyInt:
+        ...     def __init__(self, n):
+        ...         self.n = n
+        ...     def __int__(self):
+        ...         return self.n
+        >>> _ = numbers.Integral.register(MyInt)
+
+    A list of Python ints is homogeneous already and comes back unchanged,
+    as does anything that is not a list at all::
+
+        >>> homogenize_int_arrays([1, -1, 1])
+        [1, -1, 1]
+        >>> homogenize_int_arrays(3)
+        3
+
+    Mixing in the other integer type would make psycopg refuse the array, so
+    the entries become ints::
+
+        >>> homogenize_int_arrays([MyInt(1), -1, 1])
+        [1, -1, 1]
+
+    A nested array is one array, as it is in Postgres, and its NULLs stay
+    NULL::
+
+        >>> homogenize_int_arrays([[MyInt(1), 2], [3, None]])
+        [[1, 2], [3, None]]
+
+    A list that is not all integers is psycopg's business, not ours::
+
+        >>> homogenize_int_arrays([0.5, 1])
+        [0.5, 1]
+    """
+    if not isinstance(value, list):
+        return value
+    types = set()
+    _array_element_types(value, types)
+    if len(types) < 2:
+        # One type (or an array of nothing but NULLs): psycopg is content.
+        return value
+    if not all(issubclass(typ, numbers.Integral) for typ in types):
+        return value
+    if any(issubclass(typ, bool) for typ in types):
+        return value
+    if all(issubclass(typ, int) for typ in types):
+        # psycopg understands all of these; whatever it makes of the
+        # mixture, it is not ours to second-guess.
+        return value
+    return _as_ints(value)
+
+
+def _map_changed(params, func):
+    """
+    ``func`` applied to every value of a parameter collection -- a sequence
+    for ``%s`` placeholders, a mapping for the ``%(name)s`` ones that
+    multi-row inserts use -- except that ``params`` itself comes back when
+    ``func`` changed nothing, so that the overwhelmingly common case of a
+    query with nothing to fix allocates nothing.
+    """
+    out = None
+    if isinstance(params, Mapping):
+        for key, item in params.items():
+            new = func(item)
+            if new is not item:
+                if out is None:
+                    out = dict(params)
+                out[key] = new
+    else:
+        for i, item in enumerate(params):
+            new = func(item)
+            if new is not item:
+                if out is None:
+                    out = list(params)
+                out[i] = new
+    return params if out is None else out
+
+
+def homogenize_values(values, values_list=False):
+    """
+    Return the values of a query with every mixed-type integer array in them
+    made homogeneous by :func:`homogenize_int_arrays`.
+
+    INPUT:
+
+    - ``values`` -- the values of a single statement: a sequence with one
+      entry per ``%s`` placeholder, or a mapping keyed by the names of
+      ``%(name)s`` ones.  When ``values_list`` is set, a sequence of such
+      collections instead, one per row of a multi-row insert.
+    - ``values_list`` -- boolean (default ``False``); whether ``values`` is a
+      sequence of rows rather than the values of one statement
+
+    OUTPUT:
+
+    ``values`` itself when nothing needed changing, which is the usual case,
+    so that ordinary queries copy nothing.
+
+    EXAMPLES::
+
+        >>> from psycodict.encoding import homogenize_values
+
+    A query whose values hold no mixed array -- almost every query -- gets
+    its own values back, not a copy of them::
+
+        >>> values = [[1, 2], 'a', 3]
+        >>> homogenize_values(values) is values
+        True
+        >>> rows = [[[1, 2], 'a'], [[3, 4], 'b']]
+        >>> homogenize_values(rows, values_list=True) is rows
+        True
+    """
+    if not values:
+        return values
+    if values_list:
+        return _map_changed(values, homogenize_values)
+    return _map_changed(values, homogenize_int_arrays)
+
+
 class Json():
     """
     A wrapper marking a value for storage as json/jsonb, encoded with
@@ -424,6 +612,13 @@ class Json():
             return {"__time__": 0, "data": "%s" % (obj)}
         elif isinstance(obj, (str, bool, float, int)):
             return obj
+        elif isinstance(obj, numbers.Integral):
+            # Some other integer type: gmpy2's, numpy's, or Sage's when
+            # psycodict was imported without Sage.  Stored as the integer it
+            # is, as :func:`homogenize_int_arrays` sends one to Postgres.
+            # This branch comes after the one above so that ``bool``, which
+            # Python counts as an integer and Postgres does not, stays a bool.
+            return int(obj)
         else:
             raise ValueError("Unsupported type: %s" % (type(obj)))
 

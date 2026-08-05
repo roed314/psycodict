@@ -22,10 +22,42 @@ If no server is reachable the whole suite is skipped, so that ``pytest`` in a
 checkout without PostgreSQL is not a wall of errors.  Continuous integration
 sets ``PSYCODICT_TEST_DB_REQUIRED=1``, which turns that skip into a failure.
 """
+import numbers
 import os
 import uuid
 
 import pytest
+
+
+class FakeInteger:
+    """
+    An integer type that is not a subclass of ``int``, standing in for Sage's
+    ``Integer``.
+
+    psycodict does not depend on Sage, so the type that motivates
+    :func:`psycodict.encoding.homogenize_int_arrays` cannot be imported by the
+    unit CI jobs.  Registering with ``numbers.Integral`` reproduces everything
+    that function and psycopg look at: a distinct type, integral, convertible
+    with ``int()``.
+    """
+
+    def __init__(self, n):
+        self.n = n
+
+    def __int__(self):
+        return self.n
+
+    def __eq__(self, other):
+        return self.n == int(other)
+
+    def __hash__(self):
+        return hash(self.n)
+
+    def __repr__(self):
+        return "FakeInteger(%d)" % self.n
+
+
+numbers.Integral.register(FakeInteger)
 
 
 def _connection_kwargs():

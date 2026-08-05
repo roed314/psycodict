@@ -14,7 +14,7 @@ no write path updates unless ``stats.saving`` is on; see
 import pytest
 from psycopg import IntegrityError
 
-from conftest import sample_row
+from conftest import FakeInteger, sample_row
 from psycodict.utils import DelayCommit
 
 
@@ -86,6 +86,26 @@ def test_insert_many_roundtrips_arrays(empty_table):
     assert first == {"vec": [3, -1, 0], "mat": [2, 4, 8]}
     second = empty_table.lucky({"n": 2}, projection=["vec", "mat"])
     assert second == {"vec": [], "mat": [1.5, 2.5]}
+
+
+def test_insert_many_roundtrips_arrays_of_several_integer_types(empty_table):
+    # The rows of a multi-row insert are bound as one values list, so this is
+    # the other shape psycodict has to make homogeneous before psycopg sees it.
+    empty_table.insert_many([
+        {"n": 1, "label": "a", "vec": [FakeInteger(3), -1, 0], "mat": [2, FakeInteger(4)]},
+        {"n": 2, "label": "b", "vec": [1, 2, 3], "mat": [1, 2]},
+    ])
+    assert empty_table.lucky({"n": 1}, projection=["vec", "mat"]) == {
+        "vec": [3, -1, 0], "mat": [2, 4],
+    }
+    assert empty_table.lucky({"n": 2}, projection=["vec", "mat"]) == {
+        "vec": [1, 2, 3], "mat": [1, 2],
+    }
+
+
+def test_update_with_an_array_of_several_integer_types(filled_table):
+    filled_table.update({"n": 3}, {"vec": [FakeInteger(9), 8, 7]}, restat=False)
+    assert filled_table.lucky({"n": 3}, projection="vec") == [9, 8, 7]
 
 
 def test_insert_many_roundtrips_double_precision_and_boolean(empty_table):
