@@ -8,6 +8,15 @@ import json
 import datetime
 import math
 from psycopg.adapt import Dumper
+
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "Json",
+    "Array",
+    "copy_dumps",
+]
 try:
     try:
         # this fails in sage 9.3

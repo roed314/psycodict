@@ -21,6 +21,14 @@ from collections import namedtuple
 
 from psycopg.sql import SQL, Identifier
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "InvalidColumnTypeError",
+    "InvalidDefinitionError",
+]
+
 
 # This dictionary is used when creating new tables
 # The value associated to each type is the typlen from the pg_type table

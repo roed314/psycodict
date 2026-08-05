@@ -93,6 +93,13 @@ import re
 import psycopg
 from psycopg.sql import SQL, Identifier
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "NotificationListener",
+]
+
 # The single channel on which psycodict announces schema changes.  The payload
 # is the affected table's name.  See the module docstring for the contract.
 SCHEMA_CHANNEL = "psycodict_schema"

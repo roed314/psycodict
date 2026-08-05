@@ -52,3 +52,17 @@ assert DelayCommit
 from psycopg.sql import SQL, Identifier, Placeholder, Literal, Composable, Composed
 
 assert SQL and Identifier and Placeholder and Literal and Composable and Composed
+
+# The names psycodict re-exports at the package root.  The Postgres* classes and
+# the rest of the interface are imported from their submodules; see each
+# module's __all__ and Versioning.md for the full public API.
+__all__ = [
+    "__version__",
+    "SQL",
+    "Identifier",
+    "Placeholder",
+    "Literal",
+    "Composable",
+    "Composed",
+    "DelayCommit",
+]

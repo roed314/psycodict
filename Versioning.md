@@ -9,12 +9,14 @@ metadata tables living inside your database.
 
 ## What is public
 
- * **Non-underscore names** in the `psycodict` package that are documented — in
-   the specification documents ([QueryLanguage.md](QueryLanguage.md),
-   [Searching.md](Searching.md), [DataManagement.md](DataManagement.md),
-   [MetadataFormats.md](MetadataFormats.md)) or in docstrings.  Names with a
-   leading underscore are private, whatever module they live in, and may change
-   in any release.
+ * **The names each module exports in its `__all__`**, and their documented
+   behavior.  These are exactly the names in the [API reference](api/index.md),
+   and the snapshot test `tests/test_public_api.py` freezes them, so the promise
+   and the code cannot drift apart.  A non-underscore name that is *not* in an
+   `__all__` (and every underscore-prefixed name, whatever module it lives in)
+   is implementation: it may still be importable, but it is not part of this
+   promise and may change in any release.  Having a docstring does not make a
+   name public; being in `__all__` does.
  * **The query language** as specified in [QueryLanguage.md](QueryLanguage.md):
    the meaning of a query dictionary is stable within a major version: new
    features may be added in minor versions, but functioning queries will
@@ -34,13 +36,24 @@ metadata tables living inside your database.
  * **The `meta_*` tables**, whose layout is governed by the metadata format
    protocol below.
 
+## Reaching a table
+
+`db[name]` is the canonical, collision-free way to reach a search table, and the
+one covered by this promise.  `db.<name>` (attribute access) is convenience
+syntax for the same lookup, with one caveat: a real attribute or method of the
+database object wins over a table of the same name, so a table called `config`
+or `tablenames` is reachable only through `db["config"]`.  Adding a method to
+the database class in a minor release therefore never makes a table inaccessible
+through the canonical `db[name]` lookup, even if it shadows an attribute-access
+name.
+
 ## What is not covered
 
-Underscore-prefixed names; the exact SQL text psycodict emits (only its
-semantics); performance characteristics; the contents of log files; and
-undocumented behavior generally, even where observable.  If something
-undocumented matters to your project, open an issue — turning it into
-documented (hence stable) behavior is usually easy.
+Non-`__all__` names, whether or not they carry a docstring; underscore-prefixed
+names; the exact SQL text psycodict emits (only its semantics); performance
+characteristics; the contents of log files; and undocumented behavior generally,
+even where observable.  If something undocumented matters to your project, open
+an issue — turning it into documented (hence stable) behavior is usually easy.
 
 ## Database metadata compatibility
 

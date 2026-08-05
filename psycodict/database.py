@@ -55,6 +55,13 @@ from .grants import GRANT_ACTIONS, GrantPolicy
 from .searchtable import PostgresSearchTable
 from .utils import DelayCommit, safe_child_path
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresDatabase",
+]
+
 # The registry of metadata-format migrations.  Entry N describes the step
 # from format N-1 to format N; MetadataFormats.md has the checklist a new
 # format must follow.

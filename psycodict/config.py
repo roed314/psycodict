@@ -17,6 +17,13 @@ from configparser import ConfigParser
 from collections import defaultdict
 from copy import deepcopy
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "Configuration",
+]
+
 
 def strbool(s):
     """

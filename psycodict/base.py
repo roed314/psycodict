@@ -50,6 +50,13 @@ from .validation import (  # noqa: F401
     validate_column_type,
 )
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresBase",
+]
+
 
 ##################################################################
 # meta_* infrastructure                                          #

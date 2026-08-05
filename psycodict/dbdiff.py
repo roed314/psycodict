@@ -24,6 +24,14 @@ connections do not report stale differences.
 
 from psycopg.sql import SQL, Identifier
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "compare_databases",
+    "format_differences",
+]
+
 # The columns of meta_tables that are compared for tables present in both
 # databases (in this order).  The remaining columns are deliberately left
 # out: total is reported through row_counts instead, out_of_order and

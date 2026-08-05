@@ -464,6 +464,17 @@ hardening standalone use; the highlights:
   install smoke tests assert `importlib.metadata.version == __version__` and run
   `pip check` for both a plain and a binary-extra install.
 
+- **The public API is defined by `__all__`.** Each module now declares the
+  names psycodict promises to keep across 1.x, and the API reference documents
+  exactly those (Sphinx `undoc-members` is off). A non-`__all__` name -- even one
+  with a docstring -- is implementation: still importable, so nothing downstream
+  breaks, but not part of the stability promise. `tests/test_public_api.py`
+  freezes the surface so a change to it is deliberate. Versioning.md is rewritten
+  around this, and states that `db[name]` is the canonical table lookup while
+  `db.<name>` is convenience syntax a real database attribute wins over -- so
+  adding a method in a minor release never makes a table unreachable through
+  `db[name]`.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores

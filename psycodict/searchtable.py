@@ -21,6 +21,13 @@ from .table import PostgresTable
 from .encoding import Json
 from .utils import IdentifierWrapper, DelayCommit, filter_sql_injection, postgres_infix_ops
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresSearchTable",
+]
+
 # psycopg3 splits plain and server-side cursors into two classes
 # (psycopg2 had a single cursor class, which this name used to alias)
 pg_cursor = (Cursor, ServerCursor)

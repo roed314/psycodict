@@ -26,6 +26,14 @@ from dataclasses import dataclass, field
 
 from .validation import InvalidDefinitionError, MAX_IDENTIFIER_LENGTH
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "GrantPolicy",
+    "LMFDBGrantPolicy",
+]
+
 # The actions a policy can grant.  A policy manages exactly these: privileges
 # outside this set (TRUNCATE, REFERENCES, TRIGGER) are left alone.
 GRANT_ACTIONS = ("SELECT", "INSERT", "UPDATE", "DELETE")

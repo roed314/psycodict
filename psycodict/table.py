@@ -49,6 +49,13 @@ from .validation import (
 )
 from .statstable import PostgresStatsTable
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresTable",
+]
+
 assert _operator_classes and _valid_storage_params
 
 

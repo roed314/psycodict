@@ -25,6 +25,13 @@ from .validation import column_type_sql, physical_table_name
 from .encoding import Json, numeric_converter
 from .utils import DelayCommit, KeyedDefaultDict, make_tuple
 
+# The supported public API of this module: the names psycodict promises to
+# keep across 1.x.  Other non-underscore names are implementation that may
+# change; see Versioning.md.
+__all__ = [
+    "PostgresStatsTable",
+]
+
 # The following is used in bucketing for statistics
 pg_to_py = {}
 for typ in [
