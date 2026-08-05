@@ -323,3 +323,182 @@ def test_copy_from_analyzes_the_live_table(cached_table, table_factory, tmp_path
 
     assert seen == [([target.search_table], "")]
     assert target.count() == 200
+
+
+# ---------------------------------------------------------------------------
+# no changed-data path keeps a cached answer by forgetting the flag
+#
+# The whole gate above is worth nothing if a write changes rows, does not
+# refresh the caches, and leaves stats_valid true: the cached rows are then
+# still served as answers.  These check the flag, the cache and the truth.
+# ---------------------------------------------------------------------------
+
+QUERY = {"flag": True}
+
+
+@pytest.fixture
+def counted(cached_table):
+    """
+    ``cached_table`` with a nonempty-query count actually recorded and served.
+    """
+    before = cached_table.stats.count(QUERY, record=True)
+    assert before == 67
+    assert cached_table.stats.quick_count(QUERY) == before
+    assert stats_valid_in_meta(cached_table) is True
+    return cached_table
+
+
+def assert_invalidated(table, expected):
+    """
+    The flag is false, no cached answer is served, and the truth is available.
+    """
+    assert table._stats_valid is False
+    assert stats_valid_in_meta(table) is False
+    assert table.stats.quick_count(QUERY) is None
+    assert table.count(QUERY) == expected
+
+
+def _flag_flip_file(table, tmp_path, name="u.txt"):
+    """
+    An update file clearing ``flag`` on the rows the cached query counts.
+    """
+    labels = [
+        rec["label"]
+        for rec in table.search(QUERY, projection=["label"])
+    ]
+    path = tmp_path / name
+    with open(path, "w") as F:
+        F.write("label|flag\ntext|boolean\n\n")
+        for label in labels:
+            F.write("%s|f\n" % label)
+    return str(path)
+
+
+def test_inplace_update_from_file_without_restat_invalidates(counted, tmp_path):
+    counted.update_from_file(
+        _flag_flip_file(counted, tmp_path), inplace=True, restat=False
+    )
+    assert_invalidated(counted, 0)
+
+
+def test_replacement_update_from_file_without_restat_invalidates(db, counted, tmp_path):
+    name = counted.search_table
+    counted.update_from_file(_flag_flip_file(counted, tmp_path), restat=False)
+    assert_invalidated(db[name], 0)
+
+
+def test_rewrite_without_restat_invalidates(db, counted):
+    name = counted.search_table
+
+    def clear_flag(rec):
+        rec["flag"] = False
+        return rec
+
+    counted.rewrite(clear_flag, restat=False)
+    assert_invalidated(db[name], 0)
+
+
+def test_inplace_rewrite_without_restat_invalidates(counted):
+    def clear_flag(rec):
+        rec["flag"] = False
+        return rec
+
+    counted.rewrite(clear_flag, inplace=True, restat=False)
+    assert_invalidated(counted, 0)
+
+
+def test_reload_without_matching_caches_invalidates(db, counted, tmp_path):
+    """
+    A reload with no counts/stats files swaps changed search data in beside
+    companions it merely cloned; with restat off nothing rebuilds them.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    counted.copy_to(str(searchfile), include_id=False)
+    # a file whose rows differ from the cached ones
+    text = open(searchfile).read().replace("|t|", "|f|")
+    with open(searchfile, "w") as F:
+        F.write(text)
+
+    counted.reload(str(searchfile), restat=False)
+    assert_invalidated(db[name], 0)
+
+
+def test_a_metafile_cannot_vouch_for_caches_the_reload_did_not_build(db, counted, tmp_path):
+    """
+    meta_tables is replaced wholesale by the metafile, stats_valid included.
+    That flag describes the database the file came from; it must not be
+    installed over caches this reload never rebuilt.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    metafile = tmp_path / "meta.txt"
+    counted.copy_to(str(searchfile), include_id=False, metafile=str(metafile))
+    assert "|t|" in open(metafile).read()  # the file asserts stats_valid
+
+    text = open(searchfile).read().replace("|t|", "|f|")
+    with open(searchfile, "w") as F:
+        F.write(text)
+    counted.reload(str(searchfile), metafile=str(metafile), restat=False)
+
+    assert_invalidated(db[name], 0)
+
+
+def test_a_reload_carrying_its_own_caches_stays_valid(db, counted, tmp_path):
+    """
+    The other half of the rule: an export that supplies counts and stats
+    alongside the search file installed caches built for exactly that data,
+    so the table is entitled to go on serving them.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    countsfile = tmp_path / "counts.txt"
+    statsfile = tmp_path / "stats.txt"
+    counted.copy_to(str(searchfile), countsfile=str(countsfile), statsfile=str(statsfile))
+
+    counted.reload(str(searchfile), countsfile=str(countsfile), statsfile=str(statsfile))
+
+    table = db[name]
+    assert table._stats_valid is True
+    assert stats_valid_in_meta(table) is True
+    assert table.stats.quick_count(QUERY) == 67
+
+
+def test_a_refreshing_replacement_restores_validity(db, counted, tmp_path):
+    """
+    And a replacement that does recompute its caches ends valid, serving the
+    new answer rather than the old one.
+    """
+    name = counted.search_table
+    counted.update_from_file(_flag_flip_file(counted, tmp_path), restat=True)
+
+    table = db[name]
+    assert table._stats_valid is True
+    assert stats_valid_in_meta(table) is True
+    assert table.count(QUERY) == 0
+
+
+def test_a_failed_swap_does_not_leave_validity_behind(counted, tmp_path, monkeypatch):
+    """
+    The flag moves in the same transaction as the swap, so a swap that fails
+    leaves the table exactly as it was -- still valid, still holding the data
+    the caches describe.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    counted.copy_to(str(searchfile), include_id=False)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("swap blew up")
+
+    monkeypatch.setattr(type(counted), "_swap_in_tmp", boom)
+    with pytest.raises(RuntimeError):
+        counted.reload(str(searchfile), restat=False)
+    counted._db.conn.rollback()
+    counted.drop_tmp()
+
+    counted._refresh()
+    assert counted._stats_valid is True
+    assert stats_valid_in_meta(counted) is True
+    assert counted.stats.quick_count(QUERY) == 67
+    assert counted.search_table == name

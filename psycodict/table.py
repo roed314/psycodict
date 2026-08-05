@@ -12,6 +12,7 @@ lives in the subclass :class:`~psycodict.searchtable.PostgresSearchTable`,
 which is what ``db.<tablename>`` actually returns.
 """
 import csv
+import json
 import os
 import tempfile
 import time
@@ -1199,6 +1200,28 @@ class PostgresTable(PostgresBase):
             self._execute(updater, [self.search_table], silent=True)
             self._stats_valid = True
 
+    def _set_stats_validity(self, fresh):
+        """
+        Record whether the counts and statistics now live were built from the
+        data now live.
+
+        The one place the replacement paths -- ``reload``, the non-inplace
+        ``update_from_file`` and ``rewrite``, and the staged swap -- decide the
+        flag, so that they cannot drift apart on it.  Call it inside the
+        transaction that does the swap: a failure part way through then leaves
+        the flag as it was rather than describing companions that never
+        arrived.
+
+        Unlike :meth:`_break_stats` and :meth:`_restore_stats` this writes
+        unconditionally rather than trusting the cached flag, because a
+        metafile import replaces the whole meta_tables row (``stats_valid``
+        included) behind this object's back.
+        """
+        fresh = bool(fresh)
+        updater = SQL("UPDATE meta_tables SET stats_valid = %s WHERE name = %s")
+        self._execute(updater, [fresh, self.search_table], silent=True)
+        self._stats_valid = fresh
+
     def _break_order(self):
         """
         This function should be called when the id ordering is invalidated by an insertion or update.
@@ -1280,6 +1303,10 @@ class PostgresTable(PostgresBase):
             Defaults to resorting a non-inplace (replacement) rewrite and not an
             in-place one; ``resort=True`` on an in-place rewrite raises, since
             the in-place path cannot resort (call ``resort()`` afterward).
+            ``func`` may return anything, and the dump covers every search
+            column, so a rewrite that is not resorted always leaves the table
+            marked ``out_of_order``; there is no way to tell that it did not
+            move a sort key.
         - ``restat`` -- whether to recompute statistics after running the rewrite
         - ``tostr_func`` -- a function to be used when writing data to the temp file
             defaults to copy_dumps from encoding
@@ -1304,9 +1331,12 @@ class PostgresTable(PostgresBase):
         if resort is None:
             # Default: resort on the non-inplace (replacement) path, as before;
             # an in-place rewrite edits rows on the live table and cannot
-            # resort, so do not ask it to.  An explicit resort=True on an
-            # in-place rewrite still raises, in update_from_file.
+            # resort, so do not ask it to.
             resort = not kwds.get("inplace", False)
+        elif kwds.get("inplace"):
+            # update_from_file would reject this too, but only after func has
+            # been run over every row and the result dumped to disk.
+            self._forbid_row_level_resort(resort, "rewrite with inplace=True")
         sep = kwds.get("sep", "|")
         # An unusable separator would otherwise be rejected only by COPY itself,
         # after func has already been run over every row of the table.
@@ -1403,7 +1433,7 @@ class PostgresTable(PostgresBase):
         - ``datafile`` -- a file with header lines (unlike ``reload``, does not need to include all columns) and rows containing data to be updated.
         - ``label_col`` -- a column specifying which row(s) of the table should be updated corresponding to each row of the input file.  This will usually be the label for the table, in which case it can be omitted.
         - ``inplace`` -- whether to do the update in place.  If set, the operation cannot be undone with ``reload_revert``.
-        - ``resort`` -- whether this table should be resorted after updating (default is to resort when the sort columns intersect the updated columns)
+        - ``resort`` -- whether the replacement table should be built with its ids renumbered in sort order (default is to renumber when the updated columns intersect the sort columns).  Only the replacement path can do this, so ``resort=True`` with ``inplace`` raises.  ``resort=False`` says not to renumber, not that the sort was left alone: an update that touches a sort column marks the table ``out_of_order`` either way, so that ``resort()`` can put it right later.
         - ``reindex`` -- only meaningful when ``inplace`` is set: whether to drop the indexes touching the updated columns before the update and recreate them afterward, which is faster when many rows change (by default this is done when more than 1000 rows are updated).  Without ``inplace``, all indexes are necessarily recreated on the replacement table, so ``reindex=True`` is redundant and ``reindex=False`` raises an error.
         - ``restat`` -- whether to recompute stats for the table
         - ``logging`` -- a dictionary of keyword arguments for _log_db_change.
@@ -1454,8 +1484,16 @@ class PostgresTable(PostgresBase):
                     for line in F:
                         rowcount += 1
                     reindex = rowcount > 1000
+            # Two separate facts, which one variable used to conflate.  Whether
+            # the input can change the id ordering is a property of the file;
+            # whether to rebuild the table in sort order is the caller's
+            # choice.  Deriving the first from the second made resort=False
+            # mean "the sort was not touched" as well as "do not rebuild", so
+            # a write that reordered the table left out_of_order = false
+            # behind -- an assertion search code is allowed to act on.
+            sort_changed = bool(set(columns[1:]).intersection(self._sort_keys))
             if resort is None:
-                resort = bool(set(columns[1:]).intersection(self._sort_keys))
+                resort = sort_changed
             # Create a temp table to hold the data
             tmp_table = "tmp_update_from_file"
 
@@ -1513,14 +1551,17 @@ class PostgresTable(PostgresBase):
                 # non-inplace path the renumber replaces the _tmp table, so it
                 # must run while that table has no primary key or indexes.  The
                 # in-place path cannot renumber (resort=True was rejected up
-                # front); if it changed a sort-key column it just records that
-                # the id order no longer matches.
+                # front).  Whenever the rows are not renumbered and the file
+                # could have moved a sort key, the ordering is recorded as
+                # broken instead -- including on the non-inplace path, where
+                # the flag set here survives the swap below, which only ever
+                # clears it via _set_ordered.
                 if not inplace and self._id_ordered and resort:
                     self._generate_sorted_ids(suffix=suffix)
                     ordered = True
                 else:
                     ordered = False
-                    if inplace and resort and self._id_ordered:
+                    if sort_changed:
                         self._break_order()
                 if reindex and inplace:
                     # also restores constraints
@@ -1530,7 +1571,14 @@ class PostgresTable(PostgresBase):
                     self.restore_indexes(suffix=suffix)
                     # We also need to recreate the primary key
                     self.restore_pkeys(suffix=suffix)
-                if restat and self.stats.saving:
+                # The only way this write ends with caches describing its own
+                # data: recompute them, in place against the live table or on
+                # the _tmp companions swapped in beside the replacement below.
+                # With restat off, or on a table that does not save
+                # statistics, whatever is cached was computed from the rows as
+                # they were before this write.
+                refreshed = bool(restat and self.stats.saving)
+                if refreshed:
                     if not inplace:
                         for table in [self.stats.counts, self.stats.stats]:
                             if not self._table_exists(physical_table_name(table, lifecycle="_tmp")):
@@ -1545,7 +1593,7 @@ class PostgresTable(PostgresBase):
                     # and the _tmp tables are left orphaned.  reload builds its
                     # swap list the same way.
                     tables = [self.search_table]
-                    if restat and self.stats.saving:
+                    if refreshed:
                         tables += [self.stats.counts, self.stats.stats]
                     if self.stats.counts in tables:
                         # _clone built the _tmp counts table with a bare LIKE,
@@ -1557,6 +1605,9 @@ class PostgresTable(PostgresBase):
                     self._swap_in_tmp(tables)
                     if ordered:
                         self._set_ordered()
+                # In the same transaction as the update or the swap, so that
+                # the flag and the data it describes move together.
+                self._set_stats_validity(refreshed)
                 # Delete the temporary table used to load the data
                 drop_tmp()
                 log_data["logid"] = logid
@@ -1815,10 +1866,10 @@ class PostgresTable(PostgresBase):
         finally:
             self._log_db_change("insert_many", aborted=aborted, logid=logid, nrows=len(search_data))
 
-    def _generate_sorted_ids(self, suffix=""):
+    def _generate_sorted_ids(self, suffix="", sort=None):
         """
         Rebuild ``{search}{suffix}`` so that ascending ``id`` follows the
-        configured sort, laying the rows out on disk in that order too.
+        intended sort, laying the rows out on disk in that order too.
 
         This is a physical rebuild, not an in-place ``UPDATE`` of every id: the
         rows are copied into a fresh table in sort order, with ids drawn in
@@ -1830,18 +1881,64 @@ class PostgresTable(PostgresBase):
         Must run *before* the primary key and indexes are (re)built on the
         ``{suffix}`` table, since it drops and recreates that table.  It is the
         internal step reload and non-inplace update_from_file use; the public
-        entry point is :meth:`resort`.  ``self._sort`` must be set.
+        entry point is :meth:`resort`.
+
+        INPUT:
+
+        - ``suffix`` -- names the relation to rebuild, ``{search}{suffix}``.
+        - ``sort`` -- the sort to number the rows by, in the form ``set_sort``
+          takes.  Defaults to this table's configured sort.  A reload that
+          installs a metafile passes the sort *that file* will install: ids
+          assigned by the sort being replaced would not describe the sort the
+          table ends up with, and the reload would then mark it ordered.
+
+        The relation being rebuilt is not necessarily described by this table
+        object.  Under ``reload(adjust_schema=True)`` the ``_tmp`` relation is
+        built from the data file's header, so it may have gained or lost
+        columns relative to ``self.search_cols``; its own columns are read
+        from the catalog rather than assumed, and everything is checked before
+        the first destructive statement.
         """
         target = self.search_table + suffix
-        if self._sort is None:
+        sort = self._sort_orig if sort is None else sort
+        if not sort:
             raise ValueError(
                 "Cannot resort %s: it has no configured sort" % (self.search_table,)
+            )
+        order = self._sort_str(sort)
+        cols, _, has_id = self._column_types(target)
+        if not has_id:
+            raise ValueError(
+                "Cannot resort %s: it has no id column to renumber "
+                "(does the relation exist?)" % (target,)
+            )
+        if not cols:
+            raise ValueError(
+                "Cannot resort %s: it has no columns besides id, so there is "
+                "nothing to sort it by" % (target,)
+            )
+        missing = sorted(
+            {col if isinstance(col, str) else col[0] for col in sort}.difference(cols)
+        )
+        if missing:
+            # Checked here, before anything is dropped, so that a data file
+            # and a metafile that disagree about the schema leave the
+            # relation as it was rather than half rebuilt.
+            raise ValueError(
+                "Cannot resort %s by %s: the relation has no column%s %s.  The "
+                "imported schema and the sort being installed do not agree."
+                % (
+                    target,
+                    sort,
+                    "" if len(missing) == 1 else "s",
+                    ", ".join(missing),
+                )
             )
         # Transient, named nowhere else, so shortened to fit rather than left
         # for the server to truncate.
         resorting = derived_identifier(target, "_resort")
         seq = derived_identifier(target, "_resort_seq")
-        search_cols = SQL(", ").join(Identifier(c) for c in self.search_cols)
+        target_cols = SQL(", ").join(Identifier(c) for c in cols)
         # A fresh table with the same columns and storage but no indexes.
         self._clone(target, resorting)
         try:
@@ -1858,10 +1955,10 @@ class PostgresTable(PostgresBase):
                     "SELECT nextval({2}), {1} FROM {3} ORDER BY {4}, id"
                 ).format(
                     Identifier(resorting),
-                    search_cols,
+                    target_cols,
                     Literal(seq),
                     Identifier(target),
-                    self._sort,
+                    order,
                 )
             )
             self._execute(SQL("DROP SEQUENCE {0}").format(Identifier(seq)))
@@ -2099,6 +2196,62 @@ class PostgresTable(PostgresBase):
                 "You should probably run `db.{0}.cleanup_from_reload()` "
                 "to save disc space"
             ).format(self.search_table, backup_number))
+
+    def _metafile_order_state(self, metafile, sep="|"):
+        """
+        The ordering metadata a metafile will install: ``(id_ordered,
+        out_of_order, sort)``.
+
+        A reload that carries a metafile replaces this table's sort with the
+        file's, so the renumbering it does has to follow *that* sort; reading
+        it here, before anything is rebuilt, is what lets
+        ``_generate_sorted_ids`` number the rows for the sort the table ends
+        up with rather than the one it is losing.  The file is validated as
+        strictly as ``_reload_meta`` validates it later.
+
+        INPUT:
+
+        - ``metafile`` -- a file holding this table's meta_tables row
+        - ``sep`` -- the column separator it was written with
+        """
+        meta_name = "meta_tables"
+        meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
+        # the column which will match search_table
+        table_name = _meta_table_name(meta_name)
+        table_name_idx = meta_cols.index(table_name)
+        with open(metafile, "r") as F:
+            lines = list(csv.reader(F, delimiter=str(sep)))
+        if len(lines) != 1:
+            raise RuntimeError("%s has more than one line" % (metafile,))
+        line = lines[0]
+        if line[table_name_idx] != self.search_table:
+            raise RuntimeError(
+                f"column {table_name_idx} (= {line[table_name_idx]}) "
+                f"in the file {metafile} doesn't match "
+                f"the search table name {self.search_table}"
+            )
+        flags = {}
+        for col in ["id_ordered", "out_of_order"]:
+            idx = meta_cols.index(col)
+            if line[idx] not in ['t', 'f']:
+                raise RuntimeError(
+                    f"column {idx} (= {line[idx]}) "
+                    f"in the file {metafile} is different from 't' or 'f'"
+                )
+            flags[col] = line[idx] == 't'
+        sort_idx = meta_cols.index("sort")
+        raw = line[sort_idx]
+        if raw == r"\N":  # COPY's null marker: a table with no sort at all
+            sort = None
+        else:
+            try:
+                sort = json.loads(raw)
+            except ValueError as err:
+                raise RuntimeError(
+                    f"column {sort_idx} (= {raw}) in the file {metafile} "
+                    f"is not valid JSON: {err}"
+                )
+        return flags["id_ordered"], flags["out_of_order"], sort
 
     def _check_file_input(self, searchfile, kwds):
         """
@@ -2339,44 +2492,21 @@ class PostgresTable(PostgresBase):
                 # Renumber ids in sort order before the keys are built: the
                 # renumber replaces the _tmp table, so it must run while that
                 # table still has no primary key or indexes to rebuild.
+                resort_sort = None
                 if resort:
                     if metafile:
-                        # read the metafile
-                        # using code from _reload_meta
-                        meta_name = 'meta_tables'
-                        meta_cols, _, _ = _meta_cols_types_jsonb_idx(meta_name)
-                        # the column which will match search_table
-                        table_name = _meta_table_name(meta_name)
-                        table_name_idx = meta_cols.index(table_name)
-                        with open(metafile, "r") as F:
-                            lines = list(csv.reader(F, delimiter=str(sep)))
-                            if len(lines) != 1:
-                                raise RuntimeError(
-                                    "%s has more than one line" % (metafile,)
-                                )
-                            line = lines[0]
-                            if line[table_name_idx] != self.search_table:
-                                raise RuntimeError(
-                                    f"column {table_name_idx} (= {line[table_name_idx]}) "
-                                    f"in the file {metafile} doesn't match "
-                                    f"the search table name {self.search_table}"
-                                )
-                            for col in ["id_ordered", "out_of_order"]:
-                                idx = meta_cols.index(col)
-                                if line[idx] not in ['t', 'f']:
-                                    raise RuntimeError(
-                                        f"column {idx} (= {line[idx]}) "
-                                        f"in the file {metafile} is different from 't' or 'f'"
-                                    )
-                            resort = (
-                                line[meta_cols.index("id_ordered")] == 't'
-                                and line[meta_cols.index("out_of_order")] == 'f'
-                            )
-                    else:
-                        if not self._id_ordered: # this table doesn't need to be sorted
-                            resort = False
+                        id_ordered, out_of_order, resort_sort = self._metafile_order_state(
+                            metafile, sep=sep
+                        )
+                        resort = id_ordered and not out_of_order
+                        # resort_sort, not the sort currently configured: the
+                        # metafile replaces that one, and numbering the rows by
+                        # a sort the table is about to stop having would install
+                        # ids that satisfy nothing while claiming to be ordered.
+                    elif not self._id_ordered:  # this table doesn't need to be sorted
+                        resort = False
                 if resort:
-                    self._generate_sorted_ids(suffix=suffix)
+                    self._generate_sorted_ids(suffix=suffix, sort=resort_sort)
                     ordered = True
                 else:
                     ordered = False
@@ -2411,10 +2541,21 @@ class PostgresTable(PostgresBase):
                     # create index on counts table
                     self._create_counts_indexes(suffix=suffix)
 
+                # The replacement's caches agree with its data in exactly two
+                # cases: the export supplied both of them alongside the search
+                # file, or they were recomputed here from what was loaded.
+                # Otherwise the counts and stats that go live are the ones
+                # already there (untouched, since they are not in ``tables``)
+                # or an empty or reused ``_tmp`` clone -- in neither case a
+                # description of the rows now in the table.
+                stats_fresh = (countsfile is not None and statsfile is not None) or (
+                    self.stats.saving and restat
+                )
                 if final_swap:
                     self.reload_final_swap(tables=tables,
                                            metafile=metafile,
-                                           ordered=ordered)
+                                           ordered=ordered,
+                                           stats_fresh=stats_fresh)
                 elif metafile is not None and not silence_meta:
                     print("Warning: since the final swap was not requested, we have not updated meta_tables")
                     print("when performing the final swap with reload_final_swap, pass the metafile as an argument to update the meta_tables")
@@ -2429,7 +2570,7 @@ class PostgresTable(PostgresBase):
                 stats=(statsfile is not None),
             )
 
-    def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|"):
+    def reload_final_swap(self, tables=None, metafile=None, ordered=False, sep="|", stats_fresh=False):
         """
         Renames the ``_tmp`` versions of ``tables`` to the live versions,
         and updates the corresponding meta_tables row if ``metafile`` is provided.
@@ -2439,6 +2580,13 @@ class PostgresTable(PostgresBase):
         - ``tables`` -- list of strings (optional), of the tables to be renamed.  If None is provided, renames all the tables ending in ``_tmp``
         - ``metafile`` -- a string (optional), giving a file containing the meta information for the table.
         - ``sep`` -- a character (default ``|``) to separate columns
+        - ``ordered`` -- whether ascending id follows the sort in the tables
+          being swapped in, so that the live table may be marked ordered.
+        - ``stats_fresh`` -- whether the counts and statistics being swapped in
+          were built from the data being swapped in.  Defaults to False, the
+          safe answer for a swap finished by hand: a cached count that
+          describes the previous data is a wrong answer, whereas an
+          unnecessary ``false`` only costs a ``refresh_stats()``.
         """
         with DelayCommit(self, silence=True):
             if tables is None:
@@ -2454,8 +2602,23 @@ class PostgresTable(PostgresBase):
             self._swap_in_tmp(tables)
             if metafile is not None:
                 self.reload_meta(metafile, sep=sep)
+                if not stats_fresh:
+                    # A metafile carries the stats_valid of the database it was
+                    # exported from, which says nothing about whether this
+                    # reload installed matching caches.  Importing it as-is
+                    # would let a true written elsewhere vouch for counts that
+                    # were never rebuilt here.
+                    print(
+                        "Marking %s's cached statistics invalid: this reload "
+                        "did not install counts and statistics built from the "
+                        "data it loaded, whatever %s says.  Recompute them "
+                        "with db.%s.stats.refresh_stats()."
+                        % (self.search_table, metafile, self.search_table)
+                    )
             if ordered:
                 self._set_ordered()
+            # After reload_meta, which replaces the whole meta_tables row
+            self._set_stats_validity(stats_fresh)
             # The swapped-in table's row count bears no relation to the old
             # total, so recount and store it before the reinitialization
             # below reads meta_tables.
@@ -2815,7 +2978,11 @@ class PostgresTable(PostgresBase):
                 # not the live table; resorting it inline would defeat the
                 # point of staging.  Drop any resort request rather than letting
                 # the in-place guard reject it -- the caller resorts the live
-                # table after the commit, with resort().
+                # table after the commit, with resort().  Dropping the request
+                # does not hide the fact that the ordering moved: whether the
+                # file touches a sort column is decided from the file, so the
+                # write still records it in staged._out_of_order, which the
+                # commit transfers to the live table.
                 kwds.pop("resort", None)
                 return unstaged_update_from_file(
                     datafile, label_col=label_col, inplace=True, resort=False, **kwds

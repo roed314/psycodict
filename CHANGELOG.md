@@ -433,9 +433,28 @@ hardening standalone use; the highlights:
 - **`finalize_changes()` is removed.** It was a documented public no-op; the
   supported write methods already leave `total`, the order flag and
   `stats_valid` correct when they return.
+- **`resort=False` no longer suppresses the order bookkeeping.** Whether an
+  update can move the id order is now decided from the file's columns rather
+  than from the `resort` option, so an `update_from_file` or `rewrite` that
+  touches a sort column marks the table `out_of_order` even when it was told
+  not to rebuild — on the in-place path, on the replacement path, and through a
+  staged commit. Previously such a write could leave `out_of_order = false`
+  standing, an assertion search code is allowed to act on by replacing
+  `ORDER BY <sort>` with `ORDER BY id`. *Migration:* none; run `resort()` on
+  tables the audit below reports as `MISMATCH`.
+- **Every write that does not rebuild the caches clears `stats_valid`.**
+  `update_from_file`, `rewrite` and `reload` with `restat=False` (and any
+  replacement that installs cloned, partial or untouched counts and stats
+  beside changed data) now mark the table invalid, in the same transaction as
+  the swap. A `metafile` no longer installs a `stats_valid = true` describing
+  the database it was exported from. Without this a count cached before such a
+  write was still served afterwards, defeating the enforcement above.
 - **`scripts/audit_id_order.py`**, a read-only check that streams each
   `id_ordered` table in sort order and reports whether its ids actually
-  increase, since the flag can drift.
+  increase, since the flag can drift. Each table is audited in a read
+  transaction of its own, so one table's error does not poison the rest of the
+  run, and `id_ordered` with no configured sort is reported as an error rather
+  than trivially passing.
 
 ### Release candidates
 
