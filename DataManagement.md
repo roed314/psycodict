@@ -47,7 +47,7 @@ Renaming a table renames its indexes and constraints with it, by substituting th
  * **the `id` column** is added automatically as a `bigint` primary key unless you already list one; use `id_type=` to choose a different integer type.  Columns are physically laid out ordered by type (widest alignment first) for storage efficiency, so the on-disk column order is not your declaration order — but every file operation is header-driven, so this never matters to you.
  * **`label_col`** names the column used by `lookup`; it must be one of the search columns, or `None`.
  * **`sort`** is the default sort order: a list of column names or `(column, 1|-1)` pairs.
- * **`id_ordered`** defaults to `True` when `sort` is given, `False` otherwise.  It records the intent that, in production, the `id` column runs in the same order as `sort` (which lets some range queries use the primary-key index).  It does **not** sort anything now; see [resorting is disabled](#resorting-is-disabled).
+ * **`id_ordered`** defaults to `True` when `sort` is given, `False` otherwise.  It records the intent that, in production, the `id` column runs in the same order as `sort` (which lets some range queries use the primary-key index).  See [resorting](#resorting).
 
 The most common Postgres types are `smallint`/`integer`/`bigint`, `numeric` (exact), `real`/`double precision`, `text`, `boolean`, `jsonb`, `timestamp`, and the array forms (`integer[]`, `numeric[]`, ...).
 
@@ -141,11 +141,45 @@ Bulk paths also run PostgreSQL's own `ANALYZE`, which is a different thing from
 psycodict's statistics: a freshly loaded relation has no planner statistics
 until autovacuum reaches it.  Replacement tables are analyzed while still named
 `_tmp`, before the swap, since the catalog entry follows the relation through
-the rename; `copy_from` analyzes the live table it loaded into.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
+the rename; `copy_from` analyzes the live table it loaded into.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.  `resort()` (or a rebuild through `reload`/`rewrite`) sets it back to `false`.
 
-### Resorting is disabled
+### Resorting
 
-`resort()` is a **no-op on this branch**: it prints `resorting disabled` and returns `None` without touching the table.  In-place resorting was found to stall replication and to not persist correctly on disk, and since the tables are effectively read-only in production the supported way to renumber ids is to dump the data in sorted order and `reload` it.  Consequently the `resort=` keyword on `insert_many`, `update`, `copy_from`, `reload` and `update_from_file` currently does nothing.
+`table.resort()` rebuilds the table so that ascending `id` matches the
+configured sort, laying the rows out on disk in that order.  It is a full-table
+operation: the data is dumped, loaded into a fresh table whose ids are assigned
+`1..N` in sort order, and swapped into place through the same machinery `reload`
+uses, so the primary key, indexes, constraints, grants and counts/stats
+companions are rebuilt, `ANALYZE` is run, and the previous table is kept as a
+`name_old<n>` backup.  **The ids change** — anything outside psycodict that
+stored them as durable identifiers must be updated — and the operation needs
+temporary disk space for the replacement, its indexes, the dump and the backup.
+By default a table already marked ordered reports that there is nothing to do;
+pass `force=True` to rebuild anyway.
+
+The earlier in-place implementation renumbered every id with an `UPDATE`, which
+stalled replication and left the rows in their old physical order (defeating the
+point of id-ordering); it was disabled, and is now replaced by this rebuild.
+
+Because a resort is expensive, it is no longer a side effect of a small write.
+`resort=True` on `insert_many`, `update`, `copy_from` or an in-place
+`update_from_file` **raises**, pointing at `resort()`; `resort=False` (the
+default) is unaffected.  The replacement operations that rebuild the whole table
+anyway — `reload`, `rewrite`, and a non-inplace `update_from_file` — still
+establish id order as part of building the new table.  The workflow for a
+maintained table is therefore:
+
+```python
+table.update(...)          # marks out_of_order
+# later, in a maintenance window:
+table.resort()             # rebuild in sort order
+```
+
+`scripts/audit_id_order.py` checks the flag against reality: it streams each
+`id_ordered` table in sort order and reports `OK`, `MISMATCH` or an error
+without modifying anything.  Use it before trusting `out_of_order = false` on a
+table whose history includes non-inplace updates, which could have left the flag
+stale.
 
 ### Locking
 

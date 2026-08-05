@@ -415,6 +415,28 @@ hardening standalone use; the highlights:
   value rather than interpolated. *Migration:* none unless you were relying on
   psycodict seeing relations outside `public`, which it did only by accident.
 
+- **`resort()` rebuilds and swaps instead of renumbering in place.** It was a
+  disabled no-op (the in-place `UPDATE` of every id stalled replication and left
+  the rows in their old physical order, defeating the point of id-ordering).
+  It now dumps the table, loads it into a fresh table whose ids are assigned
+  `1..N` in sort order, and swaps it in through `reload`'s machinery -- primary
+  key, indexes, constraints, grants and counts/stats companions rebuilt,
+  `ANALYZE` run, previous table kept as an `_oldN` backup. **The ids change.**
+  A table already ordered reports nothing to do unless `force=True`.
+- **Row-level writes no longer resort.** `resort=True` on `insert_many`,
+  `update`, `copy_from` or an in-place `update_from_file` now raises and points
+  at `resort()`, so a small write cannot silently trigger a full-table rebuild;
+  `resort=False` is unaffected. `reload`, `rewrite` and a non-inplace
+  `update_from_file` still establish order as part of the replacement they were
+  already building. *Migration:* drop `resort=True` from row-level calls and
+  call `table.resort()` in a maintenance window instead.
+- **`finalize_changes()` is removed.** It was a documented public no-op; the
+  supported write methods already leave `total`, the order flag and
+  `stats_valid` correct when they return.
+- **`scripts/audit_id_order.py`**, a read-only check that streams each
+  `id_ordered` table in sort order and reports whether its ids actually
+  increase, since the flag can drift.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores
