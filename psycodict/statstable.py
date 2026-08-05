@@ -2198,7 +2198,12 @@ ORDER BY v.ord LIMIT %s"""
                 continue
             for values in values_list:
                 query = self._join_dict(cols, values)
-                if self.quick_count(query, suffix=suffix) is None:
+                # "is this one already recorded here", not "may it be served":
+                # the caller is filling a counts table, and on the live table
+                # it is doing so inside a refresh, which has marked the table
+                # invalid.  The gated lookup would report every one of these
+                # missing and recount them all.
+                if self._cached_count(query, suffix=suffix) is None:
                     self._slow_count(query, record=True, suffix=suffix)
 
     def extra_counts(self, include_counts=True, suffix=""):
