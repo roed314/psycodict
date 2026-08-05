@@ -410,10 +410,19 @@ hardening standalone use; the highlights:
   queries across `pg_tables`, `pg_indexes`, `pg_class`, `pg_constraint` and
   `information_schema` -- so with two schemas holding a relation of the same
   name, column discovery could mix their columns, an index or constraint in
-  the other schema counted as present, and `_all_tablenames` listed the name
-  twice. Every one is now filtered to the selected schema, which is bound as a
-  value rather than interpolated. *Migration:* none unless you were relying on
-  psycodict seeing relations outside `public`, which it did only by accident.
+  the other schema counted as present, `_all_tablenames` listed the name
+  twice, and a lock on the other schema's copy refused a write to this one.
+  Every one is now filtered to the selected schema, which is bound as a value
+  rather than interpolated. The schema goes into `search_path` as one quoted
+  identifier rather than as text (a `search_path` is a comma-separated list,
+  in which a name needing quotes is parsed rather than used), `pg_temp` is
+  named after it so a temporary relation cannot shadow a real one, and
+  `current_schema()` is checked afterwards, since PostgreSQL silently ignores
+  an entry naming a schema that is missing or not accessible. *Migration:*
+  none unless you were relying on psycodict seeing relations outside `public`,
+  which it did only by accident. The schema must exist and the role needs
+  `USAGE` on it; the name `$user` is refused, PostgreSQL substituting the
+  role's name for it even when quoted.
 
 ### Release candidates
 

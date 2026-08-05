@@ -444,12 +444,26 @@ class PostgresBase():
         ]
 
     def _get_locks(self):
-        return self._execute(SQL(
-            "SELECT t.relname, l.mode, l.pid, age(clock_timestamp(), a.backend_start) "
-            "FROM pg_locks l "
-            "JOIN pg_stat_all_tables t ON l.relation = t.relid JOIN pg_stat_activity a ON l.pid = a.pid "
-            "WHERE l.granted AND t.schemaname <> 'pg_toast'::name AND t.schemaname <> 'pg_catalog'::name"
-        ))
+        """
+        The granted locks on relations in this database's schema.
+
+        Filtered to that schema in SQL, because the caller has only the
+        relation name to go on: a lock on ``other_schema.same_name`` would
+        otherwise be reported as a lock on this schema's ``same_name``, and
+        ``_check_locks`` would refuse a write that nothing is blocking.  Another
+        session's temporary table of the same name does the same thing.
+        Equality with the schema also subsumes the old exclusions of
+        ``pg_toast`` and ``pg_catalog``.
+        """
+        return self._execute(
+            SQL(
+                "SELECT t.relname, l.mode, l.pid, age(clock_timestamp(), a.backend_start) "
+                "FROM pg_locks l "
+                "JOIN pg_stat_all_tables t ON l.relation = t.relid JOIN pg_stat_activity a ON l.pid = a.pid "
+                "WHERE l.granted AND t.schemaname = %s"
+            ),
+            [self._db.schema],
+        )
 
     def _table_locked(self, tablename, types="all"):
         """

@@ -183,6 +183,15 @@ class PostgresDatabase(PostgresBase):
       MetadataFormats.md).  Without it, a database using an older but
       compatible metadata format connects with a warning and operates at the
       older format.
+    - ``schema`` -- the one PostgreSQL schema this database operates in,
+      ``public`` by default.  Every relation psycodict creates goes there,
+      every relation it looks for is looked for there, and every catalog query
+      is filtered to it.  It is pinned in each connection's ``search_path``,
+      ahead of ``pg_temp`` and behind the implicit ``pg_catalog``.  The schema
+      must already exist -- psycodict does not create one, and ``create=True``
+      bootstraps the metadata tables *within* it -- and the connecting role
+      must have ``USAGE`` on it, plus ``CREATE`` to make any relation there.
+      Connecting raises ``ValueError`` when the session does not end up in it.
     - ``session_settings`` -- a dictionary of PostgreSQL session settings
       (``statement_timeout``, ``lock_timeout``,
       ``idle_in_transaction_session_timeout``, ``application_name``) applied to
@@ -204,6 +213,7 @@ class PostgresDatabase(PostgresBase):
 
     - ``server_side_counter`` -- an integer tracking how many buffered connections have been created
     - ``conn`` -- the psycopg connection object
+    - ``schema`` -- the schema this database operates in
     - ``tables`` -- the search tables, by name
     - ``tablenames`` -- the names of the search tables, sorted
     - ``meta_format`` -- the metadata format this connection operates at (see
@@ -331,16 +341,20 @@ class PostgresDatabase(PostgresBase):
         Apply psycodict's per-session setup to a fresh connection.
 
         Everything a session needs beyond the connection itself: the type
-        adapters, and the session settings (statement, lock and
-        idle-in-transaction timeouts) that protect the server from this
-        connection.  A replacement connection that skipped this would be a
-        connection without those protections.
+        adapters, the ``search_path`` that pins this database's schema, and the
+        session settings (statement, lock and idle-in-transaction timeouts)
+        that protect the server from this connection.  A replacement connection
+        that skipped this would be a connection without those protections, and
+        one pointing at whatever schema the role's default happens to be.
 
         This is for the main connection and its replacements.  A notification
         listener opens its own connection and does not come through here.
 
         Runs directly on ``conn`` rather than through ``_execute``, because it
         is called while recovering from a failure in ``_execute``.
+
+        Raises ``ValueError`` if the session does not end up in
+        ``self.schema``.
         """
         # The following function controls how Python classes are converted to
         # strings for passing to Postgres, and how the results are decoded upon
@@ -349,10 +363,44 @@ class PostgresDatabase(PostgresBase):
         # is not limited to just one connection
         setup_connection(conn)
         # Pin the schema first: everything below, and every statement this
-        # connection later runs, resolves unqualified names in it.  pg_catalog
-        # is still searched -- PostgreSQL puts it first implicitly when it is
-        # not named -- so the built-in types and functions stay reachable.
-        conn.execute("SELECT set_config('search_path', %s, false)", [self.schema])
+        # connection later runs, resolves unqualified names in it.  The
+        # effective order is pg_catalog, this schema, pg_temp.
+        #
+        # The schema is composed in as one Identifier rather than bound as a
+        # value, because search_path is not an identifier: it is a
+        # comma-separated *list*, in which unquoted names are case-folded and
+        # ``$user`` is a substitution.  A schema legitimately named
+        # ``a, b``, or one whose spelling needs quoting, would otherwise be
+        # parsed into something other than the schema every catalog query here
+        # binds by name -- and unqualified DDL would then create relations
+        # somewhere this database does not look.
+        #
+        # pg_temp is named last on purpose.  Left unnamed it is searched
+        # *first*, so a temporary relation in this session would shadow the
+        # real meta_tables or search table of the same name.  pg_catalog is
+        # left unnamed, which puts it first, so built-in types and functions
+        # stay reachable and cannot be shadowed either.
+        conn.execute(
+            SQL("SET search_path TO {schema}, pg_temp").format(
+                schema=Identifier(self.schema)
+            )
+        )
+        # PostgreSQL accepts a search_path naming a schema that does not exist,
+        # or one this role has no USAGE on: it silently drops the entry and
+        # resolves names further down the path -- pg_temp, here, which would
+        # make an unqualified CREATE TABLE produce a *temporary* table.  Ask
+        # what the setting actually selected, rather than let a session run on
+        # in a schema nobody chose.
+        current = conn.execute("SELECT current_schema()").fetchone()[0]
+        if current != self.schema:
+            raise ValueError(
+                "Could not operate in schema %r: the session resolves "
+                "unqualified names in %s instead.  The schema must exist, and "
+                "the role %r must have USAGE on it."
+                % (self.schema,
+                   "no schema at all" if current is None else repr(current),
+                   conn.info.user)
+            )
         for name, value in self._session_settings.items():
             # set_config takes both as bound values, so nothing is interpolated
             conn.execute("SELECT set_config(%s, %s, false)", [name, str(value)])
@@ -1410,19 +1458,28 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         ).fetchone()[0]
         # Column level compression settings (attcompression) appeared in
         # postgres 14; on older servers there is only attstorage to copy.
-        if server_version >= 140000:
-            selecter = SQL(
-                "SELECT attname, attstorage, attcompression FROM pg_attribute "
-                "WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped"
-            )
-        else:
-            selecter = SQL(
-                "SELECT attname, attstorage, '' FROM pg_attribute "
-                "WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped"
-            )
+        #
+        # The relation is reached by joining pg_class to pg_namespace and
+        # binding this database's schema, rather than by casting the name to
+        # regclass: a regclass cast resolves through the search path, so it
+        # would read a temporary relation of the same name in preference to the
+        # table being copied, and would silently follow the session's schema
+        # rather than this database's.
+        attcompression = "a.attcompression" if server_version >= 140000 else "''"
+        selecter = SQL(
+            "SELECT a.attname, a.attstorage, " + attcompression + " "
+            "FROM pg_catalog.pg_attribute a "
+            "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s "
+            "AND a.attnum > 0 AND NOT a.attisdropped"
+        )
 
         def settings(tname):
-            return {rec[0]: (rec[1], rec[2]) for rec in self._execute(selecter, [tname])}
+            return {
+                rec[0]: (rec[1], rec[2])
+                for rec in self._execute(selecter, [self.schema, tname])
+            }
 
         source = settings(table.search_table)
         target = settings(new_name)
@@ -2402,7 +2459,13 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
 
     def show_locks(self):
         """
-        Prints information on all locks currently held on any table.
+        Prints information on the locks currently held on tables in this
+        database's schema.
+
+        Confined to that schema, like every other catalog query here and like
+        the ``_check_locks`` that consults the same result: a lock on a
+        same-named table elsewhere in the cluster is somebody else's business
+        and does not block anything done here.
         """
         locks = sorted(self._get_locks())
         if locks:

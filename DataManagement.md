@@ -70,7 +70,22 @@ creates goes there, every relation it looks for is looked for there, and every
 catalog query is filtered to it, so a relation of the same name in another
 schema is neither mistaken for one of these nor merged with it.  The schema is
 pinned in each connection's `search_path`, including replacement connections
-after a reconnect.
+after a reconnect, as one quoted identifier (a `search_path` is a
+comma-separated *list*, so a name that needs quoting must not be written to it
+as text).  psycodict names `pg_temp` explicitly *after* it, so that a temporary
+relation cannot shadow `meta_tables` or a search table, and leaves `pg_catalog`
+unnamed, which is what keeps it ahead of both so the built-in types and
+functions stay reachable.  The effective order is therefore `pg_catalog`, the
+selected schema, `pg_temp`.
+
+The schema must already exist: psycodict never creates one, and `create=True`
+bootstraps the meta tables *within* it.  The connecting role needs `USAGE` on
+it, and `CREATE` to make any relation there.  PostgreSQL silently ignores a
+`search_path` entry naming a schema that is missing or not accessible, so
+psycodict checks `current_schema()` after setting it and refuses to connect
+rather than operate somewhere nobody chose.  One name cannot be selected at all:
+`$user`, which PostgreSQL substitutes with the connecting role's name even when
+quoted, is rejected by the constructor.
 
  * **`meta_tables`** — one row per search table, holding `name`, `sort`, `count_cutoff`, `id_ordered`, `out_of_order`, `stats_valid`, `label_col`, `total`, `important` and `include_nones`.  This is the source of truth psycodict reads on connection to reconstruct each table object.
  * **`meta_indexes`** and **`meta_constraints`** — one row per index / constraint, recording how to rebuild it.  `reload` and `restore_indexes` rebuild from these rows, **not** from whatever is physically on the table (see [reload](#reload)).
@@ -245,7 +260,7 @@ Every search table has two companion tables:
 
 ## Operational tips
 
- * **`db.show_locks()`** prints every lock currently held on any table — name, mode, pid and age.  This is how you find the process id to kill when a write raised `LockError`.
+ * **`db.show_locks()`** prints every lock currently held on a table in this database's schema — name, mode, pid and age.  This is how you find the process id to kill when a write raised `LockError`.  A lock on a same-named table in another schema is not shown, and does not block anything done here.
  * **`table.analyze(query, projection=1, limit=1000, sort=None, explain_only=False)`** prints the SQL it would run and its `EXPLAIN ANALYZE` plan (or just `EXPLAIN`, with `explain_only=True`).  Use it when tuning indexes for a slow search.
  * **Slow-query logging** is configured in `config.ini`: `[logging] slowcutoff` (seconds, default `0.1`) and `slowlogfile` (default `slow_queries.log`).  Any statement slower than `slowcutoff` is logged with its interpolated SQL; slow searches additionally log a `Replicate with db.table.analyze(...)` hint so you can reproduce them.
  * On **PostgreSQL 18+** a `reload` or `update_from_file` prints a harmless warning like `Constraint of ... with name ..._id_not_null does not end with the suffix _tmp` during the swap — Postgres now catalogs `NOT NULL` as a named constraint that the swap logic does not recognize.  The constraint is preserved; the warning can be ignored.

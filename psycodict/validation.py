@@ -579,11 +579,35 @@ def validate_schema_name(name):
     Check a PostgreSQL schema name psycodict will operate in.
 
     A schema name is an identifier like any other, and it is quoted wherever
-    psycodict emits it, so the rules are the identifier rules: not empty, no
-    control characters, and short enough that the server will not truncate it
-    into a different schema.  It is checked once, in the constructor, rather
-    than at each use.
+    psycodict emits it -- including in ``search_path``, which it is composed
+    into as one ``Identifier`` rather than written as text -- so the rules are
+    the identifier rules: not empty, no control characters, and short enough
+    that the server will not truncate it into a different schema.  It is
+    checked once, in the constructor, rather than at each use.
+
+    The one name a quoted identifier cannot express is ``$user``: PostgreSQL
+    unquotes each ``search_path`` element before looking for that token, so
+    ``"$user"`` is replaced by the connecting role's name and never selects a
+    schema actually called ``$user``.  psycodict refuses it here rather than
+    silently operating somewhere else.  Any other spelling, ``$USER``
+    included, is an ordinary identifier.
+
+    EXAMPLES::
+
+        >>> from psycodict.validation import validate_schema_name
+        >>> validate_schema_name("my schema, other")
+        'my schema, other'
+        >>> validate_schema_name("$user")
+        Traceback (most recent call last):
+        ...
+        psycodict.validation.InvalidDefinitionError: Schema name '$user' ...
     """
+    if name == "$user":
+        raise InvalidDefinitionError(
+            "Schema name '$user' cannot be selected: PostgreSQL substitutes "
+            "the connecting role's name for it in search_path, even quoted.  "
+            "Name the schema you mean."
+        )
     return validate_relation_name(name, kind="Schema", max_length=MAX_IDENTIFIER_LENGTH)
 
 
