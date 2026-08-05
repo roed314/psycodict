@@ -2412,15 +2412,20 @@ class PostgresTable(PostgresBase):
 
         - ``searchfile`` -- a string, the file with data for the search table
         - ``countsfile`` -- a string (optional), giving a file containing counts
-            information for the table.
+            information for the table.  Loaded only when the table saves
+            statistics; otherwise it is reported and ignored.
         - ``statsfile`` -- a string (optional), giving a file containing stats
-            information for the table.
+            information for the table.  Same condition as ``countsfile``.
         - ``indexesfile`` -- a string (optional), giving a file containing index
             information for the table.
         - ``constraintsfile`` -- a string (optional), giving a file containing constraint
             information for the table.
         - ``metafile`` -- a string (optional), giving a file containing the meta
-            information for the table.
+            information for the table.  It replaces the sort along with the
+            order flags, so the ids are numbered by the sort it installs; one
+            claiming ``id_ordered`` and not ``out_of_order`` while installing
+            no sort is refused, since ascending id would have nothing to
+            follow.
         - ``resort`` -- whether to sort the ids after copying in the data.
             Only relevant for tables that are id_ordered.  Defaults to sorting
             when the searchfile does not contain ids.
@@ -2471,6 +2476,18 @@ class PostgresTable(PostgresBase):
                     (self.stats.counts, _counts_cols, False, countsfile),
                     (self.stats.stats, _stats_cols, False, statsfile),
                 ])
+            elif countsfile is not None or statsfile is not None:
+                # Only a saving table loads its companions, so these are
+                # dropped on the floor.  Say so: silently ignoring a file the
+                # caller named looks like it worked, and the table keeps
+                # whatever counts it already had.
+                print(
+                    "Warning: %s does not save statistics (stats.saving is "
+                    "False), so the counts/stats files given are not loaded "
+                    "and the existing cached statistics are left in place; "
+                    "they are marked invalid, since they describe the data "
+                    "being replaced." % (self.search_table,)
+                )
             addedid = None
             with DelayCommit(self, silence=True):
                 for table, cols, header, filename in tabledata:
@@ -2498,19 +2515,37 @@ class PostgresTable(PostgresBase):
                 # Renumber ids in sort order before the keys are built: the
                 # renumber replaces the _tmp table, so it must run while that
                 # table still has no primary key or indexes to rebuild.
+                #
+                # A metafile replaces the order flags *and* the sort, so what it
+                # will install decides both whether to renumber and what to
+                # renumber by -- resort_sort, not the sort currently configured,
+                # since numbering the rows by a sort the table is about to stop
+                # having would install ids that satisfy nothing while claiming
+                # to be ordered.  Read whether or not this reload renumbers, so
+                # that the check below also covers a metafile installed without
+                # one.
                 resort_sort = None
-                if resort:
-                    if metafile:
-                        id_ordered, out_of_order, resort_sort = self._metafile_order_state(
-                            metafile, sep=sep
+                if metafile:
+                    meta_ordered, meta_out_of_order, resort_sort = self._metafile_order_state(
+                        metafile, sep=sep
+                    )
+                    if meta_ordered and not meta_out_of_order and not resort_sort:
+                        # Ascending id cannot follow a sort the table does not
+                        # have.  Left alone this numbers the rows by the sort
+                        # being replaced and then installs the combination the
+                        # id-order audit reports as an error.  Raised inside
+                        # the DelayCommit, before anything is rebuilt or
+                        # swapped, so the live table is untouched.
+                        raise ValueError(
+                            "%s claims id_ordered = true and out_of_order = false "
+                            "but installs no sort, so there is nothing for "
+                            "ascending id to follow.  Give the metafile a sort, "
+                            "or let it record out_of_order = true." % (metafile,)
                         )
-                        resort = id_ordered and not out_of_order
-                        # resort_sort, not the sort currently configured: the
-                        # metafile replaces that one, and numbering the rows by
-                        # a sort the table is about to stop having would install
-                        # ids that satisfy nothing while claiming to be ordered.
-                    elif not self._id_ordered:  # this table doesn't need to be sorted
-                        resort = False
+                    resort = bool(resort) and meta_ordered and not meta_out_of_order
+                elif resort and not self._id_ordered:
+                    # this table doesn't need to be sorted
+                    resort = False
                 if resort:
                     self._generate_sorted_ids(suffix=suffix, sort=resort_sort)
                     ordered = True
@@ -2549,14 +2584,26 @@ class PostgresTable(PostgresBase):
 
                 # The replacement's caches agree with its data in exactly two
                 # cases: the export supplied both of them alongside the search
-                # file, or they were recomputed here from what was loaded.
-                # Otherwise the counts and stats that go live are the ones
-                # already there (untouched, since they are not in ``tables``)
-                # or an empty or reused ``_tmp`` clone -- in neither case a
-                # description of the rows now in the table.
-                stats_fresh = (countsfile is not None and statsfile is not None) or (
-                    self.stats.saving and restat
+                # file *and* they were loaded and are being swapped in with it,
+                # or they were recomputed here from what was loaded.  Otherwise
+                # the counts and stats that go live are the ones already there
+                # (untouched, since they are not in ``tables``) or an empty or
+                # reused ``_tmp`` clone -- in neither case a description of the
+                # rows now in the table.
+                #
+                # Asking for membership of ``tables`` rather than just for the
+                # filenames is the point: the companions are only loaded under
+                # ``stats.saving``, so on a table without it both files are
+                # accepted and silently ignored, and trusting the filenames
+                # alone marked the live caches -- which still describe the old
+                # data -- as agreeing with the new.
+                loaded_both_caches = (
+                    countsfile is not None
+                    and statsfile is not None
+                    and self.stats.counts in tables
+                    and self.stats.stats in tables
                 )
+                stats_fresh = loaded_both_caches or (self.stats.saving and restat)
                 if final_swap:
                     self.reload_final_swap(tables=tables,
                                            metafile=metafile,

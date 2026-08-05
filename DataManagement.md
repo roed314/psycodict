@@ -142,12 +142,15 @@ and the staged swap — decide the flag in one place, in the same transaction as
 the swap.  The table ends up valid only when the counts and stats that go live
 were built from the data that goes live with them: either recomputed here
 (`restat`, on a table with `saving` on) or supplied whole by the export
-(`reload` given **both** `countsfile` and `statsfile`).  Anything else — a
-`restat=False` write, a partial cache set, companions that were merely cloned
-or left in place beside replaced rows — is marked invalid.  A `metafile`
-carries a `stats_valid` of its own describing the database it was exported
-from; it does not vouch for caches the reload did not install, and is
-overridden to false with a message when it disagrees.
+(`reload` given **both** `countsfile` and `statsfile`, and loading them —
+which also needs `saving`, since that is what puts the companions in the
+swap; a reload handed cache files it will not load says so rather than
+dropping them silently).  Anything else — a `restat=False` write, a partial
+cache set, companions that were merely cloned or left in place beside
+replaced rows — is marked invalid.  A `metafile` carries a `stats_valid` of
+its own describing the database it was exported from; it does not vouch for
+caches the reload did not install, and is overridden to false with a message
+when it disagrees.
 
 Bulk paths also run PostgreSQL's own `ANALYZE`, which is a different thing from
 psycodict's statistics: a freshly loaded relation has no planner statistics
@@ -196,6 +199,15 @@ one that is not rebuilt always marks the table out of order; there is no way to
 tell that it did not move a sort key.  A staged write is not allowed to rebuild
 inside the staged context, but it carries that fact through the commit, so the
 swapped-in table is marked out of order and `resort()` afterwards puts it right.
+
+A `metafile` replaces the order flags and the sort together, so a reload
+carrying one numbers the rows by the sort *that file* installs, not the one it
+is replacing.  A metafile asking for `id_ordered = true` with
+`out_of_order = false` and no sort is refused: there would be nothing for
+ascending `id` to follow, so the flags would assert an invariant that cannot
+hold.  The check runs before anything is rebuilt or swapped, so the live table
+is left untouched.  To remove a sort, let the metafile record
+`id_ordered = false` as well.
 
 `scripts/audit_id_order.py` checks the flag against reality: it streams each
 `id_ordered` table in sort order and reports `OK`, `MISMATCH` or an error

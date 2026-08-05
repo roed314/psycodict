@@ -448,11 +448,22 @@ hardening standalone use; the highlights:
   beside changed data) now mark the table invalid, in the same transaction as
   the swap. A `metafile` no longer installs a `stats_valid = true` describing
   the database it was exported from. Without this a count cached before such a
-  write was still served afterwards, defeating the enforcement above. The rule
-  is deliberately conservative in one place: `resort()` leaves the rows
-  unchanged, so the caches would still be accurate, but on a table without
-  `saving` nothing rebuilds them and it ends invalid. *Migration:* run
+  write was still served afterwards, defeating the enforcement above. A
+  `countsfile`/`statsfile` pair counts as fresh only when it was actually
+  loaded and swapped in, which needs `stats.saving`; a reload that is handed
+  cache files it will not load now says so rather than dropping them silently.
+  The rule is deliberately conservative in one place: `resort()` leaves the
+  rows unchanged, so the caches would still be accurate, but on a table
+  without `saving` nothing rebuilds them and it ends invalid. *Migration:* run
   `refresh_stats()` after a `resort()` on such a table.
+- **A `metafile` claiming to be ordered must install a sort.** `reload` now
+  refuses one carrying `id_ordered = true`, `out_of_order = false` and no
+  sort: there is nothing for ascending `id` to follow, so the flags assert an
+  invariant that cannot hold. Previously the rows were numbered by the sort
+  the file was *replacing* and the table went live in exactly the state the
+  audit reports as an error. The check runs before anything is rebuilt or
+  swapped, so a rejected reload leaves the live table untouched. *Migration:*
+  give such a metafile a sort, or let it record `out_of_order = true`.
 - **`scripts/audit_id_order.py`**, a read-only check that streams each
   `id_ordered` table in sort order and reports whether its ids actually
   increase, since the flag can drift. Each table is audited in a read

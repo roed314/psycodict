@@ -379,3 +379,113 @@ def test_a_metafile_sort_may_be_a_direction_pair(db, two_col_table, tmp_path):
     from test_id_order_audit import audit
 
     assert audit.audit_table(db, name)[0] == "OK"
+
+
+def _leftover_relations(table):
+    """
+    Any _tmp or _resort relation belonging to this table.
+    """
+    name = table.search_table
+    return [
+        t for t in table._all_tablenames()
+        if t.startswith(name) and (t.endswith("_tmp") or t.endswith("_resort"))
+    ]
+
+
+def test_a_metafile_may_not_claim_order_without_a_sort(db, two_col_table, tmp_path):
+    """
+    ``id_ordered = true`` with ``out_of_order = false`` and no sort describes
+    an invariant nothing can satisfy: there is no sort for ascending id to
+    follow.  Left alone the reload numbers the rows by the sort the metafile is
+    *replacing* and then installs the combination the id-order audit reports as
+    an error, so refuse it up front.
+    """
+    name = two_col_table.search_table
+    before = list(two_col_table.search({}, projection=["n", "label"], sort=[["n", 1]]))
+    was_out_of_order = two_col_table._out_of_order
+    path = _reload_file(
+        tmp_path / "d.txt",
+        ["n", "label"],
+        ["integer", "text"],
+        [[str(i), "l%d" % i] for i in ROW_ORDER],
+    )
+    metafile = _metafile_with_sort(two_col_table, tmp_path, "\\N")
+
+    with pytest.raises(ValueError, match="no sort"):
+        two_col_table.reload(path, metafile=metafile, resort=True)
+
+    # nothing was installed, rebuilt or left half-built
+    table = db[name]
+    assert table._sort_orig == ["n"]
+    assert table._id_ordered is True
+    assert table._out_of_order is was_out_of_order
+    assert list(table.search({}, projection=["n", "label"], sort=[["n", 1]])) == before
+    assert _leftover_relations(table) == []
+
+
+def test_the_refusal_does_not_depend_on_resorting(db, two_col_table, tmp_path):
+    """
+    The renumbering is only half of it: without one, reload_meta installs the
+    same impossible row.  A search file carrying ids resorts nothing, and the
+    metafile must still be refused.
+    """
+    name = two_col_table.search_table
+    path = str(tmp_path / "d.txt")
+    two_col_table.copy_to(path)
+    metafile = _metafile_with_sort(two_col_table, tmp_path, "\\N")
+
+    with pytest.raises(ValueError, match="no sort"):
+        two_col_table.reload(path, metafile=metafile, resort=False)
+
+    table = db[name]
+    assert table._sort_orig == ["n"]
+    assert _leftover_relations(table) == []
+
+
+def test_a_metafile_may_drop_the_sort_when_it_drops_the_ordering(db, two_col_table, tmp_path):
+    """
+    The coherent way to remove a sort: stop claiming to be id_ordered.  Only
+    the impossible combination is refused, not every sortless metafile.
+    """
+    from psycodict.base import _meta_tables_cols
+
+    name = two_col_table.search_table
+    path = str(tmp_path / "d.txt")
+    two_col_table.copy_to(path)
+    metafile = tmp_path / "meta.txt"
+    two_col_table.copy_to_meta(str(metafile))
+    fields = open(metafile).read().rstrip("\n").split("|")
+    fields[_meta_tables_cols.index("sort")] = "\\N"
+    fields[_meta_tables_cols.index("id_ordered")] = "f"
+    fields[_meta_tables_cols.index("out_of_order")] = "f"
+    with open(metafile, "w") as F:
+        F.write("|".join(fields) + "\n")
+
+    two_col_table.reload(path, metafile=str(metafile), resort=True)
+
+    table = db[name]
+    assert table._sort_orig is None
+    assert table._id_ordered is False
+    assert table.count() == len(ROW_ORDER)
+
+
+def test_reload_never_installs_a_state_the_audit_calls_an_error(db, two_col_table, tmp_path):
+    """
+    The invariant behind the refusal, stated in the audit's own terms.
+    """
+    from test_id_order_audit import audit
+
+    two_col_table.resort()
+    name = two_col_table.search_table
+    assert audit.audit_table(db, name)[0] == "OK"
+
+    table = db[name]
+    path = str(tmp_path / "d.txt")
+    table.copy_to(path)
+    metafile = _metafile_with_sort(table, tmp_path, "\\N")
+    with pytest.raises(ValueError):
+        table.reload(path, metafile=metafile, resort=True)
+
+    # Had the metafile gone in, the table would be id_ordered with no sort,
+    # which the audit reports as an error rather than as an ordering.
+    assert audit.audit_table(db, name)[0] == "OK"

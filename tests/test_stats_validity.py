@@ -548,3 +548,57 @@ def test_resort_of_a_saving_table_stays_valid(db, counted):
     assert stats_valid_in_meta(table) is True
     assert table.stats.count(QUERY, record=True) == 67
     assert table.stats.quick_count(QUERY) == 67
+
+
+def test_cache_files_are_not_trusted_when_they_are_not_loaded(db, counted, tmp_path):
+    """
+    Only a table with ``saving`` on loads its counts and stats companions, so
+    on one without it both files are accepted and quietly ignored: the live
+    caches stay exactly as they were, describing the data being replaced.
+    Reading freshness off the filenames alone therefore marked caches for the
+    old rows as agreeing with the new ones.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    countsfile = tmp_path / "counts.txt"
+    statsfile = tmp_path / "stats.txt"
+    counted.copy_to(
+        str(searchfile), countsfile=str(countsfile), statsfile=str(statsfile)
+    )
+    # Keep the three header lines and five rows, so the cached 67 is no
+    # longer the answer to anything.
+    lines = open(searchfile).read().split("\n")
+    with open(searchfile, "w") as F:
+        F.write("\n".join(lines[:3] + lines[3:8]) + "\n")
+
+    counted.stats.saving = False
+    counted.reload(
+        str(searchfile),
+        countsfile=str(countsfile),
+        statsfile=str(statsfile),
+        restat=False,
+    )
+
+    table = db[name]
+    assert table.count() == 5
+    truth = table._execute(
+        SQL("SELECT count(*) FROM {0} WHERE flag").format(Identifier(name))
+    ).fetchone()[0]
+    assert truth != 67
+    assert stats_valid_in_meta(table) is False
+    assert table.stats.quick_count(QUERY) is None
+    assert table.count(QUERY) == truth
+
+
+def test_a_partial_cache_pair_is_still_not_trusted(db, counted, tmp_path):
+    """
+    The rule needs *both* companions: one file leaves the other an empty
+    clone, which is not the cache the data was exported with.
+    """
+    name = counted.search_table
+    searchfile = tmp_path / "data.txt"
+    countsfile = tmp_path / "counts.txt"
+    counted.copy_to(str(searchfile), countsfile=str(countsfile))
+
+    counted.reload(str(searchfile), countsfile=str(countsfile), restat=False)
+    assert stats_valid_in_meta(db[name]) is False
