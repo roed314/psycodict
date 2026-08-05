@@ -241,10 +241,7 @@ def test_adjust_schema_builds_the_table_from_a_marked_header(db, filled_table, t
     filled_table.copy_to(searchfile, columns=["n", "label"], include_id=False)
     assert read(searchfile).startswith(EXPORT_FORMAT_MARKER)
 
-    # resort=False because renumbering ids selects the *old* table's columns,
-    # which a narrowed schema no longer has; that is a limitation of
-    # adjust_schema, not of the header reader this test is about.
-    filled_table.reload(searchfile, adjust_schema=True, resort=False)
+    filled_table.reload(searchfile, adjust_schema=True)
 
     # reload swaps in a new table, so the assertions must be made against the
     # object the database hands out now, not the pre-reload one.
@@ -253,6 +250,9 @@ def test_adjust_schema_builds_the_table_from_a_marked_header(db, filled_table, t
     assert reloaded.count() == 200
     assert {r["n"] for r in reloaded.search({}, ["n"])} == set(range(200))
     assert reloaded.lucky({"n": 7}, "label") == "l7"
+    # The file carries no ids, so the reload renumbers in sort order -- over
+    # the relation the header built, whose columns are not this table's.
+    assert [r["id"] for r in reloaded.search({"n": {"$lt": 3}}, ["id"], sort=["n"])] == [1, 2, 3]
 
 
 # --- the automatic reindex decision ----------------------------------------
