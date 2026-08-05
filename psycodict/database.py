@@ -194,8 +194,8 @@ class PostgresDatabase(PostgresBase):
       (``statement_timeout``, ``lock_timeout``,
       ``idle_in_transaction_session_timeout``, ``application_name``) applied to
       the main database connection and to every replacement main connection.
-      Defaults to a 25 second statement timeout when connecting as
-      ``webserver``, and to nothing otherwise.  A notification listener's
+      Defaults to no session settings; a deployment passes the ones it wants
+      (LMFDB sets its statement timeout here).  A notification listener's
       connection deliberately does not inherit them: it exists to wait, and a
       statement timeout on it would be more likely to be wrong than right.  It
       does inherit the connection overrides below, so that it reaches the same
@@ -241,7 +241,7 @@ class PostgresDatabase(PostgresBase):
     _search_table_class_ = PostgresSearchTable
 
     # The session settings psycodict will apply, and what it applies to a
-    # webserver connection when the caller asks for nothing else.  Settings are
+    # every connection.  Settings are
     # applied with set_config, which takes the name and the value as bound
     # parameters; the closed set here is what keeps a caller from setting
     # something unrelated through the same door.
@@ -251,7 +251,6 @@ class PostgresDatabase(PostgresBase):
         "idle_in_transaction_session_timeout",
         "application_name",
     )
-    _webserver_session_settings = {"statement_timeout": "25s"}
 
     def _resolve_session_settings(self, session_settings):
         """
@@ -260,19 +259,17 @@ class PostgresDatabase(PostgresBase):
         INPUT:
 
         - ``session_settings`` -- a dictionary of PostgreSQL settings, or None
-          to take the default for the connecting role
+          for no session settings
 
-        A connection as ``webserver`` has always been given a 25 second
-        statement timeout; that is now the default rather than a special case
-        applied once, so it survives a reconnect and can be overridden.  The
-        settings apply to the main connection and its replacements, not to a
-        listener's separate connection.
+        psycodict applies no session setting unless one is asked for: a role
+        named ``webserver`` used to be handed a 25 second statement timeout, but
+        a generic library should not act on a role name.  A deployment that
+        wants a timeout passes it explicitly (LMFDB does, through its
+        subclass), and it then applies to the main connection and every
+        replacement, not to a listener's separate connection.
         """
         if session_settings is None:
-            user = self._connection_options().get("user")
-            session_settings = (
-                self._webserver_session_settings if user == "webserver" else {}
-            )
+            session_settings = {}
         unknown = set(session_settings) - set(self._allowed_session_settings)
         if unknown:
             raise ValueError(

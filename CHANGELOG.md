@@ -475,6 +475,17 @@ hardening standalone use; the highlights:
   adding a method in a minor release never makes a table unreachable through
   `db[name]`.
 
+- **No implicit statement timeout from a role name.** A connection as
+  `webserver` was silently given a 25 second `statement_timeout`; a generic
+  library should not act on a role name, so that special case is gone.
+  `session_settings=` still applies (and survives reconnects) -- a deployment
+  that wants a timeout passes it explicitly. **LMFDB does this in its subclass**
+  ([lmfdb#7128](https://github.com/LMFDB/lmfdb/pull/7128)); land that before
+  bumping LMFDB to a psycodict that includes this change, or the web workers
+  lose their timeout. *Migration:* pass
+  `session_settings={"statement_timeout": "25s"}` (or your value) when
+  constructing the database.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores
