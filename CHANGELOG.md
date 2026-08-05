@@ -463,16 +463,20 @@ hardening standalone use; the highlights:
   build. The release workflow's actions are pinned to commit SHAs, and the
   install smoke tests assert `importlib.metadata.version == __version__` and run
   `pip check` for both a plain and a binary-extra install.
-
 - **The public API is defined by `__all__`.** Each module now declares the
   names psycodict promises to keep across 1.x, and the API reference documents
-  exactly those (Sphinx `undoc-members` is off). A non-`__all__` name -- even one
-  with a docstring -- is implementation: still importable, so nothing downstream
-  breaks, but not part of the stability promise. `tests/test_public_api.py`
-  freezes the surface so a change to it is deliberate. Versioning.md is rewritten
-  around this, and states that `db[name]` is the canonical table lookup while
-  `db.<name>` is convenience syntax a real database attribute wins over -- so
-  adding a method in a minor release never makes a table unreachable through
+  exactly those (Sphinx `undoc-members` is off). A name absent from `__all__` --
+  even one with a docstring -- is implementation: not part of the stability
+  promise, though **explicit imports of it still resolve**, so
+  `from psycodict.utils import range_formatter` keeps working. *Wildcard*
+  imports do change: `from psycodict.utils import *` now binds only the four
+  curated names rather than every non-underscore module name, so a module that
+  relied on `import *` to pull in a helper may bind fewer names than before.
+  `tests/test_public_api.py` freezes the surface, and checks the wildcard
+  behavior of every module, so a change to either is deliberate. Versioning.md is
+  rewritten around this, and states that `db[name]` is the canonical table lookup
+  while `db.<name>` is convenience syntax a real database attribute wins over --
+  so adding a method in a minor release never makes a table unreachable through
   `db[name]`.
 
 ### Release candidates

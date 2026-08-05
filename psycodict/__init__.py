@@ -33,6 +33,8 @@ You can search using the methods ``search``, ``lucky`` and ``lookup``::
 
 # Single source of truth for the package version: pyproject.toml reads it via
 # ``[tool.setuptools.dynamic]``, and it works from an uninstalled checkout too.
+#: The version of psycodict, as a :pep:`440` string.  For an installed copy it
+#: is the same value ``importlib.metadata.version("psycodict")`` reports.
 __version__ = "1.0.0rc2"
 
 try:

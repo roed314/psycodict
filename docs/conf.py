@@ -52,10 +52,14 @@ myst_heading_anchors = 4
 # documentation conventions (INPUT:/OUTPUT: bullet blocks, EXAMPLES:: with
 # literal transcripts); those are plain reST, so autodoc renders them as-is.
 autodoc_member_order = "bysource"
-# No "undoc-members": the API reference documents exactly each module's __all__
-# (its supported public surface), not every non-underscore name that happens to
-# have -- or lack -- a docstring.  Versioning.md defines the public API as the
-# __all__ names, so the reference and the promise stay in step.
+# No "undoc-members": with __all__ defined, autodoc considers only the names a
+# module exports, and this keeps it from documenting the ones it cannot -- so a
+# helper that merely carries a docstring no longer lands in the reference just
+# because it has one.  That is an upper bound, not a proof of parity: autodoc
+# also *drops* an exported name it has no docstring for, and (on a page without
+# "imported-members"/"special-members") an exported name that is an import or a
+# dunder.  tests/test_public_api.py supplies the parity half -- every __all__
+# name has a docstring, and every module in the frozen surface has a page here.
 autodoc_default_options = {
     "members": True,
     "show-inheritance": True,

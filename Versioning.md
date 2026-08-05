@@ -10,13 +10,18 @@ metadata tables living inside your database.
 ## What is public
 
  * **The names each module exports in its `__all__`**, and their documented
-   behavior.  These are exactly the names in the [API reference](api/index.md),
+   behavior.  A name is public exactly when it appears in its module's
+   `__all__`; that single test decides it, with no exceptions.  It covers
+   explicitly exported special names such as `psycodict.__version__`, and any
+   name *absent* from `__all__` — underscore-prefixed or not, docstring or not —
+   is implementation: an explicit `from psycodict.utils import range_formatter`
+   still resolves, but the name is not part of this promise and may change in
+   any release.  (`from psycodict.utils import *`, on the other hand, binds
+   `__all__` and nothing else, so a wildcard import binds fewer names than it
+   did before 1.0.)  The `__all__` names are exactly the names in the
+   [API reference](https://psycodict.readthedocs.io/en/latest/api/index.html),
    and the snapshot test `tests/test_public_api.py` freezes them, so the promise
-   and the code cannot drift apart.  A non-underscore name that is *not* in an
-   `__all__` (and every underscore-prefixed name, whatever module it lives in)
-   is implementation: it may still be importable, but it is not part of this
-   promise and may change in any release.  Having a docstring does not make a
-   name public; being in `__all__` does.
+   and the code cannot drift apart.
  * **The query language** as specified in [QueryLanguage.md](QueryLanguage.md):
    the meaning of a query dictionary is stable within a major version: new
    features may be added in minor versions, but functioning queries will
@@ -49,11 +54,12 @@ name.
 
 ## What is not covered
 
-Non-`__all__` names, whether or not they carry a docstring; underscore-prefixed
-names; the exact SQL text psycodict emits (only its semantics); performance
-characteristics; the contents of log files; and undocumented behavior generally,
-even where observable.  If something undocumented matters to your project, open
-an issue — turning it into documented (hence stable) behavior is usually easy.
+Names absent from their module's `__all__`, whether or not they carry a
+docstring and whatever they are named; the exact SQL text psycodict emits (only
+its semantics); performance characteristics; the contents of log files; and
+undocumented behavior generally, even where observable.  If something
+undocumented matters to your project, open an issue — turning it into documented
+(hence stable) behavior is usually easy.
 
 ## Database metadata compatibility
 
