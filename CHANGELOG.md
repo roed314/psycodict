@@ -339,6 +339,138 @@ hardening standalone use; the highlights:
   Connect — no long-lived token is stored anywhere. (#113)
 - `CITATION.cff`, so GitHub renders a citation for the package. (#124)
 
+### Fixed after the first release candidates
+
+- **`max_id` and `min_id` compose the table name they are given.** Both took a
+  `table=` argument and formatted it into the statement as text, so a name
+  needing quotes was a syntax error and a name carrying its own statement ran
+  it. Both now use `Identifier`. `max_id` returns -1 for an empty table, which
+  is the only empty sentinel: 0 is a real id, and `random()` treated a table
+  whose single row had id 0 as empty.
+- **Approximate statistics are scaled by the table they describe.**
+  `_approx_most_common` took `reltuples` from a hard-coded `public.nf_fields`
+  while taking frequencies from the real table, so on every other table the
+  estimate was that table's frequencies multiplied by an unrelated row count.
+  The column type it interpolates now goes through the validated
+  `column_type_sql`.
+- **`update_from_file` no longer shares log state between calls.** Its
+  `logging` default was a dictionary literal that the method wrote `logid` and
+  `aborted` into, so consecutive default calls saw each other's values and a
+  caller-supplied dictionary came back modified. The default is now `None` and
+  the mapping is copied per call.
+- **Random selection edge cases.** `random(query, pick_first=...)` returned
+  `None` rather than raising `IndexError` when nothing satisfies the query; a
+  projected value of `0`, `False`, `""` or `[]` counts as a result instead of
+  being skipped until `maxtries` ran out; `random_sample` raises `ValueError`
+  naming the accepted modes instead of silently returning `None` for an
+  unknown one; and a repeatable `choice` sample uses a local
+  `random.Random(seed)` rather than reseeding the process-wide generator.
+
+- **`stats_valid` is enforced, not just recorded.** Write paths cleared the
+  flag but read paths ignored it, so a count cached before a `restat=False`
+  write kept being served afterwards -- verified: a query counted at 67, then
+  every matching row changed, still answered 67. Every lookup that would serve
+  a cached answer now goes through one predicate and reports a miss while the
+  flag is false: `quick_count`, `quick_count_distinct` and `_quick_statistic`,
+  which is what makes `count`, `max`, `min` and `sum` compute the answer
+  instead of returning a recorded one. The line is whether a miss costs one
+  bounded query or a rebuild, so these are deliberately not gated: the
+  empty-query `total`, maintained on every write and so exact; the `_status` /
+  `status` / `extra_counts` inventory, which is how `refresh_stats` discovers
+  what to recompute; `_has_stats` / `_has_numstats`, which decide whether a
+  whole statistics family needs computing; and `null_counts`, whose fallback
+  is one full count *per search column*. Gating that last group made
+  `column_counts`, `numstats` and `null_counts` rebuild on every call with
+  nothing to converge on, since only `refresh_stats` restores the flag --
+  measured on the LMFDB, four minutes of downstream suite became over
+  forty-five. **The gap that leaves:** `column_counts`, `numstats` and
+  `null_counts` can still report a value recorded before an unrefreshed
+  write.
+  Closing it needs freshness per statistic rather than one flag per table,
+  which is a metadata format change; `refresh_stats()` is the remedy
+  meanwhile. A suffixed (`_tmp`, `_oldN`) table is not gated by the live
+  table's flag, since it carries its own caches. The flag is restored only by
+  `refresh_stats()`, inside the transaction that rebuilt the caches, so a
+  failed refresh leaves the table invalid; refreshing a `_tmp` copy does not
+  validate the live table.
+- **Bulk paths run `ANALYZE`.** A relation that has just been bulk loaded has
+  no planner statistics until autovacuum reaches it, so queries against it are
+  costed as though it were tiny. Replacement tables are analyzed while still
+  named `_tmp` -- before the swap, and outside its transaction, since the
+  catalog entry follows the relation through the rename -- which covers
+  `reload`, `rewrite`, non-inplace `update_from_file` and staged commits
+  through the one helper they share; `copy_from` analyzes the live table it
+  loaded into.
+
+- **A database operates in exactly one schema.** `PostgresDatabase` takes a
+  `schema=` argument (default `"public"`, so nothing changes for existing
+  deployments), validates it as an identifier, and pins `search_path` to it on
+  the first connection and on every replacement. Catalog inspection was
+  previously a mixture of hard-coded `'public'` and no filter at all -- 30-odd
+  queries across `pg_tables`, `pg_indexes`, `pg_class`, `pg_constraint` and
+  `information_schema` -- so with two schemas holding a relation of the same
+  name, column discovery could mix their columns, an index or constraint in
+  the other schema counted as present, and `_all_tablenames` listed the name
+  twice. Every one is now filtered to the selected schema, which is bound as a
+  value rather than interpolated. *Migration:* none unless you were relying on
+  psycodict seeing relations outside `public`, which it did only by accident.
+
+- **`resort()` rebuilds and swaps instead of renumbering in place.** It was a
+  disabled no-op (the in-place `UPDATE` of every id stalled replication and left
+  the rows in their old physical order, defeating the point of id-ordering).
+  It now dumps the table, loads it into a fresh table whose ids are assigned
+  `1..N` in sort order, and swaps it in through `reload`'s machinery -- primary
+  key, indexes, constraints, grants and counts/stats companions rebuilt,
+  `ANALYZE` run, previous table kept as an `_oldN` backup. **The ids change.**
+  A table already ordered reports nothing to do unless `force=True`.
+- **Row-level writes no longer resort.** `resort=True` on `insert_many`,
+  `update`, `copy_from` or an in-place `update_from_file` now raises and points
+  at `resort()`, so a small write cannot silently trigger a full-table rebuild;
+  `resort=False` is unaffected. `reload`, `rewrite` and a non-inplace
+  `update_from_file` still establish order as part of the replacement they were
+  already building. *Migration:* drop `resort=True` from row-level calls and
+  call `table.resort()` in a maintenance window instead.
+- **`finalize_changes()` is removed.** It was a documented public no-op; the
+  supported write methods already leave `total`, the order flag and
+  `stats_valid` correct when they return.
+- **`resort=False` no longer suppresses the order bookkeeping.** Whether an
+  update can move the id order is now decided from the file's columns rather
+  than from the `resort` option, so an `update_from_file` or `rewrite` that
+  touches a sort column marks the table `out_of_order` even when it was told
+  not to rebuild — on the in-place path, on the replacement path, and through a
+  staged commit. Previously such a write could leave `out_of_order = false`
+  standing, an assertion search code is allowed to act on by replacing
+  `ORDER BY <sort>` with `ORDER BY id`. *Migration:* none; run `resort()` on
+  tables the audit below reports as `MISMATCH`.
+- **Every write that does not rebuild the caches clears `stats_valid`.**
+  `update_from_file`, `rewrite` and `reload` with `restat=False` (and any
+  replacement that installs cloned, partial or untouched counts and stats
+  beside changed data) now mark the table invalid, in the same transaction as
+  the swap. A `metafile` no longer installs a `stats_valid = true` describing
+  the database it was exported from. Without this a count cached before such a
+  write was still served afterwards, defeating the enforcement above. A
+  `countsfile`/`statsfile` pair counts as fresh only when it was actually
+  loaded and swapped in, which needs `stats.saving`; a reload that is handed
+  cache files it will not load now says so rather than dropping them silently.
+  The rule is deliberately conservative in one place: `resort()` leaves the
+  rows unchanged, so the caches would still be accurate, but on a table
+  without `saving` nothing rebuilds them and it ends invalid. *Migration:* run
+  `refresh_stats()` after a `resort()` on such a table.
+- **A `metafile` claiming to be ordered must install a sort.** `reload` now
+  refuses one carrying `id_ordered = true`, `out_of_order = false` and no
+  sort: there is nothing for ascending `id` to follow, so the flags assert an
+  invariant that cannot hold. Previously the rows were numbered by the sort
+  the file was *replacing* and the table went live in exactly the state the
+  audit reports as an error. The check runs before anything is rebuilt or
+  swapped, so a rejected reload leaves the live table untouched. *Migration:*
+  give such a metafile a sort, or let it record `out_of_order = true`.
+- **`scripts/audit_id_order.py`**, a read-only check that streams each
+  `id_ordered` table in sort order and reports whether its ids actually
+  increase, since the flag can drift. Each table is audited in a read
+  transaction of its own, so one table's error does not poison the rest of the
+  run, and `id_ordered` with no configured sort is reported as an error rather
+  than trivially passing.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores

@@ -88,9 +88,9 @@ def _column_types(db, names):
         "FROM pg_attribute a "
         "JOIN pg_class c ON a.attrelid = c.oid "
         "JOIN pg_namespace n ON c.relnamespace = n.oid "
-        "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+        "WHERE n.nspname = %s AND c.relkind = 'r' "
         "AND a.attnum > 0 AND NOT a.attisdropped"
-    ))
+    ), [db.schema])
     columns = {}
     for table_name, column_name, typ in cur:
         if table_name in names:
