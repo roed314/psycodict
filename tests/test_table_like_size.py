@@ -19,6 +19,10 @@ import pytest
 from psycopg.sql import SQL, Identifier
 
 
+# A schema for holding a same-named decoy of a table under test.
+DECOY = "psycodict_storage_decoy"
+
+
 def fresh_name():
     """
     A table name that no other test (or run) will collide with.
@@ -135,6 +139,51 @@ def test_create_table_like_preserves_column_storage_settings(db, empty_table, tr
     if check_compression:
         assert settings["vec"][1] == "p"
         assert settings["label"][1] == ""
+
+
+def test_column_storage_settings_are_read_from_the_selected_schema(
+    db, empty_table, transient
+):
+    """
+    The storage settings are read with a bound schema predicate rather than by
+    casting the table name to ``regclass``, which resolves through the search
+    path.  A same-named relation the session would reach first -- another
+    schema put ahead of this one, or a temporary table -- must not be the one
+    whose settings are copied.
+    """
+    source = empty_table.search_table
+    db._execute(
+        SQL("ALTER TABLE {0} ALTER COLUMN {1} SET STORAGE EXTERNAL").format(
+            Identifier(source), Identifier("mat")
+        )
+    )
+    target = fresh_name()
+    db.create_table_like(target, empty_table)
+    transient.append(target)
+    assert _column_settings(db, target, ["mat"])["mat"][0] == "e"
+
+    db._execute(SQL("CREATE SCHEMA IF NOT EXISTS {0}").format(Identifier(DECOY)))
+    try:
+        # a decoy of the same name, whose mat column keeps the type default
+        db._execute(
+            SQL("CREATE TABLE {0}.{1} (mat numeric[])").format(
+                Identifier(DECOY), Identifier(source)
+            )
+        )
+        # ... reachable before the real one, for the rest of this session
+        db._execute(
+            SQL("SET search_path TO {0}, {1}, pg_temp").format(
+                Identifier(DECOY), Identifier(db.schema)
+            )
+        )
+        db._clone_storage_settings(target, empty_table)
+    finally:
+        # a fresh connection, pinned the way this database pins every one of
+        # them, whatever the assertions above did
+        db.reset_connection()
+        db._execute(SQL("DROP SCHEMA IF EXISTS {0} CASCADE").format(Identifier(DECOY)))
+    # the decoy's default storage did not overwrite the source's EXTERNAL
+    assert _column_settings(db, target, ["mat"])["mat"][0] == "e"
 
 
 ##################################################################

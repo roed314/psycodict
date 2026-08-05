@@ -64,6 +64,29 @@ Copies the column layout, `label_col`, `sort`, `id_ordered`, `id` type and descr
 
 psycodict keeps its own bookkeeping in a handful of tables that live alongside your search tables:
 
+psycodict operates in one PostgreSQL schema, `public` unless the constructor is
+given another (`PostgresDatabase(schema="myschema")`).  Every relation it
+creates goes there, every relation it looks for is looked for there, and every
+catalog query is filtered to it, so a relation of the same name in another
+schema is neither mistaken for one of these nor merged with it.  The schema is
+pinned in each connection's `search_path`, including replacement connections
+after a reconnect, as one quoted identifier (a `search_path` is a
+comma-separated *list*, so a name that needs quoting must not be written to it
+as text).  psycodict names `pg_temp` explicitly *after* it, so that a temporary
+relation cannot shadow `meta_tables` or a search table, and leaves `pg_catalog`
+unnamed, which is what keeps it ahead of both so the built-in types and
+functions stay reachable.  The effective order is therefore `pg_catalog`, the
+selected schema, `pg_temp`.
+
+The schema must already exist: psycodict never creates one, and `create=True`
+bootstraps the meta tables *within* it.  The connecting role needs `USAGE` on
+it, and `CREATE` to make any relation there.  PostgreSQL silently ignores a
+`search_path` entry naming a schema that is missing or not accessible, so
+psycodict checks `current_schema()` after setting it and refuses to connect
+rather than operate somewhere nobody chose.  One name cannot be selected at all:
+`$user`, which PostgreSQL substitutes with the connecting role's name even when
+quoted, is rejected by the constructor.
+
  * **`meta_tables`** — one row per search table, holding `name`, `sort`, `count_cutoff`, `id_ordered`, `out_of_order`, `stats_valid`, `label_col`, `total`, `important` and `include_nones`.  This is the source of truth psycodict reads on connection to reconstruct each table object.
  * **`meta_indexes`** and **`meta_constraints`** — one row per index / constraint, recording how to rebuild it.  `reload` and `restore_indexes` rebuild from these rows, **not** from whatever is physically on the table (see [reload](#reload)).
  * **`meta_tables_hist`**, **`meta_indexes_hist`**, **`meta_constraints_hist`** — versioned history of the three tables above, so that `reload_meta`/`revert_meta` can roll a table's metadata forward and back.
@@ -108,7 +131,32 @@ These mutate the live table directly.  They are convenient for small edits; for 
  * **`update(query, changes, resort=False, restat=True)`** — a plain SQL `UPDATE` of every row matching `query`; `changes` maps column names to constants.
  * **`delete(query, restat=True)`** — deletes every row matching `query` and decrements `total`.
 
-**Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call; otherwise they are simply marked invalid.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
+**Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call; otherwise they are simply marked invalid.
+
+`stats_valid` is enforced rather than merely recorded: while it is false, a
+cached nonempty-query count, distinct count, minimum, maximum or sum reports a
+miss, and the method computes the answer instead of returning the stored one.
+The empty-query `total` is the exception, since it is maintained on every write
+and so stays exact.
+
+`column_counts`, `numstats` and `null_counts` are the other exception, and a
+caveat worth knowing.  The line is what a cache miss costs: the counts above
+fall back to a single statement about the rows in question, while these fall
+back to rebuilding a whole statistics family, or to one full count per search
+column.  Making them miss while the table is invalid would rebuild on every
+call and never converge, since only `refresh_stats()` restores the flag, so
+they read what is recorded.  A value recorded before an unrefreshed write is
+therefore still reported by them; run `refresh_stats()` after a write you did
+not `restat`.  The flag goes back to true only in `refresh_stats()`, inside
+the transaction that rebuilt the caches, so a refresh that fails part-way leaves
+the table marked invalid rather than claiming a cache it does not have.
+Refreshing a `_tmp` copy does not validate the live table.
+
+Bulk paths also run PostgreSQL's own `ANALYZE`, which is a different thing from
+psycodict's statistics: a freshly loaded relation has no planner statistics
+until autovacuum reaches it.  Replacement tables are analyzed while still named
+`_tmp`, before the swap, since the catalog entry follows the relation through
+the rename; `copy_from` analyzes the live table it loaded into.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
 
 ### Resorting is disabled
 
@@ -212,7 +260,7 @@ Every search table has two companion tables:
 
 ## Operational tips
 
- * **`db.show_locks()`** prints every lock currently held on any table — name, mode, pid and age.  This is how you find the process id to kill when a write raised `LockError`.
+ * **`db.show_locks()`** prints every lock currently held on a table in this database's schema — name, mode, pid and age.  This is how you find the process id to kill when a write raised `LockError`.  A lock on a same-named table in another schema is not shown, and does not block anything done here.
  * **`table.analyze(query, projection=1, limit=1000, sort=None, explain_only=False)`** prints the SQL it would run and its `EXPLAIN ANALYZE` plan (or just `EXPLAIN`, with `explain_only=True`).  Use it when tuning indexes for a slow search.
  * **Slow-query logging** is configured in `config.ini`: `[logging] slowcutoff` (seconds, default `0.1`) and `slowlogfile` (default `slow_queries.log`).  Any statement slower than `slowcutoff` is logged with its interpolated SQL; slow searches additionally log a `Replicate with db.table.analyze(...)` hint so you can reproduce them.
  * On **PostgreSQL 18+** a `reload` or `update_from_file` prints a harmless warning like `Constraint of ... with name ..._id_not_null does not end with the suffix _tmp` during the swap — Postgres now catalogs `NOT NULL` as a named constraint that the swap logic does not recognize.  The constraint is preserved; the warning can be ignored.

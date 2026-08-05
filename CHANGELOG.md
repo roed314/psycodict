@@ -339,6 +339,91 @@ hardening standalone use; the highlights:
   Connect — no long-lived token is stored anywhere. (#113)
 - `CITATION.cff`, so GitHub renders a citation for the package. (#124)
 
+### Fixed after the first release candidates
+
+- **`max_id` and `min_id` compose the table name they are given.** Both took a
+  `table=` argument and formatted it into the statement as text, so a name
+  needing quotes was a syntax error and a name carrying its own statement ran
+  it. Both now use `Identifier`. `max_id` returns -1 for an empty table, which
+  is the only empty sentinel: 0 is a real id, and `random()` treated a table
+  whose single row had id 0 as empty.
+- **Approximate statistics are scaled by the table they describe.**
+  `_approx_most_common` took `reltuples` from a hard-coded `public.nf_fields`
+  while taking frequencies from the real table, so on every other table the
+  estimate was that table's frequencies multiplied by an unrelated row count.
+  The column type it interpolates now goes through the validated
+  `column_type_sql`.
+- **`update_from_file` no longer shares log state between calls.** Its
+  `logging` default was a dictionary literal that the method wrote `logid` and
+  `aborted` into, so consecutive default calls saw each other's values and a
+  caller-supplied dictionary came back modified. The default is now `None` and
+  the mapping is copied per call.
+- **Random selection edge cases.** `random(query, pick_first=...)` returned
+  `None` rather than raising `IndexError` when nothing satisfies the query; a
+  projected value of `0`, `False`, `""` or `[]` counts as a result instead of
+  being skipped until `maxtries` ran out; `random_sample` raises `ValueError`
+  naming the accepted modes instead of silently returning `None` for an
+  unknown one; and a repeatable `choice` sample uses a local
+  `random.Random(seed)` rather than reseeding the process-wide generator.
+
+- **`stats_valid` is enforced, not just recorded.** Write paths cleared the
+  flag but read paths ignored it, so a count cached before a `restat=False`
+  write kept being served afterwards -- verified: a query counted at 67, then
+  every matching row changed, still answered 67. Every lookup that would serve
+  a cached answer now goes through one predicate and reports a miss while the
+  flag is false: `quick_count`, `quick_count_distinct` and `_quick_statistic`,
+  which is what makes `count`, `max`, `min` and `sum` compute the answer
+  instead of returning a recorded one. The line is whether a miss costs one
+  bounded query or a rebuild, so these are deliberately not gated: the
+  empty-query `total`, maintained on every write and so exact; the `_status` /
+  `status` / `extra_counts` inventory, which is how `refresh_stats` discovers
+  what to recompute; `_has_stats` / `_has_numstats`, which decide whether a
+  whole statistics family needs computing; and `null_counts`, whose fallback
+  is one full count *per search column*. Gating that last group made
+  `column_counts`, `numstats` and `null_counts` rebuild on every call with
+  nothing to converge on, since only `refresh_stats` restores the flag --
+  measured on the LMFDB, four minutes of downstream suite became over
+  forty-five. **The gap that leaves:** `column_counts`, `numstats` and
+  `null_counts` can still report a value recorded before an unrefreshed
+  write.
+  Closing it needs freshness per statistic rather than one flag per table,
+  which is a metadata format change; `refresh_stats()` is the remedy
+  meanwhile. A suffixed (`_tmp`, `_oldN`) table is not gated by the live
+  table's flag, since it carries its own caches. The flag is restored only by
+  `refresh_stats()`, inside the transaction that rebuilt the caches, so a
+  failed refresh leaves the table invalid; refreshing a `_tmp` copy does not
+  validate the live table.
+- **Bulk paths run `ANALYZE`.** A relation that has just been bulk loaded has
+  no planner statistics until autovacuum reaches it, so queries against it are
+  costed as though it were tiny. Replacement tables are analyzed while still
+  named `_tmp` -- before the swap, and outside its transaction, since the
+  catalog entry follows the relation through the rename -- which covers
+  `reload`, `rewrite`, non-inplace `update_from_file` and staged commits
+  through the one helper they share; `copy_from` analyzes the live table it
+  loaded into.
+
+- **A database operates in exactly one schema.** `PostgresDatabase` takes a
+  `schema=` argument (default `"public"`, so nothing changes for existing
+  deployments), validates it as an identifier, and pins `search_path` to it on
+  the first connection and on every replacement. Catalog inspection was
+  previously a mixture of hard-coded `'public'` and no filter at all -- 30-odd
+  queries across `pg_tables`, `pg_indexes`, `pg_class`, `pg_constraint` and
+  `information_schema` -- so with two schemas holding a relation of the same
+  name, column discovery could mix their columns, an index or constraint in
+  the other schema counted as present, `_all_tablenames` listed the name
+  twice, and a lock on the other schema's copy refused a write to this one.
+  Every one is now filtered to the selected schema, which is bound as a value
+  rather than interpolated. The schema goes into `search_path` as one quoted
+  identifier rather than as text (a `search_path` is a comma-separated list,
+  in which a name needing quotes is parsed rather than used), `pg_temp` is
+  named after it so a temporary relation cannot shadow a real one, and
+  `current_schema()` is checked afterwards, since PostgreSQL silently ignores
+  an entry naming a schema that is missing or not accessible. *Migration:*
+  none unless you were relying on psycodict seeing relations outside `public`,
+  which it did only by accident. The schema must exist and the role needs
+  `USAGE` on it; the name `$user` is refused, PostgreSQL substituting the
+  role's name for it even when quoted.
+
 ### Release candidates
 
 1.0.0 is published as a sequence of release candidates first. `pip` ignores

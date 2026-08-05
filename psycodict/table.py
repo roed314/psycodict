@@ -328,7 +328,10 @@ class PostgresTable(PostgresBase):
         """
         Determine the tablespace hosting this table (which is then used for indexes and constraints)
         """
-        cur = self._execute(SQL("SELECT tablespace FROM pg_tables WHERE tablename=%s"), [self.search_table])
+        cur = self._execute(
+            SQL("SELECT tablespace FROM pg_tables WHERE schemaname = %s AND tablename = %s"),
+            [self._db.schema, self.search_table],
+        )
         return cur.fetchone()[0]
 
     def _create_index_statement(self, name, table, type, columns, modifiers, storage_params, whereclause=None):
@@ -1182,6 +1185,20 @@ class PostgresTable(PostgresBase):
             self._execute(updater, [self.search_table], silent=True)
             self._stats_valid = False
 
+    def _restore_stats(self):
+        """
+        Record that the cached counts and statistics agree with the live data.
+
+        The counterpart of :meth:`_break_stats`, and the only way the flag goes
+        back to true.  Call it from inside the transaction that rebuilt or
+        loaded the caches, so that a failure part-way through leaves the table
+        marked invalid rather than claiming a cache it does not have.
+        """
+        if not self._stats_valid:
+            updater = SQL("UPDATE meta_tables SET stats_valid = true WHERE name = %s")
+            self._execute(updater, [self.search_table], silent=True)
+            self._stats_valid = True
+
     def _break_order(self):
         """
         This function should be called when the id ordering is invalidated by an insertion or update.
@@ -1350,7 +1367,7 @@ class PostgresTable(PostgresBase):
         resort=None,
         reindex=None,
         restat=True,
-        logging={"operation":"file_update"},
+        logging=None,
         **kwds
     ):
         """
@@ -1373,7 +1390,9 @@ class PostgresTable(PostgresBase):
         - ``resort`` -- whether this table should be resorted after updating (default is to resort when the sort columns intersect the updated columns)
         - ``reindex`` -- only meaningful when ``inplace`` is set: whether to drop the indexes touching the updated columns before the update and recreate them afterward, which is faster when many rows change (by default this is done when more than 1000 rows are updated).  Without ``inplace``, all indexes are necessarily recreated on the replacement table, so ``reindex=True`` is redundant and ``reindex=False`` raises an error.
         - ``restat`` -- whether to recompute stats for the table
-        - ``logging`` -- a dictionary of keyword arguments for _log_db_change
+        - ``logging`` -- a dictionary of keyword arguments for _log_db_change.
+          A copy is taken, so the caller's dictionary is not modified and two
+          calls sharing one dictionary do not see each other's ``logid``.
         - ``kwds`` -- passed on to the ``COPY`` command.  Cannot include "columns".
         """
         self._forbid_reindex_false(reindex, inplace)
@@ -1384,8 +1403,12 @@ class PostgresTable(PostgresBase):
             # The counts and stats tables are not checked: this method
             # deliberately reuses their _tmp versions when they exist.
             self._check_tmp_leftovers([self.search_table])
-        logid = self._check_locks(logging["operation"], datafile=datafile)
-        logging["aborted"] = True
+        # Copied rather than used directly: this dictionary is mutated below,
+        # and the default used to be a shared literal, so consecutive default
+        # calls carried the previous call's logid and aborted flag.
+        log_data = {"operation": "file_update"} if logging is None else dict(logging)
+        logid = self._check_locks(log_data["operation"], datafile=datafile)
+        log_data["aborted"] = True
         try:
             sep = kwds.get("sep", "|")
             print("Updating %s from %s..." % (self.search_table, datafile))
@@ -1505,11 +1528,11 @@ class PostgresTable(PostgresBase):
                         self._set_ordered()
                 # Delete the temporary table used to load the data
                 drop_tmp()
-                logging["logid"] = logid
-                logging["aborted"] = False
+                log_data["logid"] = logid
+                log_data["aborted"] = False
                 print("Updated %s in %.3f secs" % (self.search_table, time.time() - now))
         finally:
-            self._log_db_change(**logging)
+            self._log_db_change(**log_data)
 
     def delete(self, query, restat=True):
         """
@@ -1937,6 +1960,24 @@ class PostgresTable(PostgresBase):
                 )
         return backup_number
 
+    def _analyze(self, tables, suffix=""):
+        """
+        Refresh PostgreSQL's planner statistics for the given relations.
+
+        These are the server's own statistics, not the counts and stats
+        psycodict maintains: a relation that has just been bulk loaded has none
+        until autovacuum reaches it, and until then the planner costs queries
+        against it as though it were tiny.
+
+        Run on a ``_tmp`` copy before the swap rather than on the live table
+        after it, so that no query is served by an unanalyzed relation; the
+        catalog entry follows the relation through the rename.
+        """
+        for table in tables:
+            self._execute(
+                SQL("ANALYZE {0}").format(Identifier(table + suffix)), silent=True
+            )
+
     def _swap_in_tmp(self, tables):
         """
         Helper function for ``reload``: appends _old{n} to the names of tables/indexes/pkeys
@@ -1947,6 +1988,10 @@ class PostgresTable(PostgresBase):
         - ``tables`` -- a list of tables to rename (e.g. self.search_table, self.stats.counts, self.stats.stats)
         """
         now = time.time()
+        # Before the swap, and outside its transaction: the _tmp relations are
+        # complete by now, and analyzing them here keeps the window in which
+        # the live names are locked as short as it was.
+        self._analyze(tables, "_tmp")
         backup_number = self._next_backup_number()
         with DelayCommit(self, silence=True):
             self._swap(tables, "", "_old" + str(backup_number))
@@ -2021,9 +2066,11 @@ class PostgresTable(PostgresBase):
                 SQL(
                     "SELECT rel.relname, con.conname FROM pg_constraint con "
                     "JOIN pg_class rel ON rel.oid = con.conrelid "
-                    "WHERE rel.relname = ANY(%s) AND con.conname ~ %s"
+                    "JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace "
+                    "WHERE nsp.nspname = %s AND rel.relname = ANY(%s) "
+                    "AND con.conname ~ %s"
                 ),
-                [tables, pattern],
+                [self._db.schema, tables, pattern],
                 silent=True,
             )
         ]
@@ -2036,9 +2083,9 @@ class PostgresTable(PostgresBase):
             for tbl, name in self._execute(
                 SQL(
                     "SELECT tablename, indexname FROM pg_indexes "
-                    "WHERE tablename = ANY(%s) AND indexname ~ %s"
+                    "WHERE schemaname = %s AND tablename = ANY(%s) AND indexname ~ %s"
                 ),
-                [tables, pattern],
+                [self._db.schema, tables, pattern],
                 silent=True,
             )
             if (tbl, name) not in found
@@ -2848,10 +2895,16 @@ class PostgresTable(PostgresBase):
     def max_id(self, table=None):
         """
         The largest id occurring in the given table.  Used in the random method.
+
+        Returns -1 for a table with no rows, which is below every id psycodict
+        generates; callers distinguishing "empty" from "has rows" must test
+        ``< 0`` rather than ``< 1``, since 0 is a legitimate id.
         """
         if table is None:
             table = self.search_table
-        res = self._execute(SQL("SELECT MAX(id) FROM {}".format(table))).fetchone()[0]
+        res = self._execute(
+            SQL("SELECT MAX(id) FROM {0}").format(Identifier(table))
+        ).fetchone()[0]
         if res is None:
             res = -1
         return res
@@ -2860,10 +2913,16 @@ class PostgresTable(PostgresBase):
     def min_id(self, table=None):
         """
         The smallest id occurring in the given table.  Used in the random method.
+
+        Returns 0 for a table with no rows.  Unlike :meth:`max_id` that is not a
+        sentinel a caller can test for, since 0 is also a real id; pair it with
+        ``max_id() < 0`` to detect an empty table.
         """
         if table is None:
             table = self.search_table
-        res = self._execute(SQL("SELECT MIN(id) FROM {}".format(table))).fetchone()[0]
+        res = self._execute(
+            SQL("SELECT MIN(id) FROM {0}").format(Identifier(table))
+        ).fetchone()[0]
         if res is None:
             res = 0
         return res
@@ -2919,6 +2978,10 @@ class PostgresTable(PostgresBase):
                 if reindex:
                     self.restore_indexes()
                 self._break_stats()
+                # A bulk COPY can change the table's size and distribution
+                # enough that the planner's statistics no longer describe it,
+                # and the stats refresh below plans against them.
+                self._analyze([self.search_table])
                 if self.stats.saving and restat:
                     self.stats.refresh_stats(total=False)
                 self.stats._update_total(search_count)

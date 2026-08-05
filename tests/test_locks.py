@@ -12,8 +12,14 @@ import time
 
 import psycopg
 import pytest
+from psycopg.sql import SQL, Identifier
 
 from psycodict.utils import LockError
+
+
+# A schema of its own, so that the same table name can exist twice in the
+# cluster while these tests run.
+LOCK_OTHER = "psycodict_lock_other"
 
 
 def raw_connection():
@@ -149,6 +155,53 @@ def test_check_locks_warns_for_reload_when_table_locked(db, empty_table, capsys)
     finally:
         conn.rollback()
         conn.close()
+
+
+def test_locks_in_another_schema_are_not_this_schema_s(db, empty_table):
+    """
+    Lock discovery reports relation names, so it has to ask the server for the
+    locks in this database's schema.  Unfiltered, a lock on a same-named table
+    anywhere else in the cluster -- another schema, or another session's
+    temporary table -- was reported as a lock on this one, and refused a write
+    that nothing was blocking.
+    """
+    name = empty_table.search_table
+    db._execute(SQL("CREATE SCHEMA IF NOT EXISTS {0}").format(Identifier(LOCK_OTHER)))
+    db._execute(
+        SQL("CREATE TABLE IF NOT EXISTS {0}.{1} (id bigint)").format(
+            Identifier(LOCK_OTHER), Identifier(name)
+        )
+    )
+    holder = raw_connection()
+    try:
+        holder.execute(
+            SQL("LOCK TABLE {0}.{1} IN ACCESS EXCLUSIVE MODE").format(
+                Identifier(LOCK_OTHER), Identifier(name)
+            )
+        )
+        # the lock is real, and held by somebody else ...
+        assert any(
+            row[1] == "AccessExclusiveLock" and row[2] == holder.info.backend_pid
+            for row in db._execute(
+                SQL(
+                    "SELECT t.relname, l.mode, l.pid FROM pg_locks l "
+                    "JOIN pg_stat_all_tables t ON l.relation = t.relid "
+                    "WHERE l.granted AND t.schemaname = %s AND t.relname = %s"
+                ),
+                [LOCK_OTHER, name],
+            )
+        )
+        # ... but it is not a lock on this schema's table of that name
+        assert db._table_locked(name, "all") == []
+        assert empty_table._table_locked(name, "all") == []
+        # so a write that would conflict with it goes ahead
+        empty_table._check_locks("insert_many")
+    finally:
+        holder.rollback()
+        holder.close()
+        db._execute(
+            SQL("DROP SCHEMA IF EXISTS {0} CASCADE").format(Identifier(LOCK_OTHER))
+        )
 
 
 def test_check_locks_reload_is_quiet_without_locks(empty_table, capsys):
