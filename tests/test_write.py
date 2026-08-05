@@ -147,10 +147,21 @@ def test_insert_many_bulk_restores_keys_indexes_and_data(empty_table):
 
 
 def test_insert_many_flags_do_not_change_the_result(empty_table):
-    empty_table.insert_many([sample_row(0)], reindex=True, resort=True, restat=False)
+    empty_table.insert_many([sample_row(0)], reindex=True, resort=False, restat=False)
     empty_table.insert_many([sample_row(1)], reindex=False, resort=False, restat=True)
     assert [rec["n"] for rec in _all_rows(empty_table)] == [0, 1]
     assert empty_table.search_table + "_pkey" in set(empty_table._list_built_indexes())
+
+
+def test_insert_many_rejects_resort(empty_table):
+    """
+    resort=True must not silently trigger a full rebuild from a row-level
+    write; it raises and points at the explicit resort().
+    """
+    with pytest.raises(ValueError, match="resort"):
+        empty_table.insert_many([sample_row(0)], resort=True)
+    # the write did not happen
+    assert _num_rows(empty_table) == 0
 
 
 def test_insert_many_updates_ids_but_not_values(empty_table):
@@ -213,9 +224,16 @@ def test_update_matching_no_rows_changes_nothing(filled_table):
 
 def test_update_flags_do_not_change_the_result(filled_table):
     filled_table.update({"n": 7}, {"label": "quiet"}, restat=False)
-    filled_table.update({"n": 8}, {"label": "sorted"}, resort=True)
+    filled_table.update({"n": 8}, {"label": "sorted"})
     assert filled_table.lucky({"n": 7}, projection="label") == "quiet"
     assert filled_table.lucky({"n": 8}, projection="label") == "sorted"
+
+
+def test_update_rejects_resort(filled_table):
+    with pytest.raises(ValueError, match="resort"):
+        filled_table.update({"n": 8}, {"label": "x"}, resort=True)
+    # the row is unchanged
+    assert filled_table.lucky({"n": 8}, projection="label") == "l8"
 
 
 def test_update_marks_the_table_out_of_order_and_stats_invalid(filled_table):
@@ -310,10 +328,11 @@ def test_copy_to_writes_name_and_type_header_lines(filled_table, tmp_path):
     searchfile = str(tmp_path / "search.txt")
     filled_table.copy_to(searchfile)
     lines = _read(searchfile).split("\n")
-    assert lines[0].split("|")[0] == "id"
-    assert set(lines[0].split("|")) == {"id"} | set(filled_table.search_cols)
-    assert lines[1].split("|")[0] == "bigint"
-    assert lines[2] == ""
+    assert lines[0] == "# psycodict-export-format: 1"
+    assert lines[1].split("|")[0] == "id"
+    assert set(lines[1].split("|")) == {"id"} | set(filled_table.search_cols)
+    assert lines[2].split("|")[0] == "bigint"
+    assert lines[3] == ""
 
 
 def test_copy_to_copy_from_roundtrip(filled_table, table_factory, tmp_path):
@@ -346,9 +365,10 @@ def test_copy_to_copy_from_respect_a_custom_null_marker(table_factory, tmp_path)
     searchfile = str(tmp_path / "search.txt")
     source.copy_to(searchfile, null="NULL")
     lines = _read(searchfile).split("\n")
-    header = lines[0].split("|")
+    assert lines[0] == "# psycodict-export-format: 1"
+    header = lines[1].split("|")
     data = {}
-    for line in lines[3:]:
+    for line in lines[4:]:
         if line:
             rec = dict(zip(header, line.split("|")))
             data[rec["n"]] = rec["label"]
@@ -393,8 +413,9 @@ def test_copy_to_with_columns_exports_only_those_columns(filled_table, tmp_path)
     searchfile = str(tmp_path / "search.txt")
     filled_table.copy_to(searchfile, columns=["n", "label"])
     lines = _read(searchfile).split("\n")
-    assert lines[0] == "id|label|n"
-    assert lines[3] == "0|l0|0"
+    assert lines[0] == "# psycodict-export-format: 1"
+    assert lines[1] == "id|label|n"
+    assert lines[4] == "0|l0|0"
 
 
 def test_copy_to_rejects_an_unknown_column(filled_table, tmp_path):
@@ -405,7 +426,7 @@ def test_copy_to_rejects_an_unknown_column(filled_table, tmp_path):
 def test_copy_from_a_file_without_ids_assigns_them(filled_table, table_factory, tmp_path):
     searchfile = str(tmp_path / "search.txt")
     filled_table.copy_to(searchfile, include_id=False)
-    assert "id" not in _read(searchfile).split("\n")[0].split("|")
+    assert "id" not in _read(searchfile).split("\n")[1].split("|")
     target = table_factory()
     target.copy_from(searchfile)
     assert [rec["id"] for rec in _all_rows(target)] == list(range(200))
@@ -559,11 +580,6 @@ def test_reload_resort_rejects_a_malformed_metafile(filled_table, tmp_path):
 ##################################################################
 
 
-def test_resort_is_a_disabled_noop(filled_table):
-    # resort() is deliberately short circuited in table.py: resorting without a
-    # reload makes replication stall.
-    assert filled_table.resort() is None
-    assert [rec["n"] for rec in _all_rows(filled_table)][:5] == [0, 1, 2, 3, 4]
 
 
 def test_rewrite_applies_the_function_to_every_row(filled_table):
@@ -630,11 +646,6 @@ def test_drop_column_validates_its_argument(filled_table):
     assert "n" in filled_table.search_cols
     with pytest.raises(ValueError):
         filled_table.drop_column("nosuchcol", force=True)
-
-
-def test_finalize_changes_is_a_noop(filled_table):
-    assert filled_table.finalize_changes() is None
-    assert _num_rows(filled_table) == 200
 
 
 ##################################################################

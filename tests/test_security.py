@@ -419,7 +419,12 @@ def test_reload_all_with_adjust_schema_rejects_an_injected_header_type(db, fille
     metafile.write_text(metafile.read_text().replace(old_name, new_name, 1))
     searchfile = folder / (new_name + ".txt")
     lines = searchfile.read_text().split("\n")
-    lines[1] = lines[1].replace("text", injected("text", marker), 1)
+    # locate the types line rather than hard-coding an offset: a file now
+    # begins with the export-format marker, so it is no longer line 1
+    types_idx = next(
+        i for i, line in enumerate(lines) if "text" in line.split("|")
+    )
+    lines[types_idx] = lines[types_idx].replace("text", injected("text", marker), 1)
     searchfile.write_text("\n".join(lines))
 
     with pytest.raises(InvalidColumnTypeError):

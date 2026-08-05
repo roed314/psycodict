@@ -21,10 +21,13 @@ migration note.
 - **Ported from psycopg2 to psycopg 3.** psycodict no longer depends on
   psycopg2, and it re-exports `SQL`, `Identifier`, `Placeholder`, `Literal`,
   `Composable` and `Composed` from `psycodict` so callers need not import a
-  driver directly. *Migration:* install with the `pgbinary` or `pgsource` extra
-  (`pip install "psycodict[pgbinary]"`; psycopg 3.2.4 or newer -- the
+  driver directly. *Migration:* psycopg is a plain dependency, so
+  `pip install psycodict` brings the pure-Python driver for your system
+  `libpq`; add the `pgbinary` extra for the bundled binary build
+  (`pip install "psycodict[pgbinary]"`) or `pgc` for a locally compiled one.
+  The supported range is psycopg 3.x, version 3.2.4 or later -- the
   notification listener relies on psycopg 3.2 APIs and on 3.2.4's
-  notification-delivery fix), and import the SQL composition classes
+  notification-delivery fix. Import the SQL composition classes
   from `psycodict` rather than `psycopg2.sql`. (#88)
 - **The old `join_search` method is removed.** *Migration:* pass `join=` to
   `search` (or `count` / `lucky`) instead; see the joins section of
@@ -52,7 +55,7 @@ migration note.
   *Migration:* pass `include_nones=False` at `create_table` to keep the old
   behavior of omitting `None`-valued keys from result dictionaries. (#103)
 - **Metadata format 1.** The layout of the `meta_*` tables is now versioned
-  (format 0 is the unstamped 0.x baseline; format 1, aligned with this major
+  (format 0 is the unstamped 0.x baseline; format 1, which arrives with this
   release, adds `meta_indexes.whereclause`), stamped in the new `meta_format`
   table and checked on connect.  A format-0 database keeps working — every
   connection warns and operates at the old format, with the format-1 features
@@ -338,6 +341,156 @@ hardening standalone use; the highlights:
   the distributions, checks their metadata and uploads to PyPI via OpenID
   Connect — no long-lived token is stored anywhere. (#113)
 - `CITATION.cff`, so GitHub renders a citation for the package. (#124)
+
+### Fixed after the first release candidates
+
+- **`max_id` and `min_id` compose the table name they are given.** Both took a
+  `table=` argument and formatted it into the statement as text, so a name
+  needing quotes was a syntax error and a name carrying its own statement ran
+  it. Both now use `Identifier`. `max_id` returns -1 for an empty table, which
+  is the only empty sentinel: 0 is a real id, and `random()` treated a table
+  whose single row had id 0 as empty.
+- **Approximate statistics are scaled by the table they describe.**
+  `_approx_most_common` took `reltuples` from a hard-coded `public.nf_fields`
+  while taking frequencies from the real table, so on every other table the
+  estimate was that table's frequencies multiplied by an unrelated row count.
+  The column type it interpolates now goes through the validated
+  `column_type_sql`.
+- **`update_from_file` no longer shares log state between calls.** Its
+  `logging` default was a dictionary literal that the method wrote `logid` and
+  `aborted` into, so consecutive default calls saw each other's values and a
+  caller-supplied dictionary came back modified. The default is now `None` and
+  the mapping is copied per call.
+- **Random selection edge cases.** `random(query, pick_first=...)` returned
+  `None` rather than raising `IndexError` when nothing satisfies the query; a
+  projected value of `0`, `False`, `""` or `[]` counts as a result instead of
+  being skipped until `maxtries` ran out; `random_sample` raises `ValueError`
+  naming the accepted modes instead of silently returning `None` for an
+  unknown one; and a repeatable `choice` sample uses a local
+  `random.Random(seed)` rather than reseeding the process-wide generator.
+
+- **`stats_valid` is enforced, not just recorded.** Write paths cleared the
+  flag but read paths ignored it, so a count cached before a `restat=False`
+  write kept being served afterwards -- verified: a query counted at 67, then
+  every matching row changed, still answered 67. Every lookup that would serve
+  a cached answer now goes through one predicate and reports a miss while the
+  flag is false: `quick_count`, `quick_count_distinct` and `_quick_statistic`,
+  which is what makes `count`, `max`, `min` and `sum` compute the answer
+  instead of returning a recorded one. The line is whether a miss costs one
+  bounded query or a rebuild, so these are deliberately not gated: the
+  empty-query `total`, maintained on every write and so exact; the `_status` /
+  `status` / `extra_counts` inventory, which is how `refresh_stats` discovers
+  what to recompute; `_has_stats` / `_has_numstats`, which decide whether a
+  whole statistics family needs computing; and `null_counts`, whose fallback
+  is one full count *per search column*. Gating that last group made
+  `column_counts`, `numstats` and `null_counts` rebuild on every call with
+  nothing to converge on, since only `refresh_stats` restores the flag --
+  measured on the LMFDB, four minutes of downstream suite became over
+  forty-five. **The gap that leaves:** `column_counts`, `numstats` and
+  `null_counts` can still report a value recorded before an unrefreshed
+  write.
+  Closing it needs freshness per statistic rather than one flag per table,
+  which is a metadata format change; `refresh_stats()` is the remedy
+  meanwhile. A suffixed (`_tmp`, `_oldN`) table is not gated by the live
+  table's flag, since it carries its own caches. The flag is restored only by
+  `refresh_stats()`, inside the transaction that rebuilt the caches, so a
+  failed refresh leaves the table invalid; refreshing a `_tmp` copy does not
+  validate the live table.
+- **Bulk paths run `ANALYZE`.** A relation that has just been bulk loaded has
+  no planner statistics until autovacuum reaches it, so queries against it are
+  costed as though it were tiny. Replacement tables are analyzed while still
+  named `_tmp` -- before the swap, and outside its transaction, since the
+  catalog entry follows the relation through the rename -- which covers
+  `reload`, `rewrite`, non-inplace `update_from_file` and staged commits
+  through the one helper they share; `copy_from` analyzes the live table it
+  loaded into.
+
+- **A database operates in exactly one schema.** `PostgresDatabase` takes a
+  `schema=` argument (default `"public"`, so nothing changes for existing
+  deployments), validates it as an identifier, and pins `search_path` to it on
+  the first connection and on every replacement. Catalog inspection was
+  previously a mixture of hard-coded `'public'` and no filter at all -- 30-odd
+  queries across `pg_tables`, `pg_indexes`, `pg_class`, `pg_constraint` and
+  `information_schema` -- so with two schemas holding a relation of the same
+  name, column discovery could mix their columns, an index or constraint in
+  the other schema counted as present, and `_all_tablenames` listed the name
+  twice. Every one is now filtered to the selected schema, which is bound as a
+  value rather than interpolated. *Migration:* none unless you were relying on
+  psycodict seeing relations outside `public`, which it did only by accident.
+
+- **`resort()` rebuilds and swaps instead of renumbering in place.** It was a
+  disabled no-op (the in-place `UPDATE` of every id stalled replication and left
+  the rows in their old physical order, defeating the point of id-ordering).
+  It now dumps the table, loads it into a fresh table whose ids are assigned
+  `1..N` in sort order, and swaps it in through `reload`'s machinery -- primary
+  key, indexes, constraints, grants and counts/stats companions rebuilt,
+  `ANALYZE` run, previous table kept as an `_oldN` backup. **The ids change.**
+  A table already ordered reports nothing to do unless `force=True`.
+- **Row-level writes no longer resort.** `resort=True` on `insert_many`,
+  `update`, `copy_from` or an in-place `update_from_file` now raises and points
+  at `resort()`, so a small write cannot silently trigger a full-table rebuild;
+  `resort=False` is unaffected. `reload`, `rewrite` and a non-inplace
+  `update_from_file` still establish order as part of the replacement they were
+  already building. *Migration:* drop `resort=True` from row-level calls and
+  call `table.resort()` in a maintenance window instead.
+- **`finalize_changes()` is removed.** It was a documented public no-op; the
+  supported write methods already leave `total`, the order flag and
+  `stats_valid` correct when they return.
+- **`resort=False` no longer suppresses the order bookkeeping.** Whether an
+  update can move the id order is now decided from the file's columns rather
+  than from the `resort` option, so an `update_from_file` or `rewrite` that
+  touches a sort column marks the table `out_of_order` even when it was told
+  not to rebuild — on the in-place path, on the replacement path, and through a
+  staged commit. Previously such a write could leave `out_of_order = false`
+  standing, an assertion search code is allowed to act on by replacing
+  `ORDER BY <sort>` with `ORDER BY id`. *Migration:* none; run `resort()` on
+  tables the audit below reports as `MISMATCH`.
+- **Every write that does not rebuild the caches clears `stats_valid`.**
+  `update_from_file`, `rewrite` and `reload` with `restat=False` (and any
+  replacement that installs cloned, partial or untouched counts and stats
+  beside changed data) now mark the table invalid, in the same transaction as
+  the swap. A `metafile` no longer installs a `stats_valid = true` describing
+  the database it was exported from. Without this a count cached before such a
+  write was still served afterwards, defeating the enforcement above. The rule
+  is deliberately conservative in one place: `resort()` leaves the rows
+  unchanged, so the caches would still be accurate, but on a table without
+  `saving` nothing rebuilds them and it ends invalid. *Migration:* run
+  `refresh_stats()` after a `resort()` on such a table.
+- **`scripts/audit_id_order.py`**, a read-only check that streams each
+  `id_ordered` table in sort order and reports whether its ids actually
+  increase, since the flag can drift. Each table is audited in a read
+  transaction of its own, so one table's error does not poison the rest of the
+  run, and `id_ordered` with no configured sort is reported as an error rather
+  than trivially passing.
+
+- **psycopg is a plain dependency.** `pip install psycodict` now installs a
+  working package (pure-Python psycopg using the system `libpq`); `pgbinary`
+  adds the bundled binary build and `pgc` a locally compiled one. The
+  `pgsource` extra is removed -- plain install replaces it -- and a `<4` ceiling
+  keeps an unreviewed future driver major out of a 1.x environment. *Migration:*
+  replace `psycodict[pgsource]` with plain `psycodict`; `psycodict[pgbinary]` is
+  unchanged.
+- **Search-data export files carry an optional format marker.** A file written
+  by `copy_to`/`rewrite` now begins with `# psycodict-export-format: 1`; a file
+  without one is format 0, so every older export still loads, and a reader
+  refuses a version it does not understand before loading any data. This is the
+  data-file format, distinct from the `meta_*` metadata format. Versioning.md
+  states the realistic compatibility promise (newer readers read older files,
+  not necessarily the reverse) and decouples both format numbers from the
+  package major version.
+- **Generic defaults instead of LMFDB ones.** The default database name is
+  `postgres` rather than `lmfdb` -- the maintenance database conventionally
+  created with a PostgreSQL cluster, so the one most likely to exist. (Note
+  that it is not libpq's own default, which is the connection user name.)
+  Deployments name their own database in the config or constructor, as LMFDB
+  already does. The unused `secretsfile` argument to `PostgresDatabase` is
+  removed (secrets-file resolution lives in `Configuration`).
+- **Packaging.** The source distribution is complete -- tests including
+  `conftest.py`, the maintenance scripts, the guides and metadata files -- and
+  CI unpacks it and runs its database-free tests, so a missing file fails the
+  build. The release workflow's actions are pinned to commit SHAs, and the
+  install smoke tests assert `importlib.metadata.version == __version__` and run
+  `pip check` for both a plain and a binary-extra install.
 
 ### Release candidates
 

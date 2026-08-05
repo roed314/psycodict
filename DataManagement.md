@@ -47,7 +47,7 @@ Renaming a table renames its indexes and constraints with it, by substituting th
  * **the `id` column** is added automatically as a `bigint` primary key unless you already list one; use `id_type=` to choose a different integer type.  Columns are physically laid out ordered by type (widest alignment first) for storage efficiency, so the on-disk column order is not your declaration order — but every file operation is header-driven, so this never matters to you.
  * **`label_col`** names the column used by `lookup`; it must be one of the search columns, or `None`.
  * **`sort`** is the default sort order: a list of column names or `(column, 1|-1)` pairs.
- * **`id_ordered`** defaults to `True` when `sort` is given, `False` otherwise.  It records the intent that, in production, the `id` column runs in the same order as `sort` (which lets some range queries use the primary-key index).  It does **not** sort anything now; see [resorting is disabled](#resorting-is-disabled).
+ * **`id_ordered`** defaults to `True` when `sort` is given, `False` otherwise.  It records the intent that, in production, the `id` column runs in the same order as `sort` (which lets some range queries use the primary-key index).  See [resorting](#resorting).
 
 The most common Postgres types are `smallint`/`integer`/`bigint`, `numeric` (exact), `real`/`double precision`, `text`, `boolean`, `jsonb`, `timestamp`, and the array forms (`integer[]`, `numeric[]`, ...).
 
@@ -64,10 +64,18 @@ Copies the column layout, `label_col`, `sort`, `id_ordered`, `id` type and descr
 
 psycodict keeps its own bookkeeping in a handful of tables that live alongside your search tables:
 
+psycodict operates in one PostgreSQL schema, `public` unless the constructor is
+given another (`PostgresDatabase(schema="myschema")`).  Every relation it
+creates goes there, every relation it looks for is looked for there, and every
+catalog query is filtered to it, so a relation of the same name in another
+schema is neither mistaken for one of these nor merged with it.  The schema is
+pinned in each connection's `search_path`, including replacement connections
+after a reconnect.
+
  * **`meta_tables`** — one row per search table, holding `name`, `sort`, `count_cutoff`, `id_ordered`, `out_of_order`, `stats_valid`, `label_col`, `total`, `important` and `include_nones`.  This is the source of truth psycodict reads on connection to reconstruct each table object.
  * **`meta_indexes`** and **`meta_constraints`** — one row per index / constraint, recording how to rebuild it.  `reload` and `restore_indexes` rebuild from these rows, **not** from whatever is physically on the table (see [reload](#reload)).
  * **`meta_tables_hist`**, **`meta_indexes_hist`**, **`meta_constraints_hist`** — versioned history of the three tables above, so that `reload_meta`/`revert_meta` can roll a table's metadata forward and back.
- * **`meta_format`** — a single-row `(version, min_compat)` stamp of the metadata *format*: the layout of the `meta_*` tables, versioned by an integer aligned with psycodict's major version (`META_FORMAT`).  Every connection checks it.  The same format connects silently; an older but compatible format connects with a warning and operates at that older format (newer features unavailable) so a not-yet-migrated or read-only database — the LMFDB devmirror, say — keeps working; a newer format connects when its stamped `min_compat` admits this psycodict, and is otherwise refused.  A database that has meta tables but no `meta_format` is the unstamped 0.x baseline (format 0); one with no meta tables at all is fresh and must be connected to with `PostgresDatabase(create=True)`, which bootstraps all of the above.  Migrating to a newer format is deliberate — `db.upgrade_metadata()` or `PostgresDatabase(upgrade=True)`, never a side effect of connecting.  See [MetadataFormats.md](MetadataFormats.md) for the full policy (including why a pre-1.0 psycodict must not be pointed at a migrated database).
+ * **`meta_format`** — a single-row `(version, min_compat)` stamp of the metadata *format*: the layout of the `meta_*` tables, versioned by an integer of its own (`META_FORMAT`), independent of psycodict's major version.  Every connection checks it.  The same format connects silently; an older but compatible format connects with a warning and operates at that older format (newer features unavailable) so a not-yet-migrated or read-only database — the LMFDB devmirror, say — keeps working; a newer format connects when its stamped `min_compat` admits this psycodict, and is otherwise refused.  A database that has meta tables but no `meta_format` is the unstamped 0.x baseline (format 0); one with no meta tables at all is fresh and must be connected to with `PostgresDatabase(create=True)`, which bootstraps all of the above.  Migrating to a newer format is deliberate — `db.upgrade_metadata()` or `PostgresDatabase(upgrade=True)`, never a side effect of connecting.  See [MetadataFormats.md](MetadataFormats.md) for the full policy (including why a pre-1.0 psycodict must not be pointed at a migrated database).
 
 Rows of `meta_indexes` and `meta_constraints` become DDL when an index or
 constraint is rebuilt, so psycodict validates them both when they are imported
@@ -108,11 +116,97 @@ These mutate the live table directly.  They are convenient for small edits; for 
  * **`update(query, changes, resort=False, restat=True)`** — a plain SQL `UPDATE` of every row matching `query`; `changes` maps column names to constants.
  * **`delete(query, restat=True)`** — deletes every row matching `query` and decrements `total`.
 
-**Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call; otherwise they are simply marked invalid.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.
+**Statistics invalidation.**  Any write that can change the data calls `_break_stats`, which sets `meta_tables.stats_valid = false` so that cached statistics are known to be stale.  If the table has `saving` on and you left `restat=True`, statistics are refreshed at the end of the call; otherwise they are simply marked invalid.
 
-### Resorting is disabled
+`stats_valid` is enforced rather than merely recorded: while it is false, a
+cached nonempty-query count, distinct count, minimum, maximum or sum reports a
+miss, and the method computes the answer instead of returning the stored one.
+The empty-query `total` is the exception, since it is maintained on every write
+and so stays exact.
 
-`resort()` is a **no-op on this branch**: it prints `resorting disabled` and returns `None` without touching the table.  In-place resorting was found to stall replication and to not persist correctly on disk, and since the tables are effectively read-only in production the supported way to renumber ids is to dump the data in sorted order and `reload` it.  Consequently the `resort=` keyword on `insert_many`, `update`, `copy_from`, `reload` and `update_from_file` currently does nothing.
+`column_counts`, `numstats` and `null_counts` are the other exception, and a
+caveat worth knowing.  The line is what a cache miss costs: the counts above
+fall back to a single statement about the rows in question, while these fall
+back to rebuilding a whole statistics family, or to one full count per search
+column.  Making them miss while the table is invalid would rebuild on every
+call and never converge, since only `refresh_stats()` restores the flag, so
+they read what is recorded.  A value recorded before an unrefreshed write is
+therefore still reported by them; run `refresh_stats()` after a write you did
+not `restat`.  The flag goes back to true only in `refresh_stats()`, inside
+the transaction that rebuilt the caches, so a refresh that fails part-way leaves
+the table marked invalid rather than claiming a cache it does not have.
+Refreshing a `_tmp` copy does not validate the live table.
+
+The replacement paths — `reload`, `rewrite`, a non-inplace `update_from_file`,
+and the staged swap — decide the flag in one place, in the same transaction as
+the swap.  The table ends up valid only when the counts and stats that go live
+were built from the data that goes live with them: either recomputed here
+(`restat`, on a table with `saving` on) or supplied whole by the export
+(`reload` given **both** `countsfile` and `statsfile`).  Anything else — a
+`restat=False` write, a partial cache set, companions that were merely cloned
+or left in place beside replaced rows — is marked invalid.  A `metafile`
+carries a `stats_valid` of its own describing the database it was exported
+from; it does not vouch for caches the reload did not install, and is
+overridden to false with a message when it disagrees.
+
+Bulk paths also run PostgreSQL's own `ANALYZE`, which is a different thing from
+psycodict's statistics: a freshly loaded relation has no planner statistics
+until autovacuum reaches it.  Replacement tables are analyzed while still named
+`_tmp`, before the swap, since the catalog entry follows the relation through
+the rename; `copy_from` analyzes the live table it loaded into.  Inserting rows (and updating a sort-key column) also calls `_break_order`, setting `out_of_order = true` to record that the `id` order no longer matches `sort`; `delete` leaves the order flag alone.  `resort()` (or a rebuild through `reload`/`rewrite`) sets it back to `false`.
+
+### Resorting
+
+`table.resort()` rebuilds the table so that ascending `id` matches the
+configured sort, laying the rows out on disk in that order.  It is a full-table
+operation: the data is dumped, loaded into a fresh table whose ids are assigned
+`1..N` in sort order, and swapped into place through the same machinery `reload`
+uses, so the primary key, indexes, constraints, grants and counts/stats
+companions are rebuilt, `ANALYZE` is run, and the previous table is kept as a
+`name_old<n>` backup.  **The ids change** — anything outside psycodict that
+stored them as durable identifiers must be updated — and the operation needs
+temporary disk space for the replacement, its indexes, the dump and the backup.
+By default a table already marked ordered reports that there is nothing to do;
+pass `force=True` to rebuild anyway.
+
+The earlier in-place implementation renumbered every id with an `UPDATE`, which
+stalled replication and left the rows in their old physical order (defeating the
+point of id-ordering); it was disabled, and is now replaced by this rebuild.
+
+Because a resort is expensive, it is no longer a side effect of a small write.
+`resort=True` on `insert_many`, `update`, `copy_from` or an in-place
+`update_from_file` **raises**, pointing at `resort()`; `resort=False` (the
+default) is unaffected.  The replacement operations that rebuild the whole table
+anyway — `reload`, `rewrite`, and a non-inplace `update_from_file` — still
+establish id order as part of building the new table.  The workflow for a
+maintained table is therefore:
+
+```python
+table.update(...)          # marks out_of_order
+# later, in a maintenance window:
+table.resort()             # rebuild in sort order
+```
+
+`resort=False` says *do not rebuild*; it does not say the sort was left alone.
+Whether an update can move the ids is decided from the file — does it carry a
+sort column? — independently of the option, so a write that touches one always
+records `out_of_order = true`, on the in-place path and on the replacement path
+alike.  A `rewrite` runs an arbitrary function and dumps every search column, so
+one that is not rebuilt always marks the table out of order; there is no way to
+tell that it did not move a sort key.  A staged write is not allowed to rebuild
+inside the staged context, but it carries that fact through the commit, so the
+swapped-in table is marked out of order and `resort()` afterwards puts it right.
+
+`scripts/audit_id_order.py` checks the flag against reality: it streams each
+`id_ordered` table in sort order and reports `OK`, `MISMATCH` or an error
+without modifying anything.  Each table is audited in a read transaction of its
+own, so one that errors does not affect the tables audited after it.  Use it
+before trusting `out_of_order = false` on a table whose history includes
+non-inplace updates, which could have left the flag stale.
+
+```bash
+python scripts/audit_id_order.py --all
+```
 
 ### Locking
 
@@ -131,8 +225,9 @@ This is the heart of psycodict.  The workflow is: `copy_to` a table (or the curr
 
 ### The file format
 
-A **search file** begins with three header lines followed by one line per row:
+A **search file** begins with an optional format marker, then three header lines, then one line per row:
 
+ 0. optionally, `# psycodict-export-format: N` — the file format version.  A file without this line is format 0, the historical layout, so every file psycodict has ever written still loads; new files psycodict writes carry the current version.  A reader refuses a file whose version it does not understand before loading any data.  This is the *file* format, distinct from the database *metadata* format of the `meta_*` tables (see MetadataFormats.md);
  1. the column names, separated by the delimiter (default `|`), with `id` first if present;
  2. the Postgres type of each column, in the same order;
  3. a blank line.
@@ -147,6 +242,7 @@ The reader (`_read_header_lines`/`_check_header_lines`) checks that these names 
 Here is a genuine two-row export (`db.demo_circles.copy_to("demo_circles.txt")`) of the table created above:
 
 ```
+# psycodict-export-format: 1
 id|center|label|props|radius
 bigint|integer[]|text|jsonb|integer
 
@@ -154,11 +250,11 @@ bigint|integer[]|text|jsonb|integer
 1|{3,4}|big|{"note": "3-4-5", "unit": false}|5
 ```
 
-Note the id column first, the `integer[]` written as `{0,0}`, the `jsonb` keys reordered by Postgres, and (had a value contained a `|`) it would be escaped as `\|`.
+Note the marker line, the id column first, the `integer[]` written as `{0,0}`, the `jsonb` keys reordered by Postgres, and (had a value contained a `|`) it would be escaped as `\|`.
 
 ### `copy_to` and `copy_from`
 
-**`copy_to(searchfile, countsfile=None, statsfile=None, indexesfile=None, constraintsfile=None, metafile=None, columns=None, query=None, include_id=True)`** exports via `COPY ... TO STDOUT`.  Only the *search* file gets the three header lines; the counts, stats, meta, index and constraint files are headerless raw rows (their column layout is fixed and known).  `query` restricts which rows are exported; `columns` restricts which columns.  The counts and stats files are written only if the table has `saving` on.
+**`copy_to(searchfile, countsfile=None, statsfile=None, indexesfile=None, constraintsfile=None, metafile=None, columns=None, query=None, include_id=True)`** exports via `COPY ... TO STDOUT`.  Only the *search* file gets the marker and the three header lines; the counts, stats, meta, index and constraint files are headerless raw rows (their column layout is fixed and known).  `query` restricts which rows are exported; `columns` restricts which columns.  The counts and stats files are written only if the table has `saving` on.
 
 **`copy_from(searchfile, resort=False, reindex=None, restat=True)`** streams a search file into the **existing** table via `COPY ... FROM STDIN`, *appending* rows.  It validates the header, and if the file has no `id` column it assigns ids contiguously starting just after the current maximum (using a temporary sequence).  `reindex` defaults to `True` for files with more than 1000 data rows.  `total` is incremented and statistics invalidated.
 

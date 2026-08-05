@@ -80,7 +80,7 @@ jobs:
       # supported pair, the newest pair, and the combination LMFDB actually
       # deploys.  Add a row here when a new PostgreSQL major is released.
       # The extra oldest-pair row pins psycopg to the declared minimum
-      # (pyproject's pgbinary/pgsource floor), so the floor stays honest.
+      # (pyproject's pgbinary floor), so the floor stays honest.
       matrix:
         include:
           - {python: "3.9", postgres: "13"}
@@ -162,7 +162,7 @@ jobs:
       # installed -- which made this check pass against a wheel with its
       # modules deleted.  Asserting where the import came from is what makes
       # the test about the wheel rather than about the source tree.
-      - name: Wheel installs and imports
+      - name: Wheel installs and imports with the binary extra
         run: |
           python -m venv "$RUNNER_TEMP/smoke"
           "$RUNNER_TEMP/smoke/bin/pip" install "$(echo "$PWD"/dist/*.whl)[pgbinary]"
@@ -178,32 +178,57 @@ jobs:
               "imported the checkout rather than the installed wheel: %s" % path
           )
           assert PostgresDatabase is not None and Json is not None
+          assert importlib.metadata.version("psycodict") == psycodict.__version__
           print("psycodict", importlib.metadata.version("psycodict"), "imports from", path)
           PY
+          "$RUNNER_TEMP/smoke/bin/pip" check
 
-      # psycopg is deliberately an optional dependency, so that users choose
-      # between the pure-Python and binary builds.  Importing without it must
-      # fail with the guidance in psycodict/__init__.py rather than a bare
-      # ImportError -- this asserts that contract holds.
-      - name: Import without psycopg gives a helpful message
+      # psycopg is a plain dependency now, so a bare ``pip install psycodict``
+      # already pulls the pure-Python driver: a plain install must import, not
+      # fail.  (A binary build is still available as the pgbinary extra above.)
+      - name: Wheel installs and imports without any extra
         run: |
-          python -m venv "$RUNNER_TEMP/bare"
-          "$RUNNER_TEMP/bare/bin/pip" install "$(echo "$PWD"/dist/*.whl)"
+          python -m venv "$RUNNER_TEMP/plain"
+          "$RUNNER_TEMP/plain/bin/pip" install "$(echo "$PWD"/dist/*.whl)"
           # Outside the checkout, for the same reason as the step above.
           cd "$RUNNER_TEMP"
-          set +e
-          output=$(bare/bin/python -c "import psycodict" 2>&1)
-          status=$?
-          set -e
-          echo "$output"
-          if [ $status -eq 0 ]; then
-            echo "::error::importing psycodict without psycopg should fail"
-            exit 1
-          fi
-          case "$output" in
-            *psycopg\[binary\]*) echo "helpful message present" ;;
-            *) echo "::error::missing the install-psycopg hint"; exit 1 ;;
-          esac
+          plain/bin/python - <<PY
+          import importlib.metadata, os
+          import psycodict
+          import psycopg
+          from psycodict.database import PostgresDatabase
+          path = os.path.realpath(psycodict.__file__)
+          checkout = os.path.realpath("$GITHUB_WORKSPACE")
+          assert not path.startswith(checkout + os.sep), (
+              "imported the checkout rather than the installed wheel: %s" % path
+          )
+          assert importlib.metadata.version("psycodict") == psycodict.__version__
+          print("plain install imports psycodict", psycodict.__version__,
+                "with psycopg", psycopg.__version__)
+          PY
+          "$RUNNER_TEMP/plain/bin/pip" check
+
+      # The sdist is meant to be a complete, testable checkout: unpack it away
+      # from the repository and run the database-free tests from the unpacked
+      # source, which fails if conftest.py or any fixture the sdist needs was
+      # left out (as it was before MANIFEST.in listed them).
+      - name: Sdist unpacks and its tests run
+        run: |
+          mkdir -p "$RUNNER_TEMP/sdist" && tar xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist"
+          src="$(echo "$RUNNER_TEMP"/sdist/psycodict-*)"
+          # Files the sdist must carry that no test would miss: name them, so
+          # dropping one fails here instead of shipping.
+          for f in config.ini.example CHANGELOG.md CONTRIBUTING.md SECURITY.md \
+                   CITATION.cff DataManagement.md MetadataFormats.md \
+                   QueryLanguage.md Searching.md Versioning.md \
+                   tests/conftest.py; do
+            test -f "$src/$f" || { echo "sdist is missing $f"; exit 1; }
+          done
+          python -m venv "$RUNNER_TEMP/sdist-venv"
+          "$RUNNER_TEMP/sdist-venv/bin/pip" install "${src}[pgbinary,test]"
+          cd "$src"
+          "$RUNNER_TEMP/sdist-venv/bin/python" -m pytest \
+            tests/test_encoding.py tests/test_utils.py tests/test_config.py -q
 
       - uses: actions/upload-artifact@v7
         with:

@@ -23,9 +23,14 @@ metadata tables living inside your database.
    Identifier, ...`).  Downstream code should import these from `psycodict`
    rather than from the driver; the re-export point is the stable name.
  * **The export file format** written by `copy_to` and read by `copy_from` /
-   `reload` (three header lines, `|` delimiter, `\N` nulls — see
-   [DataManagement.md](DataManagement.md)): files written by one 1.x release
-   can be loaded by any other.
+   `reload` (see [DataManagement.md](DataManagement.md)).  A file may begin with
+   a `# psycodict-export-format: N` marker, and a file without one is format 0,
+   the historical layout.  A **newer** 1.x reader reads files written by an
+   earlier 1.x release; an **older** reader is not guaranteed to understand a
+   file a newer release wrote (it may carry a format the older reader predates),
+   and a reader refuses a marked file whose version it does not understand
+   rather than mis-loading it.  An incompatible change to the file format
+   requires a new major version.
  * **The `meta_*` tables**, whose layout is governed by the metadata format
    protocol below.
 
@@ -44,9 +49,12 @@ number stored in each database (`meta_format`, with a `min_compat` column
 declaring the oldest client format the database still admits); the protocol —
 including how clients degrade gracefully against older databases and when a
 migration is required — is specified in
-[MetadataFormats.md](MetadataFormats.md).  The format number is bumped only at
-major releases, so within 1.x a database migrated once is understood by every
-client.
+[MetadataFormats.md](MetadataFormats.md).  The metadata format number and the
+export file format number are protocol revisions in their own right, not the
+package major version: a compatible, additive revision may ship in a minor
+release while keeping `min_compat` low enough for existing clients.  What
+requires a new major version is a change that raises `min_compat` past an
+earlier 1.x client, or otherwise makes that client unsafe.
 
 ## Deprecation policy
 

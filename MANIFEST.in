@@ -1,0 +1,37 @@
+# What goes into the source distribution beyond the package itself.
+#
+# setuptools already ships the psycodict/ package, README.md, LICENSE and
+# pyproject.toml.  The sdist is also meant to be a complete, testable checkout:
+# the whole test suite (conftest.py included -- without it the shipped tests do
+# not run), the maintenance scripts, the narrative guides the docs are built
+# from, and the project metadata files.
+
+# The test suite, in full.  conftest.py holds the fixtures every test uses.
+graft tests
+include tests/conftest.py
+
+# Read-only maintenance scripts (e.g. the id-order audit).
+graft scripts
+
+# The narrative guides (also the sources the Sphinx docs include) and the
+# project metadata.
+include *.md
+include CITATION.cff
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+
+# The configuration example the guides tell users to copy to config.ini.  It is
+# named here rather than left to setuptools' implicit list, which does not
+# cover it.  (The remaining tracked files at the top level are either included
+# by setuptools itself -- LICENSE, README.md, pyproject.toml, MANIFEST.in -- or
+# development-only: .gitignore and .readthedocs.yaml.)
+include config.ini.example
+
+# The documentation sources, so the sdist can rebuild the docs.
+graft docs
+prune docs/_build
+
+# Housekeeping: no caches or compiled files in the archive.
+global-exclude __pycache__
+global-exclude *.py[cod]
