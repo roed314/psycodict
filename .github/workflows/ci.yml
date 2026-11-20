@@ -49,11 +49,16 @@ jobs:
 
   unit:
     name: Unit (py${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
         python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        # setup-python has no 3.9 build for Ubuntu 26.04, which ubuntu-latest
+        # now resolves to, so the 3.9 jobs here and in `database` stay on
+        # 24.04 for as long as 3.9 is supported.
+        include:
+          - {python: "3.9", runner: ubuntu-24.04}
     steps:
       - uses: actions/checkout@v7
 
@@ -73,7 +78,7 @@ jobs:
 
   database:
     name: PostgreSQL ${{ matrix.postgres }} (py${{ matrix.python }}${{ matrix.psycopg && format(', psycopg {0}', matrix.psycopg) || '' }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       # Rather than the full cross product, pin the corners: the oldest
@@ -83,8 +88,8 @@ jobs:
       # (pyproject's pgbinary/pgsource floor), so the floor stays honest.
       matrix:
         include:
-          - {python: "3.9", postgres: "13"}
-          - {python: "3.9", postgres: "13", psycopg: "3.2.4"}
+          - {python: "3.9", postgres: "13", runner: ubuntu-24.04}
+          - {python: "3.9", postgres: "13", psycopg: "3.2.4", runner: ubuntu-24.04}
           - {python: "3.11", postgres: "15"}
           - {python: "3.12", postgres: "16"}
           - {python: "3.13", postgres: "17"}
