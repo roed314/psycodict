@@ -2368,6 +2368,12 @@ class PostgresTable(PostgresBase):
         The grant policy is reapplied to both relations afterwards: PostgreSQL
         privileges follow a relation through a rename, so without that the
         restored table would come back with its backup's privileges.
+
+        The total in ``meta_tables`` is recounted, and this table object (and
+        the one the database holds, if different) is refreshed in place to the
+        restored table's columns and total.  The refresh happens before an
+        enclosing ``DelayCommit`` commits, so a caller that rolls back must
+        refresh again, as ``reload_all_revert`` does.
         """
         if self._table_exists(self.search_table + "_tmp"):
             print(
@@ -2395,7 +2401,15 @@ class PostgresTable(PostgresBase):
             # so both are told again what they are -- inside this DelayCommit,
             # with the renames.
             self._apply_post_swap_grant_policies(tables, old)
+            # As in reload_final_swap: the restored table's row count and
+            # columns need not match those of the table swapped away.
+            self.stats._set_total(self.stats._slow_count({}, record=False))
+            self._db._notify_schema_change(self.search_table)
             self._log_db_change("reload_revert")
+        self._refresh()
+        registered = self._db.tables.get(self.search_table)
+        if registered is not None and registered is not self:
+            registered._refresh()
         print(
             "Swapped backup %s with %s"
             % (self.search_table, "{0}_old{1}".format(self.search_table, backup_number))

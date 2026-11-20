@@ -2289,18 +2289,30 @@ SELECT table_name, row_estimate, total_bytes, index_bytes, toast_bytes,
         - ``data_folder`` -- the folder used in ``reload_all``;
             determines which tables
             were modified.
+
+        The reverts share one transaction, so if one fails none takes effect,
+        and the table objects already reverted are refreshed to match.
         """
         data_folder = Path(data_folder)
 
         if not data_folder.is_dir():
             raise ValueError("The path {} is not a directory".format(data_folder))
 
-        with DelayCommit(self, silence=True):
-            for tablename in self.tablenames:
-                searchfile = data_folder / (tablename + ".txt")
-                if not searchfile.exists():
-                    continue
-                self[tablename].reload_revert()
+        attempted = []
+        try:
+            with DelayCommit(self, silence=True):
+                for tablename in self.tablenames:
+                    searchfile = data_folder / (tablename + ".txt")
+                    if not searchfile.exists():
+                        continue
+                    attempted.append(tablename)
+                    self[tablename].reload_revert()
+        except BaseException:
+            # reload_revert refreshes each object to its backup before the
+            # transaction commits; the rollback put the tables back.
+            for tablename in attempted:
+                self[tablename]._refresh()
+            raise
 
     def cleanup_all(self):
         """

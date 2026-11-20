@@ -183,7 +183,7 @@ Pass `final_swap=False` to build `name_tmp` without swapping (then finish later 
 
 ### Reverting and cleaning up
 
- * **`reload_revert(backup_number=None)`** swaps the live table with `name_old<n>` (the most recent backup by default); calling it twice returns you to where you started.  It refuses to run while a `name_tmp` table is still present — a sign a reload did not finish — and tells you to `drop_tmp` first.
+ * **`reload_revert(backup_number=None)`** swaps the live table with `name_old<n>` (the most recent backup by default); calling it twice returns you to where you started.  It recounts the total and refreshes the table object in place, so `count()` and the column list describe the restored table.  It refuses to run while a `name_tmp` table is still present — a sign a reload did not finish — and tells you to `drop_tmp` first.
  * **`drop_tmp()`** drops the `_tmp` tables left behind by an interrupted reload.
  * **`cleanup_from_reload(keep_old=0)`** drops the `_tmp` and all `_old*` backup tables (keeping the `keep_old` most recent, renumbered from 1).  Running this makes `reload_revert` impossible, so do it only once you are confident in the new data.
 

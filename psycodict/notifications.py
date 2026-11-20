@@ -36,7 +36,8 @@ prefers.
 **The schema channel contract.**  psycodict's schema-changing operations
 (:meth:`~psycodict.database.PostgresDatabase.create_table`, ``drop_table``,
 ``rename_table``, :meth:`~psycodict.table.PostgresTable.add_column`,
-``drop_column`` and the reload swap ``reload_final_swap``) each emit on the
+``drop_column``, the reload swap ``reload_final_swap`` and its undo
+``reload_revert``) each emit on the
 single channel named by :data:`SCHEMA_CHANNEL` (``"psycodict_schema"``).  The
 payload is *just the affected table's name*, as a plain string -- nothing else.
 Keeping the payload to a bare table name keeps the contract simple and easy to

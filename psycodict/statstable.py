@@ -340,17 +340,49 @@ class PostgresStatsTable(PostgresBase):
         ).format(Identifier(self.counts + suffix))
         cur = self._execute(selecter, [Json([None]), False])
         allcounts = {rec[0][0]: rec[1] for rec in cur}
-        for col in self.table.search_cols:
+        for col in self._suffix_cols(suffix):
             if col not in allcounts:
-                allcounts[col] = self._slow_count({col: None}, suffix=suffix, extra=False)
+                allcounts[col] = self._slow_null_count(col, suffix)
         return {col: cnt for col, cnt in allcounts.items() if cnt > 0}
 
     def refresh_null_counts(self, suffix=""):
         """
         Recomputes the counts of null values for all search columns
         """
-        for col in self.table.search_cols:
-            self._slow_count({col: None}, suffix=suffix, extra=False)
+        for col in self._suffix_cols(suffix):
+            self._slow_null_count(col, suffix)
+
+    def _suffix_cols(self, suffix=""):
+        """
+        The search columns of the table with ``suffix`` appended to its name.
+
+        A ``_tmp`` table built by ``reload(adjust_schema=True)`` takes its
+        columns from the file's header, so they can differ from the live ones.
+        """
+        if not suffix:
+            return self.table.search_cols
+        return self._column_types(self.search_table + suffix)[0]
+
+    def _replayable_cols(self, suffix=""):
+        """
+        The columns whose recorded statistics can be recomputed on the table
+        with ``suffix`` appended to its name: those it shares with the live
+        table, since queries are parsed against the live table's columns.
+        """
+        return set(self._suffix_cols(suffix)).intersection(self.table.search_cols)
+
+    def _slow_null_count(self, col, suffix=""):
+        """
+        ``_slow_count({col: None}, suffix=suffix, extra=False)``, for a column
+        that may exist only in the suffixed table.
+        """
+        selecter = SQL("SELECT COUNT(*) FROM {0} WHERE {1} IS NULL").format(
+            Identifier(self.search_table + suffix), Identifier(col)
+        )
+        nres = self._execute(selecter).fetchone()[0]
+        if self.saving:
+            self._record_count({col: None}, nres, suffix=suffix, extra=False)
+        return nres
 
     def _set_total(self, total, suffix=""):
         """
@@ -1819,13 +1851,14 @@ ORDER BY v.ord LIMIT %s"""
             self._execute(deleter.format(Identifier(self.counts + suffix)))
 
             # Regenerate stats and counts
+            available = self._replayable_cols(suffix)
             for cols, ccols, cvals, threshold in stat_cmds:
-                if any(col not in self.table.search_cols for col in cols + ccols):
+                if any(col not in available for col in cols + ccols):
                     # Column may have been deleted
                     continue
                 self.add_stats(cols, (ccols, cvals), threshold, suffix=suffix)
             for cols, ccols, cvals, threshold in split_cmds:
-                if any(col not in self.table.search_cols for col in cols + ccols):
+                if any(col not in available for col in cols + ccols):
                     # Column may have been deleted
                     continue
                 self.add_stats(cols, (ccols, cvals), threshold, split_list=True, suffix=suffix)
@@ -1834,7 +1867,7 @@ ORDER BY v.ord LIMIT %s"""
                 # read the ``cols`` left over from the loops above -- unbound
                 # when only numstats were recorded -- with the generator
                 # variable shadowing ``col``.
-                if any(c not in self.table.search_cols for c in [col] + grouping + ccols):
+                if any(c not in available for c in [col] + grouping + ccols):
                     # Column may have been deleted
                     continue
                 self.add_numstats(col, grouping, (ccols, cvals), threshold, suffix=suffix)
@@ -1917,8 +1950,9 @@ ORDER BY v.ord LIMIT %s"""
         - ``suffix`` -- A suffix (e.g. ``_tmp``) specifying where to
             perform and record the counts
         """
+        available = self._replayable_cols(suffix)
         for cols, values_list in col_value_dict.items():
-            if any(col not in self.table.search_cols for col in cols):
+            if any(col not in available for col in cols):
                 # Column could have been deleted
                 continue
             for values in values_list:
