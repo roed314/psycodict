@@ -160,6 +160,12 @@ hardening standalone use; the highlights:
   byte. (#116)
 - `postgresql_dbname` was the one option whose default ignored the `defaults`
   dictionary passed to `Configuration`. (#119)
+- `reload(adjust_schema=True)` from a file that drops a column no longer aborts
+  with `UndefinedColumn` when statistics are saved: the refresh on the `_tmp`
+  table uses that table's columns, so it also counts nulls in added columns.
+- `reload_revert` recounts the total and refreshes the table object, so
+  `count()` and the column list no longer describe the table swapped away; it
+  also notifies the schema channel, as the reload swap does.
 
 ### Security
 

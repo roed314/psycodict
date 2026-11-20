@@ -5,8 +5,9 @@ Tests for psycodict's LISTEN/NOTIFY support (``psycodict/notifications.py``).
 These exercise the two halves of the feature:
 
 * *emission* -- ``db.notify`` and the schema-change hooks on
-  ``create_table``/``drop_table``/``add_column``/``drop_column`` and the reload
-  swap, all of which send ``pg_notify`` transactionally on the main connection;
+  ``create_table``/``drop_table``/``add_column``/``drop_column``, the reload
+  swap and its revert, all of which send ``pg_notify`` transactionally on the
+  main connection;
 * *listening* -- a :class:`~psycodict.notifications.NotificationListener` with
   its own ``autocommit`` connection, collected through ``poll`` /``listen``.
 
@@ -193,6 +194,21 @@ def test_reload_swap_emits_exactly_once(notif_db, make_table, tmp_path):
         got = listener.poll(WAIT)
         # The reload rewrites _tmp tables and swaps them in with internal DDL,
         # but only the final swap announces the table -- exactly once.
+        extra = listener.poll(QUIET)
+    assert got == [(SCHEMA_CHANNEL, name)]
+    assert extra == []
+
+
+def test_reload_revert_emits_exactly_once(notif_db, make_table, tmp_path):
+    table = make_table()
+    name = table.search_table
+    table.insert_many([{"n": i, "label": "l%d" % i, "data": {"k": i}} for i in range(10)])
+    searchfile = str(tmp_path / "search.txt")
+    table.copy_to(searchfile)
+    notif_db[name].reload(searchfile)
+    with notif_db.listener() as listener:
+        notif_db[name].reload_revert()
+        got = listener.poll(WAIT)
         extra = listener.poll(QUIET)
     assert got == [(SCHEMA_CHANNEL, name)]
     assert extra == []

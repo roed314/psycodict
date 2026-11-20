@@ -13,6 +13,7 @@ no write path updates unless ``stats.saving`` is on; see
 """
 import pytest
 from psycopg import IntegrityError
+from psycopg.sql import SQL, Identifier
 
 from conftest import sample_row
 from psycodict.utils import DelayCommit
@@ -552,6 +553,134 @@ def test_reload_resort_rejects_a_malformed_metafile(filled_table, tmp_path):
         F.write("|".join(fields) + "\n")
     with pytest.raises(RuntimeError, match="different from 't' or 'f'"):
         filled_table.reload(searchfile, metafile=metafile, resort=True)
+
+
+def test_reload_revert_recounts_the_total(db, filled_table, tmp_path):
+    # Regression: reload_revert swapped the tables back without recounting,
+    # so count() kept answering with the swapped-away table's total.
+    name = filled_table.search_table
+    table, _ = _reload_from_snapshot(db, filled_table, tmp_path)
+    assert table.count() == 200
+    table.reload_revert()
+    assert table.count() == 100
+    assert db[name].count() == 100
+    total = db._execute(SQL("SELECT total FROM meta_tables WHERE name = %s"), [name]).fetchone()[0]
+    assert total == 100
+
+
+def test_reload_revert_restores_the_column_list(db, filled_table, tmp_path):
+    name = filled_table.search_table
+    searchfile = str(tmp_path / "search.txt")
+    filled_table.copy_to(searchfile, columns=[c for c in filled_table.search_cols if c != "x"])
+    filled_table.reload(searchfile, adjust_schema=True)
+    assert "x" not in db[name].search_cols
+    db[name].reload_revert()
+    assert "x" in db[name].search_cols
+    assert db[name].lucky({"n": 4}, projection="x") == 2.0
+
+
+##################################################################
+# reload(adjust_schema=True) with statistics saved               #
+##################################################################
+
+
+def _saving(table):
+    """
+    Turn on ``stats.saving`` for ``table``, as LMFDB's stats class does.
+
+    Only with saving on does reload stage counts and stats tables and refresh
+    statistics on the ``_tmp`` table, which is where these tests look.
+    """
+    table.stats.saving = True
+    return table
+
+
+def _counted(table, suffix=""):
+    """
+    The column lists in ``table``'s counts table, as tuples, split into the
+    null counts (``values = [None]``) and the rest.
+    """
+    cur = table._execute(
+        SQL("SELECT cols, values FROM {0}").format(Identifier(table.stats.counts + suffix))
+    )
+    nulls, others = set(), set()
+    for cols, values in cur:
+        (nulls if values == [None] else others).add(tuple(cols))
+    return nulls, others
+
+
+def _stat_cols(table):
+    """
+    Every column named by a row of ``table``'s stats table.
+    """
+    cur = table._execute(
+        SQL("SELECT cols, constraint_cols FROM {0}").format(Identifier(table.stats.stats))
+    )
+    return {col for cols, ccols in cur for col in (cols or []) + (ccols or [])}
+
+
+def test_reload_adjust_schema_can_drop_a_column_while_saving_stats(db, filled_table, tmp_path):
+    # Regression: refresh_stats(suffix="_tmp") counted the nulls of every live
+    # column in the _tmp table, so this reload aborted with UndefinedColumn.
+    name = filled_table.search_table
+    _saving(filled_table).stats.add_stats(["flag"])
+    searchfile = str(tmp_path / "search.txt")
+    filled_table.copy_to(searchfile, columns=[c for c in filled_table.search_cols if c != "x"])
+    filled_table.reload(searchfile, adjust_schema=True)
+    table = db[name]
+    assert "x" not in table.search_cols
+    assert table.count() == 200
+    assert _counted(table)[0] == {(col,) for col in table.search_cols}
+    assert table.stats.quick_count({"flag": True}) == 67
+
+
+def test_reload_adjust_schema_skips_stats_on_dropped_columns(db, filled_table, tmp_path):
+    # Each kind of recorded statistic names a column that the reload drops.
+    # The countsfile carries the extra count into the _tmp counts table,
+    # which is where refresh_stats looks for extra counts.
+    name = filled_table.search_table
+    stats = _saving(filled_table).stats
+    stats.add_stats(["label"], constraint={"flag": True})
+    stats.add_stats(["vec"], split_list=True)
+    stats.add_numstats("n", ["flag"])
+    stats.add_stats(["num"])
+    assert stats.count({"flag": True, "n": {"$lt": 50}}, record=True) == 17
+    searchfile = str(tmp_path / "search.txt")
+    countsfile = str(tmp_path / "counts.txt")
+    kept = [c for c in filled_table.search_cols if c not in ("flag", "vec")]
+    filled_table.copy_to(searchfile, countsfile=countsfile, columns=kept)
+    filled_table.reload(searchfile, countsfile=countsfile, adjust_schema=True)
+    table = db[name]
+    assert sorted(table.search_cols) == sorted(kept)
+    nulls, others = _counted(table)
+    assert nulls == {(col,) for col in kept}
+    assert others == {(), ("num",)}
+    assert _stat_cols(table) == {"num"}
+
+
+def test_reload_adjust_schema_counts_nulls_in_an_added_column(db, filled_table, table_factory, tmp_path):
+    from conftest import COLUMNS
+
+    name = filled_table.search_table
+    source = table_factory(columns=COLUMNS + [("note", "text")])
+    source.insert_many([dict(sample_row(i), note="even" if i % 2 == 0 else None) for i in range(200)])
+    searchfile = str(tmp_path / "search.txt")
+    source.copy_to(searchfile)
+    _saving(filled_table).reload(searchfile, adjust_schema=True)
+    table = db[name]
+    assert "note" in table.search_cols
+    assert _counted(table)[0] == {(col,) for col in table.search_cols}
+    assert table.stats.quick_count({"note": None}) == 100
+
+
+def test_null_counts_of_a_staged_reload_use_its_columns(filled_table, tmp_path):
+    searchfile = str(tmp_path / "search.txt")
+    filled_table.copy_to(searchfile, columns=[c for c in filled_table.search_cols if c != "x"])
+    _saving(filled_table).reload(searchfile, adjust_schema=True, final_swap=False)
+    try:
+        assert filled_table.stats.null_counts(suffix="_tmp") == {}
+    finally:
+        filled_table.drop_tmp()
 
 
 ##################################################################
