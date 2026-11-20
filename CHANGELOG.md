@@ -162,10 +162,10 @@ hardening standalone use; the highlights:
   dictionary passed to `Configuration`. (#119)
 - `reload(adjust_schema=True)` from a file that drops a column no longer aborts
   with `UndefinedColumn` when statistics are saved: the refresh on the `_tmp`
-  table uses that table's columns, so it also counts nulls in added columns.
+  table uses that table's columns, so it also counts nulls in added columns. (#149)
 - `reload_revert` recounts the total and refreshes the table object, so
   `count()` and the column list no longer describe the table swapped away; it
-  also notifies the schema channel, as the reload swap does.
+  also notifies the schema channel, as the reload swap does. (#149)
 
 ### Security
 
