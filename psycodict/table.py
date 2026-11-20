@@ -2371,7 +2371,9 @@ class PostgresTable(PostgresBase):
 
         The total in ``meta_tables`` is recounted, and this table object (and
         the one the database holds, if different) is refreshed in place to the
-        restored table's columns and total.
+        restored table's columns and total.  The refresh happens before an
+        enclosing ``DelayCommit`` commits, so a caller that rolls back must
+        refresh again, as ``reload_all_revert`` does.
         """
         if self._table_exists(self.search_table + "_tmp"):
             print(

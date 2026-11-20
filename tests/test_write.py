@@ -579,6 +579,26 @@ def test_reload_revert_restores_the_column_list(db, filled_table, tmp_path):
     assert db[name].lucky({"n": 4}, projection="x") == 2.0
 
 
+def test_a_failed_reload_all_revert_leaves_table_objects_as_rolled_back(db, table_factory, tmp_path):
+    # reload_all_revert reverts every table in one transaction: when a later
+    # table has no backup, the rollback undoes the earlier reverts, whose
+    # objects had already been refreshed to the backups.
+    first, second = sorted((table_factory(), table_factory()), key=lambda t: t.search_table)
+    name = first.search_table
+    first.insert_many([sample_row(i) for i in range(200)])
+    searchfile = str(tmp_path / (name + ".txt"))
+    first.copy_to(searchfile, columns=[c for c in first.search_cols if c != "x"])
+    first.delete({"n": {"$gte": 100}})
+    first.reload(searchfile, adjust_schema=True)
+    (tmp_path / (second.search_table + ".txt")).write_text("")
+    with pytest.raises(ValueError, match="No old tables"):
+        db.reload_all_revert(str(tmp_path))
+    table = db[name]
+    assert table.count() == 200
+    assert "x" not in table.search_cols
+    assert table.lucky({"n": 4})["n"] == 4
+
+
 ##################################################################
 # reload(adjust_schema=True) with statistics saved               #
 ##################################################################
